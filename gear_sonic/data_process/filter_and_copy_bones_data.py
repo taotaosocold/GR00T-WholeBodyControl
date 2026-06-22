@@ -5,6 +5,7 @@ Script to filter and copy bones data from bones_gmr to single_pkls directory.
 This script copies motion files from the bones_gmr directory structure while
 filtering out unwanted sequences based on keywords in filenames.
 It preserves the bones_xxx directory structure in the destination.
+根据运动序列名称来过滤一些物理上的动作
 """
 
 import argparse

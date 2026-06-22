@@ -18,6 +18,7 @@ class root_backbone_network(nn.Module):
         self._args = args
 
         self.motion_rep = motion_rep
+        # 拆出全局运动序列和局部运动序列
         self.global_motion_rep = motion_rep.dual_rep.global_motion_rep
         self.local_motion_rep = motion_rep.dual_rep.local_motion_rep
 

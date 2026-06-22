@@ -272,11 +272,12 @@ class MySceneCfg(InteractiveSceneCfg):
         super().__init__()
 
         self.num_envs = config.get("num_envs", 4096)
-
+        # 环境间距
         self.env_spacing = config.get("env_spacing", 2.5)
 
         # Allow config to override replicate_physics (default True)
         # Set to False for per-environment randomization (e.g., table size)
+        # 是否复制物理（设为 False 时允许每个环境有不同物体/位置）
         self.replicate_physics = config.get("replicate_physics", True)
 
         self.eval_camera = None
@@ -315,6 +316,7 @@ class MySceneCfg(InteractiveSceneCfg):
             )
 
         # ground terrain
+        # 设置地形，plane为平面，trimesh则是复杂地形
         terrain_type = config.get("terrain_type", "plane")
         if terrain_type == "plane":
             self.terrain = TerrainImporterCfg(
@@ -355,6 +357,7 @@ class MySceneCfg(InteractiveSceneCfg):
             raise ValueError(f"Unknown terrain type: {terrain_type}")
 
         # robots
+        # 这里robot是MISSING说明是我们需要手动配置robot类型，说明是支持多种不同的机器人的
         self.robot: ArticulationCfg = dataclasses.MISSING
 
         # lights
@@ -390,12 +393,14 @@ class MySceneCfg(InteractiveSceneCfg):
         )
 
         # Check if robot has hands (43 DOF robots) - used for hand-related sensors
+        # 确定机器人配置的类型，默认g1
         robot_type = config.get("robot", {}).get("type", "g1")
+        # 判断机器人是否带手
         robot_has_hands = "43dof" in robot_type or "hand" in robot_type
 
         motion_meta_info_path = config.get("motion_meta_info_path", None)
         motion_meta_info = None
-
+        # 加载运动元信息
         usd_path = config.get("object_usd_path", "")
         if motion_meta_info_path is None and isinstance(usd_path, str) and os.path.isfile(usd_path):
             motion_meta_info_path = usd_path.replace(".usd", ".pkl").replace("object_usd", "meta")
@@ -416,14 +421,17 @@ class MySceneCfg(InteractiveSceneCfg):
         #
         # multi_object_per_env=True:  All objects spawned in every env (one active at a time)
         # multi_object_per_env=False: One object per env (MultiUsdFileCfg cycles through)
+        # 支持单个 USD 文件、目录下所有 .usd、列表或正则表达式匹配
         if config.get("add_object", False):
             usd_path = config.get("object_usd_path", f"{os.getcwd()}/data/wheelchair.usd")
             object_is_dynamic = config.get("object_is_dynamic", False)
             object_collision_enabled = config.get("object_collision_enabled", True)
+            # multi_object_per_env为true表示所有物体同时出现在每个环境中，为false则不同环境使用不同物体
             multi_object_per_env = config.get("multi_object_per_env", False)
             object_color = config.get("object_color", None)  # e.g. [0.6, 0.4, 0.2] for wood-brown
 
             # --- Step 1: Resolve usd_path to a list of absolute paths ---
+            # usd_path可能是字符串，比如物体的配置字符串名称，而resolved_paths才是物体的绝对路径
             if isinstance(usd_path, list):
                 resolved_paths = _resolve_object_usd_paths(usd_path)
             elif os.path.isdir(usd_path):
@@ -436,6 +444,7 @@ class MySceneCfg(InteractiveSceneCfg):
                 resolved_paths = [os.path.abspath(usd_path)]
 
             # --- Step 2: Spawn based on multi_object_per_env flag ---
+            # multi_object_per_env为true表示所有物体同时出现在每个环境中
             if multi_object_per_env:
                 # MULTI-OBJECT MODE: One RigidObjectCfg per USD, all present in every env.
                 # commands.py detects this by checking for object_* entries in scene.rigid_objects.
@@ -443,7 +452,9 @@ class MySceneCfg(InteractiveSceneCfg):
                 # CRITICAL: Initial positions must be spread apart to avoid collision pairs!
                 # If all objects spawn at (0,0,0), PhysX creates O(N²) pairs at scene creation.
                 # Spread in Z (vertical) since envs only vary in X,Y.
+                # 物体之间的垂直间距，这里是同一个环境下的不同物体
                 z_spacing = 10.0
+                # 逐个遍历每个物体，这个循环中，第一个物体-100米，第二个物体-110米这样依次将物体排开（这里应该是先初始化，后面才会放物体）
                 for idx, path in enumerate(resolved_paths):
                     obj_name = os.path.splitext(os.path.basename(path))[0]
                     obj_name_safe = obj_name.replace("-", "_")
@@ -470,15 +481,19 @@ class MySceneCfg(InteractiveSceneCfg):
                 print(  # noqa: T201
                     f"[Multi-Object Mode] Spawned {len(resolved_paths)} objects at spread Z positions"
                 )
+            # 如果每个环境并不是多个物体，而是只有一个物体，即所有环境都有一个物体，但是是相同的物体
             elif len(resolved_paths) == 1:
                 # SINGLE OBJECT MODE
+                # 从配置文件中获得物体的质量
                 object_mass = config.get("object_mass", None)
+                # 获得物体的质量属性
                 mass_props = (
                     sim_utils.MassPropertiesCfg(mass=object_mass)
                     if object_mass is not None
                     else None
                 )
                 object_opacity = config.get("object_opacity", 1.0)
+                # 获得物体的视觉外观，包括颜色diffuse_color和透明度opacity
                 if object_color is not None:
                     visual_material = sim_utils.PreviewSurfaceCfg(
                         diffuse_color=tuple(object_color[:3]),
@@ -490,6 +505,7 @@ class MySceneCfg(InteractiveSceneCfg):
                     visual_material = sim_utils.PreviewSurfaceCfg(opacity=object_opacity)
                 else:
                     visual_material = None
+                # 真正的初始化物体，根据前面配置的视觉和质量属性，这里还会配置初始位置和是否碰撞，和缩放
                 self.object = RigidObjectCfg(
                     prim_path="{ENV_REGEX_NS}/Object",
                     spawn=sim_utils.UsdFileCfg(
@@ -512,7 +528,9 @@ class MySceneCfg(InteractiveSceneCfg):
                 )
             else:
                 # ONE-PER-ENV MODE: Different object per env via MultiUsdFileCfg
+                # 每个环境都有一个物体，但是可以是不同的物体
                 self.replicate_physics = False
+                # 只创建一个object但是使用MultiUsdFileCfg会让每个并行环境实例从列表中选一个不同的文件加载
                 self.object = RigidObjectCfg(
                     prim_path="{ENV_REGEX_NS}/Object",
                     spawn=sim_utils.MultiUsdFileCfg(
@@ -531,9 +549,10 @@ class MySceneCfg(InteractiveSceneCfg):
                         pos=tuple(config.get("object_position", [2.0, 0.0, 0.0]))
                     ),
                 )
-
+            # 如果机器人有手指
             if robot_has_hands:
                 # Frame transformer for hand-object tracking
+                # 实时计算物体相对于机器人右手三个手指关节的位置和旋转
                 self.object_to_hand_frame_transformer = FrameTransformerCfg(
                     prim_path="{ENV_REGEX_NS}/Object",  # Source: Object
                     target_frames=[
@@ -572,6 +591,7 @@ class MySceneCfg(InteractiveSceneCfg):
                         "{ENV_REGEX_NS}/Robot/right_hand_middle_1_link",
                         "{ENV_REGEX_NS}/Robot/right_hand_palm_link",
                     ]
+                # 创建接触传感器，监测物体与右手手指之间的接触，传感器返回接触力矩阵，表示物体从每个被监控链接受到的力
                 self.object_to_hand_contact_sensor = ContactSensorCfg(
                     prim_path="{ENV_REGEX_NS}/Object",
                     filter_prim_paths_expr=right_finger_tip_bodies,
@@ -585,13 +605,14 @@ class MySceneCfg(InteractiveSceneCfg):
                     "{ENV_REGEX_NS}/Robot/left_hand_middle_1_link",
                     "{ENV_REGEX_NS}/Robot/left_hand_palm_link",
                 ]
+                # 创建接触传感器，监测物体与左手手指之间的接触，传感器返回接触力矩阵，表示物体从每个被监控链接受到的力
                 self.object_to_left_hand_contact_sensor = ContactSensorCfg(
                     prim_path="{ENV_REGEX_NS}/Object",
                     filter_prim_paths_expr=left_finger_tip_bodies,
                     history_length=2,
                     track_air_time=False,
                 )
-
+        # 添加桌子
         if config.get("add_table", False):
             # Table initial position and orientation from config or meta
             # (per-env update in commands.py for multi-motion)
@@ -775,13 +796,17 @@ class MySceneCfg(InteractiveSceneCfg):
         # TODO: Do this better.  # noqa: TD002, TD003
         # Copied from gear_sonic/config/simulator/isaacsim.yaml
         # enable_cameras flag creates the ego camera for vision-based policies
+        # 判断是否添加摄像机，用于视觉观测RGB、深度图
         if config.get("enable_cameras", False) or config.get("render_ego", False):
             # Get camera config from nested cameras dict
+            # 从嵌套字典中读取cameras中读取摄像机参数包括分辨率、裁剪平面、安装连杆、位置偏移等
             cameras_cfg = config.get("cameras", {})
 
             # Choose camera type: fisheye, pinhole, or opencv (with lens distortion)
+            # 这里有三种不同的摄像机的配置，第一种是opencv畸变模型
             if config.get("render_ego_opencv_usd", False):
                 # Load OpenCV distortion parameters from USD file
+                # 从指定的 .usda 文件中读取畸变参数（k1~k6、p1、p2 等）
                 opencv_usd_path = cameras_cfg.get(
                     "opencv_usd_path", "runs/oak_camera.usda"  # Default path
                 )
@@ -803,6 +828,7 @@ class MySceneCfg(InteractiveSceneCfg):
                     f"[DEBUG] fx={opencv_params['fx']}, fy={opencv_params['fy']}, cx={opencv_params['cx']}, cy={opencv_params['cy']}"  # noqa: E501
                 )
                 print(f"[DEBUG] k1={opencv_params['k1']}")  # noqa: T201
+                # 使用自定义的 OpenCVCameraCfg 生成带有真实畸变效果的图像
                 camera_spawn_cfg = OpenCVCameraCfg(
                     clipping_range=(0.01, 20.0),
                     opencv_fx=opencv_params["fx"],
@@ -823,8 +849,10 @@ class MySceneCfg(InteractiveSceneCfg):
                     opencv_s4=opencv_params.get("s4", 0.0),
                     opencv_image_size=(camera_resolution[1], camera_resolution[0]),  # (W, H)
                 )
+            # 第二种是鱼眼模型
             elif config.get("render_ego_fisheye", False):
                 print("USING FISHEYE CAMERA" * 1000)  # noqa: T201
+                # 使用 FisheyeCameraCfg，支持球面或多项式投影
                 camera_spawn_cfg = sim_utils.FisheyeCameraCfg(
                     projection_type=config.get("render_ego_fisheye_projection", "fisheyeSpherical"),
                     fisheye_max_fov=config.get("render_ego_fisheye_fov", 180.0),
@@ -838,6 +866,7 @@ class MySceneCfg(InteractiveSceneCfg):
                     focus_distance=0.5,
                     clipping_range=(0.1, 20.0),
                 )
+            # 最后一种是针孔模型（默认）：使用 PinholeCameraCfg，设置焦距、光圈等参数
             else:
                 # Convert clipping_range to tuple if it's a list or string (from YAML config)
                 clipping_range = cameras_cfg.get("camera_clipping_range", (0.1, 20.0))
@@ -856,6 +885,7 @@ class MySceneCfg(InteractiveSceneCfg):
 
             # Camera attachment link (e.g., "d435_link" for RealSense D435)
             # If not specified, camera is attached to robot root
+            # 上面配置好像好相机的内部参数，这里就配置相机在环境中的参数包括位置和运行时的属性
             camera_attached_link = cameras_cfg.get("camera_attached_link", "")
             if camera_attached_link:
                 camera_prim_path = f"{{ENV_REGEX_NS}}/Robot/{camera_attached_link}/ego_camera"
@@ -863,6 +893,7 @@ class MySceneCfg(InteractiveSceneCfg):
                 camera_prim_path = "{ENV_REGEX_NS}/Robot/ego_camera"
 
             # Camera position and rotation offsets (relative to attached link)
+            # 位置默认为世界坐标系
             camera_pos_offset = tuple(cameras_cfg.get("camera_pos_offset", [0.0, 0.0, 0.0]))
             camera_rot_offset = tuple(
                 cameras_cfg.get("camera_rot_offset", [1.0, 0.0, 0.0, 0.0])
@@ -873,7 +904,7 @@ class MySceneCfg(InteractiveSceneCfg):
 
             # Camera resolution [H, W]
             camera_resolution = cameras_cfg.get("camera_resolution", [108, 192])
-
+            # 根据spawn的相机内部的配置和定义的相机在环境中的设置来初始化相机
             self.ego_camera = TiledCameraCfg(
                 prim_path=camera_prim_path,
                 offset=TiledCameraCfg.OffsetCfg(

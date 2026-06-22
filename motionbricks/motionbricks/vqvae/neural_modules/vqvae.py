@@ -19,19 +19,19 @@ class VQVAE(nn.Module):
         "joint_positions_and_rotations_and_foot_contact", "joint_positions_and_rotations_and_hip_height"
     ]
     def __init__(self,
-                 pose_root_mode: str,
-                 motion_rep: MotionRepBase,
+                 pose_root_mode: str,           # "pose" 或 "root"
+                 motion_rep: MotionRepBase,     # 运动表示对象
 
                  # dim information
-                 encoder_state_dim: int,
-                 decoder_state_dim: int,
+                 encoder_state_dim: int,        # 编码器维度
+                 decoder_state_dim: int,        # 解码器维度
 
                  decoder_target_cond_dim: int,
                  decoder_external_cond_dim: int,
-                 feature_mode: List,
+                 feature_mode: List,        # 四元素列表，定义各阶段提取什么特征
 
                  # network config
-                 quantizer_strategy: str = 'multihead_ema_reset',
+                 quantizer_strategy: str = 'multihead_ema_reset',   # 网络结构超参数
                  quantizer_mu: float = 0.99,
                  nb_code: int = 512,
                  code_dim: int = 512,
@@ -79,10 +79,11 @@ class VQVAE(nn.Module):
                                                                  self.decoder_target_cond_feature_mode).shape[-1]
         decoder_external_cond_dim = extract_feature_from_motion_rep(dummy_input, motion_rep,
                                                                    self.decoder_external_cond_feature_mode).shape[-1]
-
+        # 初始化编码器
         self.encoder = Encoder(encoder_state_dim, output_emb_width,
                                down_t, stride_t, width, depth,
                                dilation_growth_rate, activation=activation, norm=norm)
+        # 初始化解码器,双条件解码器,两种条件分别是目标条件,如边界帧的姿势或根轨迹值,还有外部条件,对姿势 VQ-VAE 而言，通常是已生成的根轨迹信息
         self.decoder = DoubleCondDecoder(decoder_state_dim, output_emb_width,
                                          down_t, width, depth, dilation_growth_rate,
                                          activation=activation, norm=norm,
@@ -103,7 +104,7 @@ class VQVAE(nn.Module):
         """
         feature = self._pose_root_mode if feature == "" else feature
         return extract_feature_from_motion_rep(x, self._motion_rep, feature)
-
+    # 前向传播流程
     def forward(self, x, target_cond: t.Tensor, has_target_cond: t.Tensor = None, external_cond: t.Tensor = None):
         """ @brief: full encoder decoder path that goes from x to z to x
         @params x: [batch_size, numFrames, feat_dim]
@@ -115,10 +116,13 @@ class VQVAE(nn.Module):
         """
         num_expected_frames = x.shape[1]
         # encoder
+        # 提取所需特征 → (B,T,F) 转置为 (B,F,T)
         x_in = self.extract_feature(x, self.encoder_input_feature_mode).permute(0, 2, 1)  # from [B,T,F] to [B,F,T]
+        # 编码
         x_encoder = self.encoder(x_in)
 
         # quantization
+        # 量化
         x_quantized, loss, perplexity = self.quantizer(x_encoder)
 
         # decoder

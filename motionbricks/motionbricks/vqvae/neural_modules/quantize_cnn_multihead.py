@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vector_quantize_pytorch import VectorQuantize
-
+# 量化:将编码器输出的连续潜向量替换成码本中与之最接近的离散向量,这里采用多头EMA码本
 class QuantizeEMAResetMultiHead(nn.Module):
     def __init__(self, nb_code: int, code_dim: int, args):
         super().__init__()
@@ -16,12 +16,15 @@ class QuantizeEMAResetMultiHead(nn.Module):
         self.nb_code_per_head = int(round(2 ** (np.log2(self.nb_code) / self.num_heads)))
         assert self.nb_code_per_head ** self.num_heads == self.nb_code, \
             "the specified number of code is not compatible with the number of heads."
+        # 这个向量量化也是第三方库调用的,其实就是将连续特征向量量化到离散码本中,这里用的是多头码本,和正常的单头码本主要是为了降低开销
+        # 比如假设你正常码本,输入维度为512.每个码本向量为512(正常输入和码本向量必须相等),码本向量数量为1024,那么计算就比较复杂
+        # 这里多头码本是,输入维度保持不变512,每个码本向量被多头分开,假设4个头,那么就是设置4个码本,每个码本512/4=128的码本向量维度,每个码本仍然是1024个数量
         self.vq = VectorQuantize(
-            dim=self.code_dim,
-            codebook_dim=self.code_dim // self.num_heads,       # smaller codebook dimension is acceptable
-            heads=self.num_heads,             # number of heads to vector quantize, codebook shared across all heads
-            separate_codebook_per_head=True,  # whether to have a separate codebook per head.
-            codebook_size=self.nb_code_per_head,
+            dim=self.code_dim,      # 输入特征维度
+            codebook_dim=self.code_dim // self.num_heads,      # 码本大小,即每个码本的向量维度
+            heads=self.num_heads,             # 头的数量
+            separate_codebook_per_head=True,  # True表示每个头拥有独立的码本,false则所有头共享一个码本
+            codebook_size=self.nb_code_per_head,    # 每个码本包含的向量个数
             accept_image_fmap=False,
             threshold_ema_dead_code = 1,      # if the number of code usage < 1; reset it
             decay=self.mu,
@@ -76,12 +79,19 @@ class QuantizeEMAResetMultiHead(nn.Module):
         N, width, T = x.shape
         # expected the shape of the input to vq: (1, 1024, 256) --> batch, Timesteps, feat_dim
         # The input to x is batch, width(feat_dim), T
+        # 编码器输出的潜向量形状是 (N, width, T)（width=特征维，T=压缩后的时间帧数）,vector_quantize_pytorch 库要求输入为 (batch, seq_len, dim)，因此先转置
         x = x.permute(0, 2, 1).contiguous()
 
         # quantize and dequantize through bottleneck
+        # 调用self.vq多头向量量化
+        # self.vq会将最后多头向量得到的值最相近的多个码本向量拼接得到的就是x_d,而mh_indices是多头索引,表示我们找到的是码本向量中的哪个
+        # 形状为(N, T, num_heads)，每个头给出一个 [0, nb_code_per_head-1] 的整数索引
+        # commit_loss 是库内部计算的承诺损失,但是我们会重新计算所以会覆盖,这个目前没用
         x_d, mh_indices, commit_loss = self.vq(x)
 
         # Update embeddings
+        # 计算困惑度,用于监控码本的使用平均程度,这里两种计算模式
+        # 只用知道困惑度越高,码本的利用率越好
         if self._calculate_per_head_perplexity:
             if self.num_heads == 1:
                 mh_indices = mh_indices[:, :, None]
@@ -91,14 +101,16 @@ class QuantizeEMAResetMultiHead(nn.Module):
             perplexity = self.compute_perplexity(overall_indices.view([-1]))
 
         # Loss
+        # 计算承诺损失,即输入和码本向量的MSE
         commit_loss = F.mse_loss(x, x_d.detach())
 
         # Passthrough
+        # 直通估计器:解决量化操作不可导的问题
         x_d = x + (x_d - x).detach()
 
         # Postprocess
         x_d = x_d.view(N, T, -1).permute(0, 2, 1).contiguous()   #(N, DIM, T)
-
+        # 返回码本向量和承诺损失和困惑度
         return x_d, commit_loss, perplexity
 
     def forward_into_idx(self, x, fetch_overall_indices: bool = True):

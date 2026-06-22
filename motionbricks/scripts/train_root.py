@@ -27,6 +27,7 @@ from motionbricks.helper.pl_util import load_motion_rep
 
 def load_config(result_dir: str, max_steps: int):
     """Load and patch hparams.yaml for single-GPU training."""
+    # 配置目录为motionbricks_root，对应 root 模型自己的配置文件，并在数据配置中显式将 text_embeddings 设为 None，因为合成数据没有文本，避免加载文本嵌入报错
     version_dir = os.path.join(result_dir, "motionbricks_root", "version_1")
     hparams_path = os.path.join(version_dir, "hparams.yaml")
     conf = OmegaConf.load(hparams_path)
@@ -80,10 +81,12 @@ def main():
     conf, version_dir = load_config(args.result_dir, args.max_steps)
 
     # instantiate skeleton and motion representation
+    # 加载数据，这里获得的全局的数据值
     motion_rep = load_motion_rep(conf)
     feat_dim = len(motion_rep.indices['all'])
 
     # create synthetic dataset
+    # 在训练数据集的时候，这里帧数会控制在200～400帧
     dataset = SyntheticMotionDataset(
         feat_dim=feat_dim,
         num_samples=args.num_samples,
@@ -100,9 +103,11 @@ def main():
     )
 
     # instantiate networks and model
+    # 获得模型的配置文件
     model_conf = copy.deepcopy(conf.model)
     with open_dict(model_conf):
         # instantiate backbone network (needs full motion_rep for dual_rep access)
+        # 根据模型的配置文件来实例化单纯的前向网络
         backbone_net = instantiate(
             model_conf.backbone_network,
             motion_rep=motion_rep,
@@ -112,7 +117,7 @@ def main():
         # build optimizer and scheduler as partials
         optimizer_fn = instantiate(model_conf.optimizer)
         scheduler_fn = instantiate(model_conf.scheduler) if model_conf.scheduler else None
-
+        # 完整的网络配置，包含运动序列的处理等等函数，而backbone_net是直接获得处理好的运动序列来做处理
         model = instantiate(
             model_conf,
             pose_vqvae_network=None,
@@ -125,6 +130,7 @@ def main():
         )
 
     # create trainer (no callbacks)
+    # 初始化训练器
     trainer = pl.Trainer(
         max_steps=conf.trainer.max_steps,
         devices=conf.trainer.devices,

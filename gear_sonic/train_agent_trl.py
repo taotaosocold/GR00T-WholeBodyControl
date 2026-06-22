@@ -103,7 +103,7 @@ def create_manager_env(config, device, args_cli):
     )
 
     from gear_sonic.envs.wrapper.manager_env_wrapper import ManagerEnvWrapper
-
+    # 引入工厂函数根据配置文件实例化环境配置
     env_instance_cfg = custom_instantiate(config.manager_env)
 
     # Iteratively check the difference in attribute of env_instance_cfg1 and env_instance_cfg, print out the difference
@@ -178,7 +178,7 @@ def main(config: OmegaConf):
 
     from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
     import torch  # noqa: E402
-
+    # 使用 HuggingFace Accelerate 库处理多 GPU / 分布式训练
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=6000))
     accelerator = Accelerator(
@@ -224,7 +224,7 @@ def main(config: OmegaConf):
         )
 
     # Setup simulator similar to train_agent.py
-
+    # 启动isaacsim
     if simulator_type == "IsaacSim":
         try:
             with open("./rl/simulator/isaacsim/.isaacsim_version", encoding="utf-8") as f:

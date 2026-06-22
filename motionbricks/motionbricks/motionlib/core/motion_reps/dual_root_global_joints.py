@@ -41,7 +41,7 @@ def get_body_keys_dim(self, nbjoints: int):
         "foot_contacts": [4],  # Left: Foot + Toe / Right: Foot + Toe
     }
 
-
+# 这里初始化后，是能够获得运动序列的各种全局值
 class GlobalRootGlobalJoints(GlobalRootLocalBody):
     """Motion representation with global root."""
 
@@ -53,7 +53,7 @@ class GlobalRootGlobalJoints(GlobalRootLocalBody):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-
+# 这里初始化后，是能够获得运动序列的各种局部值
 class LocalRootGlobalJoints(LocalRootLocalBody):
     """Motion representation with local root."""
 

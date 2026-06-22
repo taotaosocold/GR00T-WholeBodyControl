@@ -31,6 +31,7 @@ class DoubleCondDecoder(nn.Module):
         self._COND_FUSION_LAST_LAYER = cond_fusion_last_layer
 
         # step 1: the main model
+        # 上采样
         blocks = []
         blocks.append(nn.Conv1d(output_emb_width, width, 3, 1, 1))  # this does not change sequence length
         blocks.append(nn.ReLU())
@@ -51,6 +52,7 @@ class DoubleCondDecoder(nn.Module):
         At each layer, the external embedding will be merged with the hidden state. The external condition is dense
         and expected to be always available in each frame.
         """
+        # 引入外部稠密条件,[B, T, ext_dim]，每帧都有（如根轨迹信息）
         if self._HAS_EXTERNAL_COND:
             external_cond_blocks = []
             for i in range(down_t + (1 if self._COND_FUSION_LAST_LAYER else 0)):
@@ -65,6 +67,7 @@ class DoubleCondDecoder(nn.Module):
         In earlier layers where each position corresponds to multiple frames, we reshape the hidden states to map to
         each frame position (see @forward method)
         """
+        # 引入目标稀疏条件,[B, T, target_dim]，仅在关键帧上提供
         if self._HAS_TARGET_COND:
             target_cond_blocks = []
             assert width % (2 ** down_t) == 0, \
@@ -73,7 +76,7 @@ class DoubleCondDecoder(nn.Module):
                 target_cond_blocks.append(nn.Linear(self._target_cond_dim, int(width / (2 ** (down_t - i)))))
                 target_cond_blocks.append(nn.ReLU())
             self.target_cond_blocks = nn.ModuleList(target_cond_blocks)
-
+    # 通过上采样将数据恢复为原来的维度
     def forward(self, x: torch.Tensor, external_cond: torch.Tensor = None,
                 target_cond: torch.Tensor = None, has_target_cond: torch.Tensor = None,
                 token_mask: torch.Tensor = None):
@@ -83,19 +86,26 @@ class DoubleCondDecoder(nn.Module):
         @params target_cond: shape -> [batch, timesteps, feat_dim]
         @params has_target_cond: shape -> [batch, timesteps] (dtype=bool)
         """
+        # 解码器接收量化后的潜向量 x，形状为 [batch, feat_dim, T_latent]，其中 T_latent = T // (2^down_t)
         batch_size = x.shape[0]
 
-        # preprocess
+        # preprocess 预处理
+        # 若提供了 token_mask（形状 [B, T_latent]），则通过广播将其乘到 x 上（token_mask 增加维度变成 [B, 1, T_latent]）。目的是将填充时间步的嵌入全部置零，防止它们干扰后续计算
         x = x * token_mask[:, None, :] if token_mask is not None else x  # zeroing out the padded tokens' embeddings
+        # 首先先经过一个不改变时序长度的卷积，将潜特征从 feat_dim 投影到统一宽度 width，为后续融合提供足够容量
         h = self.model[0](x)  # conv1d
         h = self.model[1](h)  # relu; h.shape = ([batch, width, timesteps // (2 ** down_t)])
-
+        # 循环_dowt_t次上采样
         for i in range(self._down_t + (1 if self._COND_FUSION_LAST_LAYER else 0)):
+            # numFrames_per_position：当前隐藏状态中每个位置对应的输出帧数。在早期层（i 小）这个数值大，最后层为 1
             numFrames_per_position = 2 ** (self._down_t - i)
+            # numPositions：当前隐藏状态的长度（位置数），即 h.shape[-1]
             numPositions = h.shape[-1]  # numPositions = timesteps // numFrames_per_position
+            # timesteps：当前尺度对应的总帧数，等于 numPositions * numFrames_per_position，应与原始运动帧数一致（不考虑 padding 的话）
             timesteps = numPositions * numFrames_per_position
 
             # step 1: consider the target cond
+            # 如果模型不使用目标条件（_HAS_TARGET_COND=False），或者输入中未提供，则跳过整个步骤
             if (not self._HAS_TARGET_COND) or target_cond is None or has_target_cond is None:
                 pass
             else:
