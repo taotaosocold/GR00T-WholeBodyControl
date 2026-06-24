@@ -195,7 +195,7 @@ def copy_filtered_bones_data(
 
     return True
 
-
+# 这里直接根据soma数据集的名称来过滤数据，包括那些含有bed还有bike等等的数据集全部筛选掉只保留和平地面交互的动作
 def main():
     parser = argparse.ArgumentParser(description="Filter and copy bones data")
     parser.add_argument(

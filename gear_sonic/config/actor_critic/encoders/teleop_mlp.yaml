@@ -1,3 +1,4 @@
+# 编码器四：输入数据是下半身指令和VR的3D目标和朝向
 teleop:
   inputs: ["command_multi_future_lower_body", "vr_3point_local_target", "vr_3point_local_orn_target", "motion_anchor_ori_b"]
   params:

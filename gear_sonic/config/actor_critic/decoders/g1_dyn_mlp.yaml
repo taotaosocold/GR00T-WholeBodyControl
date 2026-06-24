@@ -1,3 +1,4 @@
+# 解码器的配置，除了token还会引入本体感知作为输入，然后在解码
 g1_dyn:
   inputs: ["token_flattened", "proprioception"]
   outputs: ["action"]

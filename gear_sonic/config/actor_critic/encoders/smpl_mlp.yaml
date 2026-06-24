@@ -1,3 +1,4 @@
+# 编码器二：输入数据是smpl人体数据包括未来10帧关节位置和速度以及未来10帧的根朝向
 smpl:
   inputs: ["smpl_joints_multi_future_nonflat", "smpl_root_ori_b_multi_future"]
   params:

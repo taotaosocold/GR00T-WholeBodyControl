@@ -1,3 +1,4 @@
+# 编码器一：输入数据是g1的重定向后的数据包括未来10帧关节位置和速度以及未来10帧的根朝向
 g1:
   inputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
   params:

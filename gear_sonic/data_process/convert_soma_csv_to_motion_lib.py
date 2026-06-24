@@ -161,7 +161,7 @@ BONES_CSV_JOINT_NAMES = [
     "right_wrist_yaw_joint_dof",
 ]
 
-
+# 数据加载方式一：加载seed数据集
 def load_bones_csv(csv_path: str) -> dict:
     """Load a single Bones-SEED flat CSV motion file.
 
@@ -221,7 +221,7 @@ def load_bones_csv(csv_path: str) -> dict:
         "joint_order": "mj",  # already in MuJoCo order, skip IL→MJ reorder
     }
 
-
+# 数据处理方式二：对于文件下是对每个运动序列的joint_pos和body_pos和body_quat都有个.csv文件的格式加载方式
 def load_csv_motion(motion_dir: str) -> dict:
     """Load a single motion from a directory of CSV files."""
     joint_pos_f = os.path.join(motion_dir, "joint_pos.csv")
@@ -246,7 +246,7 @@ def load_csv_motion(motion_dir: str) -> dict:
         "body_quat_w": body_quat,  # (T, 14, 4) wxyz format
     }
 
-
+# 最后的数据处理格式就是这样的.pkl文件
 def convert_sequence(seq_data: dict, fps: int, humanoid_fk=None) -> dict:  # noqa: ARG001
     """Convert a single deploy-format sequence to motion_lib format.
 

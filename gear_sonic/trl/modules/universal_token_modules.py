@@ -29,7 +29,7 @@ def set_fuzzy_config_params(config, candidate_keys, value):
             config[key] = value
     return config
 
-
+# 编码器和量化器和解码器的配置
 class UniversalTokenModule(nn.Module):
     """SONIC-style action transform module (ATM) with FSQ token bottleneck.
 
@@ -492,7 +492,10 @@ class UniversalTokenModule(nn.Module):
             index += all_dim
         assert index == tokenizer_obs.shape[-1], f"{index=}, {tokenizer_obs.shape[-1]=}"
         return tokenizer_obs_dict
-
+    # 让不同的环境去走不同的编码器，比如环境0-1000 → G1编码器（机器人自主运动）
+    # 环境1001-2000 → SMPL编码器（人体动捕）
+    # 环境2001-3000 → Teleop编码器（VR遥操作）
+    # 同时有些环境走两个编码器（用于对齐损失）
     def create_encoder_masks(self, tokenizer_obs):
         """Create encoder masks for each encoder.
 
@@ -538,7 +541,7 @@ class UniversalTokenModule(nn.Module):
                 for mask_name, mask_src, mask_cond in mask_defs:
                     encoder_masks[mask_name] = encoder_masks[mask_src][encoder_masks[mask_cond]]
         return encoder_masks
-
+    # token组装，每个编码器只处理了自己的那部分环境，需要把分散的 token 拼回一个完整的 batch
     def assemble_all_tokens(self, encoded_tokens, encoder_masks, batch_size, seq_len):
         """Scatter per-encoder tokens into a single batch-aligned tensor.
 
