@@ -1,0 +1,8 @@
+# @package algo.config.actor.backbone
+# G1-only auxiliary loss: just reconstruction, no cross-modal alignment.
+
+defaults:
+  - terms/g1_recon@aux_loss_func
+
+aux_loss_coef:
+  g1_recon: 0.01
