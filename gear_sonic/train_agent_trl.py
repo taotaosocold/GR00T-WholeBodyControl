@@ -150,9 +150,21 @@ def create_manager_env(config, device, args_cli):
 
     env = ManagerEnvWrapper(env, env_instance_cfg.config)
     return env
+# 这个是sonic默认配置的启动命令
+# accelerate launch --num_processes=8 gear_sonic/train_agent_trl.py \
+#     +exp=manager/universal_token/all_modes/sonic_release \
+#     +checkpoint=sonic_release/last.pt \
+#     num_envs=4096 headless=True \
+#     ++manager_env.commands.motion.motion_lib_cfg.motion_file=data/motion_lib_bones_seed/robot_filtered \
+#     ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=data/smpl_filtered
+# 我会以这个为开始去讲述整个数据流
 
 
+# 从当前的脚本下去寻找配置目录"config"即gear_sonic/config，配置文件名字为"base"即gear_sonic/config/base.yaml
+# 而启动命令比如里面有+exp=manager/universal_token/all_modes/sonic_release相当于在base.yaml的default配置下直接加一条- exp/manager/universal_token/all_modes/sonic_release
+# 而这里面刚好就有比较详细的algo或者env等详细的配置
 @hydra.main(config_path="config", config_name="base", version_base="1.1")
+# 根据上一行最后会得到一个很大的.yaml的配置文件，是一种字典类型的DictConfig类型，作为config变量去传给main函数
 def main(config: OmegaConf):
     simulator_type = "IsaacSim"
     env_config = config.manager_env
@@ -168,7 +180,7 @@ def main(config: OmegaConf):
         resume_checkpoint(config)
 
     config.algo.trl.output_dir = str(Path(config.experiment_dir))
-
+    # 用parser去解析配置文件中的训练部分的配置
     script_args, training_args, model_args = parser.parse_dict(config.algo.trl)
 
     # Add exp_name from main config to training_args
@@ -181,6 +193,8 @@ def main(config: OmegaConf):
     # 使用 HuggingFace Accelerate 库处理多 GPU / 分布式训练
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=6000))
+    # sonic默认启动命令中有一行是accelerate launch --num_processes=8，表示会启动8个独立python进程（每个GPU一个），它们运行同一份代码，通过NCCL通信
+    # 这里是创建了一个Accelerator的实例
     accelerator = Accelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs, kwargs],
@@ -377,7 +391,7 @@ def main(config: OmegaConf):
             env.config["robot"]["actions_dim"] = config.manager_env.config.meta_action_dim
         else:
             env.config["robot"]["actions_dim"] = env.env.action_space.shape[-1]
-
+        # 策略类
         policy = custom_instantiate(
             config.algo.config.actor,
             env_config=env.config,
@@ -453,11 +467,11 @@ def main(config: OmegaConf):
         args=training_args,
         config=config.algo.config,
         env=env,
-        model=policy,
-        disc_model=disc_model,
-        value_model=value_model,
-        ref_model=ref_model,
-        use_ref_model=getattr(config.algo.config, "use_dagger", False),
+        model=policy,   # actor网络即编码器->FSQ->解码器
+        disc_model=disc_model,  # 可选，判别期网络
+        value_model=value_model,    # critic网络
+        ref_model=ref_model,    # 可选，冻结的参考网络是actor网络的副本，参数不更新，用于计算KL散度惩罚，是一种正则化手段
+        use_ref_model=getattr(config.algo.config, "use_dagger", False), # 控制是否去启用ref_model，默认false
         train_dataset=None,
         eval_dataset=None,
         callbacks=callbacks,
