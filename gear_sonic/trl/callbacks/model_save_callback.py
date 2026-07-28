@@ -120,8 +120,15 @@ class ModelSaveCallback(TrainerCallback):
     ):
         if model is not None:
             # Save model, optimizer, scheduler and training state
-            _state = copy.deepcopy(state)
-            _state.__dict__.pop("log_history")
+            # Do not deepcopy the trainer state here. It contains CUDA tensors
+            # (for example the per-environment reward/length accumulators), and
+            # log_history may also contain tensors produced by environment
+            # metrics. Deep-copying either clones the underlying CUDA storage
+            # before torch.save and can fail in embedded runtimes such as Isaac
+            # Sim. A shallow copy is sufficient: we only need a separate
+            # __dict__ so removing log_history does not mutate the live state.
+            _state = copy.copy(state)
+            _state.__dict__.pop("log_history", None)
             checkpoint = {
                 "policy_state_dict": model.policy.state_dict(),
                 "value_state_dict": (
