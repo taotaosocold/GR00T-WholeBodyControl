@@ -31,6 +31,8 @@ algo:
         num_future_frames: ${manager_env.commands.motion.num_future_frames}
         proprioception_features: ["actor_obs"]
         encoder_sample_probs: ${manager_env.commands.motion.encoder_sample_probs}
+        # 这里配置fsq，其中num_fsq_levels就是量化的向量维度长度，fsq_level_list就是将向量每一项可以映射为不同的离散值
+        # max_num_tokens就是一次可以输出多少个量化后的向量
         num_fsq_levels: 32
         fsq_level_list: 32
         max_num_tokens: 2

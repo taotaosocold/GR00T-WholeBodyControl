@@ -224,6 +224,7 @@ class UniversalTokenModule(nn.Module):
             )
         else:
             self.quantizer = None
+        # 初始化变量
         self.num_fsq_levels = num_fsq_levels
         self.fsq_level_list = fsq_level_list
 
@@ -669,6 +670,7 @@ class UniversalTokenModule(nn.Module):
             Otherwise: (encoded_tokens, latent) tuple
         """
         # Get base encoder latent
+        # 这里最后输出的是(N, 2, 32)就是两个32维度的连续向量
         latent = self._encode_single(
             encoder_name, tokenizer_obs, encoder_mask, frame_mask=frame_mask
         )
@@ -685,6 +687,7 @@ class UniversalTokenModule(nn.Module):
             return latent
 
         # quantize using quantizer
+        # 如果使用了量化器那么会经过fsq量化器量化
         if self.quantizer is not None:
             quantized_codes, _ = self.quantizer(latent)
             encoded_tokens = quantized_codes.contiguous()
