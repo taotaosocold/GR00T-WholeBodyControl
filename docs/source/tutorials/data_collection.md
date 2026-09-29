@@ -10,6 +10,8 @@ Everything runs **offboard on your workstation** except the **camera server**, w
 ```{admonition} Supported cameras
 :class: note
 The tested and supported camera setup uses **Luxonis OAK cameras** (OAK-D, OAK-1, etc.). This includes a head/ego-view OAK camera and optional OAK wrist cameras. Other camera drivers (RealSense, USB webcam) are included in the codebase but have not been tested recently.
+
+A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under [`hardware/camera_mount/`](https://github.com/NVlabs/GR00T-WholeBodyControl/blob/main/hardware/camera_mount/README.md) — see its README for print settings, the bill of materials, and how it mounts on the G1.
 ```
 
 ```{admonition} Prerequisites
@@ -276,6 +278,8 @@ Common options:
 | `--deploy-obs-config` | *(default)* | Custom observation config for deploy.sh |
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
+| `--deploy-motor-kp-scale` | *(disabled)* | Hardware motor Kp scale specification forwarded to deploy.sh |
+| `--deploy-motor-kd-scale` | *(disabled)* | Hardware motor Kd scale specification forwarded to deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
 | `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
 
@@ -366,7 +370,7 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 | Input | Action |
 |---|---|
 | **Left Grip + A** | **Toggle** recording — starts a new episode, or stops and saves the current one |
-| **Left Grip + B** | **Discard** the current episode without saving |
+| **Left Grip + B** | **Discard** the current episode (saved to disk but flagged for removal during post-processing) |
 
 These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls.
 
@@ -375,7 +379,7 @@ These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent
 | Key | Action |
 |---|---|
 | `c` | **Toggle** recording (same as Left Grip + A) |
-| `x` | **Discard** episode (same as Left Grip + B) |
+| `x` | **Discard** episode (same as Left Grip + B — flagged for removal) |
 
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
@@ -486,6 +490,21 @@ All commands below run in the **data collection virtual environment**:
 source .venv_data_collection/bin/activate
 ```
 
+### Remove Discarded Episodes
+
+Episodes discarded during collection (`x` key or Left Grip + B) are saved to disk
+but flagged in `meta/info.json`. By default, the processing script removes these
+flagged episodes so they are excluded from fine-tuning:
+
+```bash
+# Clean a single dataset (removes discarded episodes + stale SMPL frames)
+python gear_sonic/scripts/process_dataset.py \
+    --dataset-path outputs/my_dataset \
+    --output-path outputs/my_dataset_cleaned
+```
+
+To keep discarded episodes (e.g., for inspection), pass `--no-remove-discarded`.
+
 ### Remove Stale SMPL Frames
 
 Teleop pauses or ZMQ frame drops create frames where `teleop.smpl_pose` is all
@@ -501,6 +520,18 @@ python gear_sonic/scripts/process_dataset.py \
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/my_dataset \
     --output-path outputs/my_dataset_cleaned
+```
+
+```{warning}
+If you collected data using **VR 3-point tracking mode** (VR_3PT), the
+`teleop.smpl_pose` column will be all zeros because VR_3PT uses raw VR
+positions/orientations instead of SMPL body parameters. In this case, you
+**must** disable SMPL cleaning to avoid dropping all frames:
+
+    python gear_sonic/scripts/process_dataset.py \
+        --dataset-path outputs/my_dataset \
+        --output-path outputs/my_dataset_cleaned \
+        --no-remove-stale-smpl
 ```
 
 ### Merge Multiple Datasets
