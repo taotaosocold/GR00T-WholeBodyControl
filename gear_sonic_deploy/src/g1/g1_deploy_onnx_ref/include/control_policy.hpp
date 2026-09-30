@@ -53,6 +53,7 @@ public:
    * @param use_fp16 Whether to use FP16 precision
    * @return true if initialization successful, false otherwise
    */
+  // 传入模型路径和精度设置，use_fp16表示是否采用FP16精度，默认值是false，也就是调用时如果不传第二个参数就使用FP32
   bool Initialize(const std::string& model_path, bool use_fp16 = false) {
     if (model_path.empty()) {
       std::cerr << "✗ PolicyEngine::Initialize - Empty model path" << std::endl;
@@ -64,7 +65,7 @@ public:
 
     try {
       std::cout << "Loading policy model..." << std::endl;
-
+      // 创建一个TRTInferenceEngine的指针对象inference_engine_
       inference_engine_ = std::make_unique<TRTInferenceEngine>();
 
       // Setup options for ONNX to TensorRT conversion
@@ -77,12 +78,13 @@ public:
       }
 
       std::string cached_trt_file;
+      // 调用 ConvertONNXToTRT，尝试根据 model_path 指向的 ONNX 模型创建或找到对应的 TensorRT 引擎
       if (!ConvertONNXToTRT(options, model_path, cached_trt_file, prefix, false)) {
         std::cerr << "✗ Failed to convert policy ONNX to TRT: " << model_path << std::endl;
         inference_engine_.reset();
         return false;
       }
-
+      // 加载TensorRT引擎并准备输入
       if (!inference_engine_->Initialize(cached_trt_file, options.deviceID, options.dynamic_axes_names)) {
         std::cerr << "✗ Failed to initialize policy TensorRT model: " << cached_trt_file << std::endl;
         inference_engine_.reset();

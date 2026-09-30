@@ -1,4 +1,5 @@
 #!/bin/bash
+# set -e就是只要某条命令执行失败并返回非 0，脚本原则上立即退出
 set -e
 
 # ============================================================================
@@ -6,7 +7,8 @@ set -e
 # ============================================================================
 # This script handles the complete setup and deployment process for g1_deploy
 # Following the steps from the README.md
-#
+# 这里说明了脚本支持四种启动模式：sim、real、指定接口名(eth0)、指定IP地址(192.168.123.100)
+# 如果不带任何参数./deploy.sh这样就默认是real也就是./deploy.sh real
 # Usage: ./deploy.sh [sim|real|<interface_name>|<ip_address>]
 #   sim   - Use loopback interface for simulation (MuJoCo)
 #   real  - Auto-detect robot network interface (192.168.123.x)
@@ -17,6 +19,7 @@ set -e
 # ============================================================================
 
 # Colors for output
+# 定义终端颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -25,6 +28,9 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Script directory (where this script is located)
+# 确定脚本自己的目录，假设脚本路径是：/home/user/g1_deploy/deploy.sh
+# 那么${BASH_SOURCE[0]}就是/home/user/g1_deploy/deploy.sh，dirname就是取目录/home/user/g1_deploy
+# 所以得到的SCRIPT_DIR就是/home/user/g1_deploy，然后cd进入该目录，这么做是为了后续方便相对路径引用其他文件
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -34,7 +40,13 @@ cd "$SCRIPT_DIR"
 
 # Get all network interfaces and their IPs
 # Returns lines of: interface_name:ip_address
+# 函数：扫描电脑的所有网络接口
+# 输出形式：
+# lo:127.0.0.1
+# eth0:192.168.123.10
+# wlan0:192.168.1.20
 get_network_interfaces() {
+    # 如果是macOS系统，使用ifconfig命令获取网络接口和IP地址（macos系统通常返回Darwin）
     if [[ "$(uname)" == "Darwin" ]]; then
         # macOS
         ifconfig | awk '
@@ -42,6 +54,7 @@ get_network_interfaces() {
             /inet / { print iface ":" $2 }
         '
     else
+    # 如果是linux系统则使用ip -4 addr show命令获取网络接口和IP地址
         # Linux
         ip -4 addr show 2>/dev/null | awk '
             /^[0-9]+:/ { gsub(/:$/, "", $2); iface=$2 }
@@ -61,6 +74,8 @@ get_network_interfaces() {
 
 # Find interface by IP address
 # Returns interface name or empty string
+# 函数：根据指定的IP地址查找对应的网络接口
+# 例如lo:127.0.0.1，eth0:192.168.123.10，则执行find_interface_by_ip "127.0.0.1"返回lo
 find_interface_by_ip() {
     local target_ip="$1"
     get_network_interfaces | while IFS=: read -r iface ip; do
@@ -73,6 +88,8 @@ find_interface_by_ip() {
 
 # Find interface with IP matching a prefix
 # Returns interface name or empty string
+# 函数：根据指定的IP前缀查找对应的网络接口，例如eth0:192.168.123.10
+# 则执行find_interface_by_ip_prefix "192.168.123."返回eth0
 find_interface_by_ip_prefix() {
     local prefix="$1"
     get_network_interfaces | while IFS=: read -r iface ip; do
@@ -84,6 +101,7 @@ find_interface_by_ip_prefix() {
 }
 
 # Check if string is an IP address
+# 判断是否是ip地址，判断方式就是是否是数字.数字.数字.数字的形式
 is_ip_address() {
     local input="$1"
     if [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -93,6 +111,7 @@ is_ip_address() {
 }
 
 # Check if interface has a specific IP
+# 检查一个网卡是不是拥有某个 IP
 interface_has_ip() {
     local iface="$1"
     local target_ip="$2"
@@ -107,6 +126,9 @@ interface_has_ip() {
 # Resolve interface parameter to actual network interface name and environment type
 # Arguments: interface - "sim", "real", or direct interface name or IP address
 # Outputs: Sets TARGET and ENV_TYPE variables
+# 最重要的网络函数，会调用上述的一堆函数，最后得到两个变量TARGET和ENV_TYPE
+# 其中TARGET是最终要使用的网络接口名比如lo或者eth0，ENV_TYPE是环境类型sim或real，通常sim的话就是lo
+# 如果是real的话就是eth0，例如./deploy.sh 127.0.0.1就最后得到TARGET=lo，ENV_TYPE=sim
 resolve_interface() {
     local interface="$1"
     local os_type="$(uname)"
@@ -198,7 +220,7 @@ resolve_interface() {
 # ============================================================================
 # Parse Command Line Arguments
 # ============================================================================
-
+# 帮助菜单
 show_usage() {
     echo "Usage: $0 [OPTIONS] [sim|real|<interface>]"
     echo ""
@@ -232,20 +254,28 @@ show_usage() {
     echo "  $0 --planner planner/custom.onnx --input-type keyboard real  # Use custom planner and input"
     echo "  $0 --motion-data reference/custom_motion/ sim  # Use custom motion data"
 }
-
+# 默认配置，默认是real模式
 # Default interface mode
 INTERFACE_MODE="real"
 
 # Default configuration values (can be overridden by command line)
+# 模型默认路径，从huggingface上下载的模型就是放在policy/release/model目录下
 CHECKPOINT_DEFAULT="policy/release/model"
+# 观测默认配置
 OBS_CONFIG_DEFAULT="policy/release/observation_config.yaml"
+# 规划器默认路径，这个是分层架构，能够根据速度来生成运动序列
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
+# 运动序列默认路径，这里不是指向一个具体的文件，而是指向一个目录，里面有很多运动序列文件
 MOTION_DATA_DEFAULT="reference/example/"
+# 默认创建输入管理器，它把键盘、手柄、ZMQ 和 ROS 2 输入整合起来，可在运行时切换
 INPUT_TYPE_DEFAULT="manager"
+# 创建所有当前构建可用的输出接口，主要是 ZMQ
 OUTPUT_TYPE_DEFAULT="all"
+# 指定ZMQ主机，默认是localhost，也就是ZMQ发布者和部署程序在同一台机器
 ZMQ_HOST_DEFAULT="localhost"
 
 # Initialize with defaults (will be set after parsing)
+# 初始化变量，初始化为默认值
 CHECKPOINT="$CHECKPOINT_DEFAULT"
 OBS_CONFIG="$OBS_CONFIG_DEFAULT"
 PLANNER="$PLANNER_DEFAULT"
@@ -253,10 +283,12 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+# 初始化kp和kd的数组
 MOTOR_KP_SCALES=()
 MOTOR_KD_SCALES=()
 
 # Parse arguments
+# 命令行参数解析，这里参数可以指定是仿真还是实机
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help)
@@ -350,7 +382,7 @@ done
 # ============================================================================
 # Display Header
 # ============================================================================
-
+# 打印启动logo
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════════════════════════╗"
 echo "║                         G1 DEPLOY LAUNCHER                           ║"
@@ -363,9 +395,9 @@ echo -e "${NC}"
 
 echo -e "${BLUE}[Interface Resolution]${NC}"
 echo "Requested mode: $INTERFACE_MODE"
-
+# 这里调用了上面定义的resolve_interface函数，最终得到TARGET和ENV_TYPE两个变量
 resolve_interface "$INTERFACE_MODE"
-
+# 打印得到的这两个变量TARGET和ENV_TYPE
 echo -e "Resolved interface: ${GREEN}$TARGET${NC}"
 echo -e "Environment type:   ${GREEN}$ENV_TYPE${NC}"
 echo ""
@@ -378,6 +410,7 @@ echo ""
 # CHECKPOINT and OBS_CONFIG are already set from argument parsing above
 
 # Decoder and Encoder ONNX models
+# 把 checkpoint 拆成 encoder 和 decoder
 CHECKPOINT_DECODER="${CHECKPOINT}_decoder.onnx"
 CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 
@@ -400,12 +433,14 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # ZMQ_HOST is already set from argument parsing above
 
 # Additional flags for simulation mode
+# 额外参数统一存在这里，sim 模式自动加：--disable-crc-check，也就是mujoco不进行crc检查
 EXTRA_ARGS=()
 if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS+=("--disable-crc-check")
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
 fi
+# 把 KP/KD scale 转成最终程序参数
 for scale in "${MOTOR_KP_SCALES[@]}"; do
     EXTRA_ARGS+=("--motor-kp-scale" "$scale")
 done
@@ -420,6 +455,8 @@ done
 echo -e "${BLUE}[Step 1/4]${NC} Checking prerequisites..."
 
 # Check for TensorRT
+# 检查TensorRT，首先检查有没有设置TensorRT_ROOT环境变量，如果没有设置就提示用户设置，并且给出下载地址
+# 并且检查$HOME/TensorRT目录是否存在，如果存在就临时设置TensorRT_ROOT为$HOME/TensorRT
 if [ -z "$TensorRT_ROOT" ]; then
     echo -e "${YELLOW}⚠️  TensorRT_ROOT is not set.${NC}"
     echo "   Please ensure TensorRT is installed and add to your ~/.bashrc:"
@@ -435,6 +472,7 @@ if [ -z "$TensorRT_ROOT" ]; then
 fi
 
 # Check for required model files
+# 检查一个文件是否存在，如果不存在就提示用户缺少文件
 check_file() {
     if [ ! -f "$1" ]; then
         echo -e "${RED}❌ Missing file: $1${NC}"
@@ -448,7 +486,7 @@ check_file() {
 echo ""
 echo "Checking required model files..."
 MISSING_FILES=0
-
+# 检查部署需要的四个文件是否存在，encoder和decoder和planner和obs_config
 check_file "$CHECKPOINT_DECODER" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$CHECKPOINT_ENCODER" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$OBS_CONFIG" || MISSING_FILES=$((MISSING_FILES + 1))
@@ -471,10 +509,11 @@ echo ""
 # ============================================================================
 # Step 2: Install Dependencies (if needed)
 # ============================================================================
-
+# 第二步检查just
 echo -e "${BLUE}[Step 2/4]${NC} Checking/Installing dependencies..."
 
 # Check if just is installed
+# 检查系统有没有just，just可以理解为就是make的任务执行工具，如果没有just这里直接执行scripts/install_deps.sh安装依赖
 if ! command -v just &> /dev/null; then
     echo "Installing dependencies (just not found)..."
     chmod +x scripts/install_deps.sh
@@ -485,6 +524,7 @@ fi
 
 # Check if other essential tools are available
 DEPS_OK=true
+# 再检查cmake、clang、git是否安装，如果没有安装就提示用户安装，并且执行scripts/install_deps.sh安装依赖
 for cmd in cmake clang git; do
     if ! command -v $cmd &> /dev/null; then
         echo -e "${YELLOW}⚠️  $cmd not found, will run install_deps.sh${NC}"
@@ -512,11 +552,14 @@ echo -e "${BLUE}[Step 3/4]${NC} Setting up environment and building..."
 # Source the environment setup script
 echo "Sourcing environment setup..."
 set +e  # Temporarily allow errors (for jetson_clocks on non-Jetson systems)
+# 加载部署环境变量，主要是设置TensorRT_ROOT和LD_LIBRARY_PATH
 source scripts/setup_env.sh
 set -e  # Re-enable exit on error
 
 # Always build to ensure we have the latest version
 echo "Building the project..."
+# 类似于make，执行just build命令，编译部署程序，我们知道make是根据Makefile文件来编译程序，而just是根据.justfile文件来编译程序
+# .justfile文件中定义了各种任务和依赖关系
 just build
 
 echo ""
@@ -524,7 +567,7 @@ echo ""
 # ============================================================================
 # Step 4: Deploy
 # ============================================================================
-
+# 打印最终 Deployment Configuration，便于用户确认
 echo -e "${BLUE}[Step 4/4]${NC} Ready to deploy!"
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -577,7 +620,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
     echo ""
-    
+    # 这句话就是整个部署的核心命令，执行just run g1_deploy_onnx_ref，后面跟着各种参数
     just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
         --obs-config "$OBS_CONFIG" \
         --encoder-file "$CHECKPOINT_ENCODER" \

@@ -120,6 +120,7 @@ public:
    * 
    * This method parses both the observations section and optional encoder section.
    */
+  // 解析观测配置文件也就是obs_config参数指向的路径文件，这里默认是这个文件/home/ubuntu/桌面/GR00T-WholeBodyControl/gear_sonic_deploy/policy/release/observation_config.yaml
   static FullObservationConfig ParseFullConfig(const std::string& config_path) {
     FullObservationConfig full_config;
     std::ifstream file(config_path);

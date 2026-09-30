@@ -165,15 +165,21 @@ using namespace unitree_hg::msg::dds_;
  * Four real-time threads handle Input (100 Hz), Control (50 Hz),
  * Planner (10 Hz), and Command Writing (500 Hz).
  */
+ // 最核心的类
 class G1Deploy {
   private:
     /// State machine for the control loop lifecycle.
+    // 这里首先定义了一个状态机，包括三种模式
+    // INIT: 初始化状态，等待机器人发送有效的LowState消息。
+    // WAIT_FOR_CONTROL: 机器人已经ready，等待操作者start
+    // CONTROL: 正式运行policy
     enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
     
     // =========================================================================
     // Core timing, mode, and counters
     // =========================================================================
     double time_;          ///< Elapsed time since start (used during INIT ramp-up).
+    // 这里有四个dt，control_dt就是策略推理频率，planner_dt是planner的推理频率，input_dt是部署端轮询输入接口的周期
     double publish_dt_;    ///< Command writer period (500 Hz = 0.002 s).
     double control_dt_;    ///< Control loop period  (50 Hz = 0.02 s).
     double planner_dt_;    ///< Planner loop period  (10 Hz = 0.1 s).
@@ -210,9 +216,11 @@ class G1Deploy {
     // Motion data, current motion, and recording
     // =========================================================================
     // Motion data reader and current motion
+    // 这个类构建的对象就是读取离线参考运动序列的类和对象
     MotionDataReader motion_reader_;
     
     // Current motion and frame (using shared_ptr for thread safety)
+    // 这个current_motion_表示当前正在跟踪第几帧
     std::shared_ptr<const MotionSequence> current_motion_ = nullptr;
     int current_frame_ = 0;
     int saved_frame_for_observation_window_ = 0; // for observation window
@@ -224,6 +232,8 @@ class G1Deploy {
     // New unified planner interface
     std::string planner_path;
     std::unique_ptr<LocalMotionPlannerBase> planner_;
+    // 数据集有两个来源，要么是预加载的离线数据MotionDataReader要么是planner生成的planner_motion_
+    // 但最后policy是不在乎reference从哪里来的，因为最后都会赋值给current_frame_，policy读的是这个变量
     std::shared_ptr<MotionSequence> planner_motion_;
     
     // Movement momentum system
@@ -360,6 +370,10 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds TOKEN_TIMEOUT_MS{200};  // Max time between tokens before warning (200ms = 5Hz min)
     
     // Control policy
+    // 策略引擎类型。它负责加载 ONNX 模型、准备 TensorRT 推理
+    // 并管理输入输出缓冲区和 CUDA 资源，定义在 control_policy.hpp
+    // 这里并不是用类PolicyEngine构建了一个对象policy_engine_，而是构建了一个policy_engine_的指针
+    // 其能指向一个PolicyEngine的对象
     std::unique_ptr<PolicyEngine> policy_engine_;
     
     // =========================================================================
@@ -368,9 +382,16 @@ class G1Deploy {
     // Function pointer type for observation functions (returns bool for success/failure)
     // Functions read from internal state (state_logger_, current_motion_, etc.)
     // and write to the provided target buffer at the given offset
+    // 解释一下这句话，这里定义了一个function函数，这个函数输入必须包括vector<double>&和size_t然后返回一个bool变量
+    // 但是这个函数具体长什么样，也就是什么情况会返回true还是false不知道。然后这里ObservationFunction相当于定义了这个函数类型
+    // 后续如果出现了ObservationFunction a;那么a就变成了一个函数，并且这个函数必须输入vector<double>&和size_t
+    // 并且返回一个bool变量，并且我们在用ObservationFunction去申明a是函数的时候必须告诉这个函数a到底长什么样
+    // 比如ObservationFunction a = [](std::vector<double>& values, size_t offset) {
+    //      values[offset] = 1.0; return true;};
     using ObservationFunction = std::function<bool(std::vector<double>&, size_t)>;
     
     // Observation registry - single place to define all observations
+    // 定义观测注册的结构体，并且定义结构体的构造函数，每一个观测都会有一个观测名字，观测维度和观测函数
     struct ObservationRegistry {
       std::string name;
       size_t dimension;
@@ -1705,6 +1726,9 @@ class G1Deploy {
     // =========================================================================
 
     /// Build the complete observation registry (name, dimension, gatherer function).
+    // 前面说了ObservationRegistry是一个结构体，内容包括观测名称、观测纬度、观测函数（返回bool变量）
+    // 这里定义GetObservationRegisry函数是vector<ObservationRegistry>也就是要返回一堆这个
+    // 下面每个return 后面的函数都是返回的bool变量，表示观测数据是否成功计算并写入
     std::vector<ObservationRegistry> GetObservationRegistry() {
       // Use token dimension from encoder config (defaults to 64 if not configured)
       size_t token_dim = (encoder_config_.dimension > 0) ? encoder_config_.dimension : 64;
@@ -1817,30 +1841,38 @@ class G1Deploy {
     // Initialize observation functions
     void InitializeObservationFunctions() {
       // Get all available observations from registry (single source of truth!)
+      // 取得所有可用的观测定义，返回一个观测注册表，每个条目包含：观测名称 + 维度 + 对应的观测计算函数
+      // 比如"motion_joint_positions" → 29 维 → GatherMotionJointPositionsMultiFrame(...)
       auto registry = GetObservationRegistry();
       
       // =========================================================================
       // Initialize policy observations
       // =========================================================================
+      // 建立策略模型的观测函数列表，并把输入向量的写入位置从 0 开始
       active_obs_functions_.clear();
       size_t current_offset = 0;
-      
+      // 按配置文件里的顺序逐项检查策略观测。顺序很重要，因为它决定观测数据拼进模型输入向量时的排列顺序。
+      // 所以YAML里的观测顺序决定了模型最后的观测顺序
       for (const auto& config : obs_config_) {
+        //如果该观测在 YAML 中 enabled: false，就跳过，不加入模型输入。
         if (!config.enabled) continue;
         
         // Find observation in registry
+        // 在注册表中查找名称与配置项相同的观测。
         auto registry_it = std::find_if(registry.begin(), registry.end(),
           [&config](const ObservationRegistry& obs) {
             return obs.name == config.name;
           });
-        
+        // 找不到名称就说明 YAML 配置引用了程序不认识的观测函数。此时抛出异常，阻止程序继续初始化。
         if (registry_it == registry.end()) {
           std::cerr << "✗ Error: Unknown observation function '" << config.name << "' in configuration!" << std::endl;
           throw std::runtime_error("Invalid observation configuration: unknown function '" + config.name + "'");
         }
         
         // Get dimension directly from registry entry
+        // 获得当前选到的观测的维度
         size_t dimension = registry_it->dimension;
+        // 维度为 0 属于无效配置，因此也会报错退出
         if (dimension == 0) {
           std::cerr << "✗ Error: Observation function '" << config.name << "' has invalid dimension!" << std::endl;
           throw std::runtime_error("Invalid observation configuration: zero dimension for '" + config.name + "'");
@@ -1852,6 +1884,7 @@ class G1Deploy {
       }
       
       // Validate total dimension matches model input
+      // 获得模型的输入维度大小
       size_t model_input_dim = policy_engine_->GetInputDimension();
       if (current_offset != model_input_dim) {
         std::cerr << "✗ Error: Total observation dimension (" << current_offset 
@@ -1862,7 +1895,10 @@ class G1Deploy {
       // =========================================================================
       // Initialize encoder observations (only if encoder is actually loaded)
       // =========================================================================
+      // 清空 encoder 观测函数列表。
       active_encoder_obs_functions_.clear();
+      // 当encoder_engine_存在并且encoder模型已经初始化并且配置里的encoder输出token维度大于0
+      // 并且YAML中配置了encoder的输入观测才设置encoder观测
       if (encoder_engine_ && encoder_engine_->IsInitialized() && encoder_config_.dimension > 0 && !encoder_config_.encoder_observations.empty()) {
         std::cout << "Initializing encoder observations..." << std::endl;
         size_t encoder_offset = 0;
@@ -2150,7 +2186,7 @@ class G1Deploy {
 
   public:
     OperatorState operator_state;
-
+    // G1Deploy的构造函数，要传入一堆变量，包括网络、模型路径、运动序列路径等
     G1Deploy(
       std::string networkInterface,
       std::string model_file_path,
@@ -2181,6 +2217,14 @@ class G1Deploy {
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
       MotorGainScaleConfig motor_gain_scales = {})
+      // 在G1Deploy的构造函数具体内容前，先给成员初始化，结构如下：
+      // G1Deploy(                  // 构造函数名
+      //   参数列表                 // 调用者传进来的数据
+      // )
+      // : 成员初始化列表           // 用参数或默认值初始化对象成员
+      // {
+      //   构造函数体               // 执行初始化工作
+      // }
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2202,7 +2246,8 @@ class G1Deploy {
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
-
+      // 构造函数的函数体的开始
+      // 首先处理kp和kd的缩放设置
       const auto kp_scales = format_motor_gain_scales(motor_gain_scales_.kp);
       const auto kd_scales = format_motor_gain_scales(motor_gain_scales_.kd);
       if (!kp_scales.empty()) {
@@ -2215,11 +2260,13 @@ class G1Deploy {
       }
       
       // Initialize ChannelFactory
+      // 初始化Unitree SDK的DDS通道
       ChannelFactory::Instance()->Init(0, networkInterface);
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
+      // 初始化Dex3手部
       dex3_hands_.initialize("");
-
+      // 初始化音频线程
       audio_thread_ = std::make_unique<AudioThread>();
 
       if(!target_motion_file_path.empty())
@@ -2288,14 +2335,18 @@ class G1Deploy {
       }
 
       // create publisher
+      // 创建LowCmd Publisher
       lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
       lowcmd_publisher_->InitChannel();
       // create subscriber
+      // 创建 LowState Subscriber，一旦订阅到消息立马执行函数LowStateHandler
       lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
+      // 创建 Torso IMU Subscriber，一旦订阅到消息立马执行函数imuTorsoHandler
       imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
       // Load motion data
+      // 根据运动序列的路径去读取数据，这里必须要求是csv类型的文件
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
         if (!motion_reader_.motions.empty()) {
           std::cout << "✓ Motion data loaded successfully!" << std::endl;
@@ -2327,8 +2378,10 @@ class G1Deploy {
       }
       
       // Initialize control policy
+      // policy_engine_已经在构造函数前已经被定义是PolicyEngine的指针
+      // 现在这里就是给其分配一个对象，让其指向这个对象
       policy_engine_ = std::make_unique<PolicyEngine>();
-      
+      // 调用这个对象的函数Initialize
       if (!policy_engine_->Initialize(model_path, policy_fp16)) {
         throw std::runtime_error("Failed to initialize control policy from: " + model_path);
       }
@@ -2346,9 +2399,80 @@ class G1Deploy {
 
       // Load observation configuration FIRST (before encoder/planner initialization)
       std::cout << "Loading observation configuration..." << std::endl;
+      // FullObserationConifg是一个结构体，在observation_config.hpp上被定义，这个结构体包含两个内容
+      // std::vector<ObservationConfig> observations;和EncoderConfig encoder;大概就长这样：
+      // FullObservationConfig {
+      //   observations = {
+      //     {"token_state", true},
+      //     {"his_base_angular_velocity_10frame_step1", true},
+      //     {"his_body_joint_positions_10frame_step1", true},
+      //     {"his_body_joint_velocities_10frame_step1", true},
+      //     {"his_last_actions_10frame_step1", true},
+      //     {"his_gravity_dir_10frame_step1", true}
+      //   },
+
+      //   encoder = {
+      //     dimension = 64,
+      //     use_fp16 = false,
+
+      //     encoder_observations = {
+      //       {"encoder_mode_4", true},
+      //       {"motion_joint_positions_10frame_step5", true},
+      //       {"motion_joint_velocities_10frame_step5", true},
+      //       {"motion_root_z_position_10frame_step5", true},
+      //       {"motion_root_z_position", true},
+      //       {"motion_anchor_orientation", true},
+      //       {"motion_anchor_orientation_10frame_step5", true},
+      //       {"motion_joint_positions_lowerbody_10frame_step5", true},
+      //       {"motion_joint_velocities_lowerbody_10frame_step5", true},
+      //       {"vr_3point_local_target", true},
+      //       {"vr_3point_local_orn_target", true},
+      //       {"smpl_joints_10frame_step1", true},
+      //       {"smpl_anchor_orientation_10frame_step1", true},
+      //       {"motion_joint_positions_wrists_10frame_step1", true}
+      //     },
+
+      //     encoder_modes = {
+      //       {
+      //         name = "g1",
+      //         mode_id = 0,
+      //         required_observations = {
+      //           "encoder_mode_4",
+      //           "motion_joint_positions_10frame_step5",
+      //           "motion_joint_velocities_10frame_step5",
+      //           "motion_anchor_orientation_10frame_step5"
+      //         }
+      //       },
+      //       {
+      //         name = "teleop",
+      //         mode_id = 1,
+      //         required_observations = {
+      //           "encoder_mode_4",
+      //           "motion_joint_positions_lowerbody_10frame_step5",
+      //           "motion_joint_velocities_lowerbody_10frame_step5",
+      //           "vr_3point_local_target",
+      //           "vr_3point_local_orn_target",
+      //           "motion_anchor_orientation"
+      //         }
+      //       },
+      //       {
+      //         name = "smpl",
+      //         mode_id = 2,
+      //         required_observations = {
+      //           "encoder_mode_4",
+      //           "smpl_joints_10frame_step1",
+      //           "smpl_anchor_orientation_10frame_step1",
+      //           "motion_joint_positions_wrists_10frame_step1"
+      //         }
+      //       }
+      //     }
+      //   }
+      // }
       FullObservationConfig full_obs_config;
+      // 如果观测配置的路径不为空
       if (!obs_config_path.empty()) {
         std::cout << "Using observation config file: " << obs_config_path << std::endl;
+        // 调用类ObservationConfigParser的函数ParseFullConfig去解析观测配置文件
         full_obs_config = ObservationConfigParser::ParseFullConfig(obs_config_path);
       } else {
         std::cout << "Using default observation configuration" << std::endl;
@@ -2374,25 +2498,32 @@ class G1Deploy {
       // =========================================================================
       // Note: Parser already validates that if token_state is enabled, encoder_config has dimension > 0
       // So if dimension <= 0 here, it means token_state is disabled - just ignore encoder_file_path
+      // 这里是可以选择是否去使用encoder的，因为有些用sonic的框架是分层架构，直接生成中间的token
+      // 而不是生成运动序列，所以其实decoder是必须的，而encoder并非必须
       if (!encoder_file_path.empty() && encoder_config_.dimension > 0) {
         std::cout << "Initializing encoder..." << std::endl;
+        // 这里一样构建类EncoderEngine的指针对象encoder_engine_
         encoder_engine_ = std::make_unique<EncoderEngine>();
-        
+        // 初始化这个对象的一些默认配置，如果初始化失败直接报错
         if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16)) {
           throw std::runtime_error("Failed to initialize encoder engine from: " + encoder_file_path);
         }
         
         // Validate encoder output dimension matches config
+        // 获得encoder的维度也就是token维度
         if (encoder_engine_->GetTokenDimension() != static_cast<size_t>(encoder_config_.dimension)) {
           std::cerr << "⚠ Warning: Encoder model output dimension (" << encoder_engine_->GetTokenDimension() 
                     << ") doesn't match config dimension (" << encoder_config_.dimension << ")" << std::endl;
         }
         
         // Initialize encoder observation buffer with correct size
+        // 获得输入encoder的观测维度大小
         size_t encoder_input_size = encoder_engine_->GetInputDimension();
         encoder_obs_buffer_.resize(encoder_input_size, 0.0);
 
         // Capture CUDA graph for optimized execution
+        // 为encoder的TensorRT推理预先录制CUDA Graph，让之后重复运行encoder时可以
+        // 直接重放这张图从而减少每次推理的调度开销
         if (!encoder_engine_->CaptureGraph()) {
           throw std::runtime_error("Failed to capture encoder CUDA graph");
         }
@@ -2610,9 +2741,16 @@ class G1Deploy {
       }
 
       // create threads
+      // 创建四个线程，分别是
+      // Input()   Control()      Planner()  LowCommandWriter()
+      //  100 Hz     50 Hz          10 Hz         500 Hz
+      // 这四个线程并没有订阅LowState，上面已经创建了订阅者其收到消息的时候会自动去订阅数据
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
+      // 发表端数据，会将观测通过policy得到的存放在motor_command_buffer_的kp和kd和target_dof_pos
+      // 通过DDS发布给机器人的SDK，调用的函数是LowCommandWriter
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
                                                     &G1Deploy::LowCommandWriter, this);
+      //创建control端的线程，这个线程会以0.02s的频率去调用函数&G1Deploy::Control
       control_thread_ptr_ =
           CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
       
@@ -2620,7 +2758,7 @@ class G1Deploy {
         planner_thread_ptr_ =
           CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
       }
-          
+      // 设置线程优先级
       SetThreadPriority();
     }
 
@@ -2642,6 +2780,7 @@ class G1Deploy {
     /// DDS callback: receives a 500 Hz LowState message from the robot SDK.
     /// Validates CRC (unless disabled for MuJoCo sim) and stores the result
     /// in the thread-safe low_state_buffer_.
+    // 如果LowState订阅到消息，则执行该函数
     void LowStateHandler(const void* message) {
       LowState_ low_state = *(const LowState_*)message;
 
@@ -2668,7 +2807,7 @@ class G1Deploy {
         }
         error_monitor_.update(motorstates);
       }
-
+      // LowState上订阅到的数据最后会存入low_state_buffer_缓存区中
       low_state_buffer_.SetData(low_state);
 
       // update mode machine
@@ -2681,6 +2820,7 @@ class G1Deploy {
     /// DDS callback: receives secondary (torso) IMU data.
     void imuTorsoHandler(const void* message) {
       IMUState_ imu_torso = *(const IMUState_*)message;
+      // Imu上订阅到的数据最后会存入imu_torso_buffer_缓存区中
       imu_torso_buffer_.SetData(imu_torso);
     }
 
@@ -2691,6 +2831,7 @@ class G1Deploy {
      * into a LowCmd_ DDS message with CRC, and publishes via DDS.
      * Also publishes Dex3 hand commands at the same cadence.
      */
+    // 发布数据到LowCmd
     void LowCommandWriter() {
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
@@ -2840,6 +2981,7 @@ class G1Deploy {
      *         exceeds the safety threshold (35 rad/s).
      */
     bool GatherRobotStateToLogger() {
+      // SDK订阅获得的数据就是放在low_state_buffer_和imu_torso_buffer_下，这里赋值过来
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       auto imu_data = imu_torso_buffer_.GetDataWithTime();
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
@@ -2853,11 +2995,14 @@ class G1Deploy {
       // robot state data
       std::array<double, G1_NUM_MOTOR> body_q = {0.0};
       std::array<double, G1_NUM_MOTOR> body_dq = {0.0};
-
+      // 这里ls是从 low_state_buffer_ 取出的最新一条 Unitree LowState_ 消息
+      // 所以这句话就是这条 LowState_ 消息中取出 motor_state()，并把结果赋给 unitree_joint_state
       auto unitree_joint_state = ls->motor_state();
       std::array<double, G1_NUM_MOTOR * 2> motor_temperature = {0.0};
       std::array<double, G1_NUM_MOTOR> motor_error = {0.0};
       std::array<double, G1_NUM_MOTOR> motor_torque = {0.0};
+      // 因为unitree_joint_state是从真机中获得的数据，这是mujoco的顺序，这里换成isaaclab的顺序赋值给body_q
+      // 和body_dq
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
         body_q[i] =
             unitree_joint_state[mujoco_to_isaaclab[i]].q() - default_angles[mujoco_to_isaaclab[i]]; // URDF order
@@ -3831,10 +3976,13 @@ class G1Deploy {
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
+    // 控制端线程，会以0.02s的频率被线程调用执行
     void Control() {
+      // 如果停止标志已经设置为true则直接返回
       if (operator_state.stop) { return; }
-
+      // program_state是状态机的状态，有INIT和WAIT_FOR_CONTROL和CONTROL，每次调用执行其中一个case
       switch (program_state_) {
+        // 机器人进入默认站立状态，执行InitControl()，会在约 3 秒内逐步把目标关节角从机器人当前姿态插值到默认姿态
         case ProgramState::INIT:
           if (!InitControl()) {
             std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
@@ -3842,19 +3990,24 @@ class G1Deploy {
           }
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
+          // 重新发布机器人配置
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          // 推出switch
           break;
 
         case ProgramState::WAIT_FOR_CONTROL:
+          // 检查机器人状态数据是否有效
           if (!CheckSafety()) {
             std::cout << "[ERROR] Safety check failed, cannot start control." << std::endl;
             operator_state.stop = true;
             break;
           }
-
+          
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
+          //发布机器人状态配置
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          // operator_state.start通常由输入接口处理键盘、手柄得到，如果变成start那么就会将状态机切换为CONTROL
           if (operator_state.start) {
             // Warn if starting control in token mode without tokens, but allow it
             if (initial_encoder_mode_ == -1 && !first_token_received_) {
@@ -3871,6 +4024,7 @@ class G1Deploy {
           break;
 
         case ProgramState::CONTROL: {
+          // 先做安全检查，如果没通过则operator_state换成stop则会推出control模式
           if (!CheckSafety()) {
             std::cout << "[ERROR] Safety check failed, stopping control." << std::endl;
             operator_state.stop = true;
@@ -3878,10 +4032,11 @@ class G1Deploy {
           }
 
           // NEW: Get data with timestamps for loop timing analysis
+          // 记录本周期的时间，并递增日志计数器
           auto obs_start_time = std::chrono::steady_clock::now();
           // Increment independent logging counter every control iteration
           logging_counter_++;
-
+          // 从DDS缓冲区读取最新关节、IMU等状态并交给状态日志保存StateLogger，如果状态确实则依旧停止控制，并函数返回
           if (!GatherRobotStateToLogger()) {
             std::cout << "✗ Error: Failed to gather robot state to logger in the middle of the control loop!" << std::endl;
             operator_state.stop = true;
@@ -3890,6 +4045,7 @@ class G1Deploy {
           }
 
           // Handle temperature report request (F key)
+          // 如果操作员请求温度报告，就从最新的LowState中读取各电机温度，打印报告，并生成语音提示文本
           if (report_temperature_) {
             report_temperature_ = false;
             const auto ls = used_low_state_data_.data;
@@ -3929,7 +4085,7 @@ class G1Deploy {
               pending_tts_ = tts;
             }
           }
-
+          // 读取并缓存本周期的外部输入包括VR目标、手部目标、上半身目标和可能的外部他哦肯
           if (!GatherInputInterfaceData()) {
             return;
           }
@@ -3942,7 +4098,9 @@ class G1Deploy {
           bool current_play_copy;
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
           {
+            // 锁定动作数据，组装策略观测，加互斥锁
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            // 保存当前帧、动作指针、encoder mode和播放状态的快照
             current_frame_copy = current_frame_;
             current_motion_copy = current_motion_;
             current_encoder_mode_copy = current_motion_copy->GetEncodeMode();
@@ -3953,10 +4111,12 @@ class G1Deploy {
 
             // Update heading state (handles reinitialize_heading_ and frame-0 init)
             // Must run before any orientation observation functions
+            //重置本周期的动作前瞻窗口记录，并在计算方向相关观测前更新 heading 状态
             UpdateHeadingState();
 
             // Gather all observations using modular functions
             // This may update token_state_data_ with encoder output (if encoder is used)
+            // 按照之前初始化好的观测配置调用各个观测函数，把数据写入 obs_buffer_。
             if (!GatherObservations()) {
               std::cout << "✗ Error: Failed to gather observations in the middle of the control loop!" << std::endl;
               std::cout << "Stopping control system." << std::endl;
@@ -3967,6 +4127,7 @@ class G1Deploy {
 
           // Log post-state data (token state) to the most recent state logger entry
           // This must be called after GatherObservations() which populates token_state_data_
+          // 把token、encoder mode、动作名称和播放状态补到最新一条日志里
           if (state_logger_) {
             std::string motion_name = current_motion_copy ? current_motion_copy->name : "";
             if (!state_logger_->LogPostState(std::span(token_state_data_), current_encoder_mode_copy, motion_name, current_play_copy)) {
@@ -3975,7 +4136,11 @@ class G1Deploy {
           }
 
           auto obs_end_time = std::chrono::steady_clock::now();
-
+          // CreatePolicyCommand函数会把obs_buffer_专程策略模型需要的float输入，并运行policy推理，取得
+          // 动作输出，并把动作转换为关节目标、增益等，最后写入motor_command_buffer
+          // 这个很关键，Control端本质上做的事情就是把观测整理好然后扔给policy推理得到action得到target_dof_pos
+          // 然后将kp和kd和target_dof_pos写道motor_command_buffer这个缓冲区，但是并不发布数据
+          // 最后由LowCommandWriter()这个线程以500hz的频率通过DDS通信将这个缓冲区的数据发布给机器人的SDK
           if (!CreatePolicyCommand()) {
             std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
@@ -3985,6 +4150,7 @@ class G1Deploy {
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
+          // 更新手部、发布状态、推进动作帧
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
           
           // set hand poses (use buffered data for consistency)
@@ -4000,6 +4166,8 @@ class G1Deploy {
           auto hand_joint_end_time = std::chrono::steady_clock::now();
 
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
+          // 把状态、VR 数据、当前动作及当前帧发布给已配置的输出接口，例如 ZMQ 或 ROS 2
+          // 这里发布的是接口数据，不是前面所说的电机 LowCmd
           for (auto& output_interface : output_interfaces_) {
             if (output_interface) {
               output_interface->publish(
@@ -4011,6 +4179,7 @@ class G1Deploy {
           }
 
           // Handle recording of streamed motion (if enabled)
+          // 为真时，就会记录streamed motion或planner motion或动捕得到的数据
           if (enable_motion_recording_) {
             if (current_motion_copy && current_motion_copy->name == "streamed") {
               // Start recording session when streamed starts at frame 0
@@ -4072,7 +4241,7 @@ class G1Deploy {
             operator_state.stop = true;
             return;
           }
-
+          // 每秒打印一次耗时统计
           if (logging_counter_ % 50 == 0) {
             auto control_loop_end_time = std::chrono::steady_clock::now();
             auto obs_duration = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
@@ -4144,6 +4313,7 @@ static bool parse_motor_gain_scale_flag(
  * All other arguments are optional flags (see --help for full list).
  * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
  */
+// 从main函数开始运行，传入参数量和参数
 int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program starting..." << std::endl;
   if (argc < 4) {
@@ -4203,6 +4373,7 @@ int main(int argc, char const* argv[]) {
     exit(0);
   }
   std::cout << "[DEBUG] Arguments validated..." << std::endl;
+  // 读取三个必要参数，网口，模型路径，运动数据路径，这里会在./deploy.sh都配置好了
   std::string networkInterface = argv[1];
   std::string modelFile = argv[2];
   std::string motionDataPath = argv[3];
@@ -4234,6 +4405,7 @@ int main(int argc, char const* argv[]) {
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   MotorGainScaleConfig motor_gain_scales;
+  // 解析参数
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4477,6 +4649,11 @@ int main(int argc, char const* argv[]) {
   }
 
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
+  // 解析完参数就启动构造函数G1Deploy，这个函数是最重要的，其会初始化DDS也就是LowCmd和LowState和Imu
+  // 加载Motion、加载Policy、加载Observation config、加载encoder、加载planner、初始化Observation Functions
+  // 初始化 Input / Output Interface，最后创建4个实时线程
+  // Input()   Control()      Planner()  LowCommandWriter()
+  //  100 Hz     50 Hz          10 Hz         500 Hz
   G1Deploy custom(
     networkInterface,
     modelFile,

@@ -1,7 +1,7 @@
 # Like GNU `make`, but `just` rustier.
 # https://just.systems/
 # run `just` from this directory to see available commands
-
+# 给命令起缩写，b就是build，比如just b就相当于just build
 alias b := build
 alias r := run
 alias t := test
@@ -13,6 +13,7 @@ default:
   @just --list
 
 # Get the number of cores
+# 自动获取cpu核心数
 CORES := if os() == "macos" { `sysctl -n hw.ncpu` } else if os() == "linux" { `nproc` } else { "1" }
 
 # Build the project

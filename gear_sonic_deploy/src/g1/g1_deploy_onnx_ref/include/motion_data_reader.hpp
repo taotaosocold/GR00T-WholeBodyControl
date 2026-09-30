@@ -55,6 +55,7 @@
  * (e.g. by keyboard 'Z' key) without requiring non-const access to
  * the MotionSequence.
  */
+ // MotionSequence就是一条运动序列，每个运动序列都由一个MotionSequence的结构体去保存
 struct MotionSequence {
     std::string name = "";    ///< Human-readable motion name (folder name or "streamed" / "planner_motion").
     int timesteps = 0;        ///< Total number of frames in this motion.
@@ -669,9 +670,13 @@ private:
  * `body_lin_vel.csv`, `body_ang_vel.csv`, `smpl_joint.csv`, `smpl_pose.csv`,
  * and `metadata.txt`.
  */
+ // 这个类的ReadFromCSV函数就是处理一堆csv文件的函数
 class MotionDataReader {
   public:
+    // 一条运动序列由一个结构体MotionSequence去保存，这里MotionDataReader其实就是定义一个vector
+    // 里面多个MotionSequence去保存所有运动序列
     std::vector<std::shared_ptr<MotionSequence>> motions;  ///< All loaded motion clips.
+    // 然后还有一个变量current_motion_index表示是在第几条运动序列
     int current_motion_index_ = 0;  ///< Index of the currently-selected motion.
 
     /// Load all motion sub-directories from @p base_directory.
