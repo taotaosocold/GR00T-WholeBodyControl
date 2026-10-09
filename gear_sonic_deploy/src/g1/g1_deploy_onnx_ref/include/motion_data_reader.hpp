@@ -65,11 +65,13 @@ struct MotionSequence {
     ///  -1 = token state needed but encoder not loaded
     ///   0+ = active encoder mode index
     mutable int encode_mode = -2;
-
+    // 这里point, quaternion, velocity都是用std::array来定义的，分别是3维和4维的数组
     using Point = std::array<double, 3>;
     using Quaternion = std::array<double, 4>;
     using Velocity = std::array<double, 3>;
-
+    // 那关节举例，先定义一个vector的joint_postions_的数组，其长度为运动序列的帧长*关节数量
+    // 然后设置一个函数JointPositions(int frame)返回joint_positions_数组中对应帧的关节位置数据的指针
+    // joint_postions_的定义在下面
     double *JointPositions(int frame) { return joint_positions_.data() + frame * num_joints; }
     double *JointVelocities(int frame) { return joint_velocities_.data() + frame * num_joints; }
     Point *BodyPositions(int frame) { return body_positions_.data() + frame * num_bodies; }
@@ -87,7 +89,7 @@ struct MotionSequence {
     const Velocity *BodyAngVelocities(int frame) const { return body_ang_velocities_.data() + frame * num_bodies; }
     const Point *SmplJoints(int frame) const { return smpl_joints_.data() + frame * num_smpl_joints; }
     const Point *SmplPoses(int frame) const { return smpl_poses_.data() + frame * num_smpl_poses; }
-
+    // 获得关节数、连杆数、身体四元数数、smpl关节数、smpl姿态数
     int GetNumJoints() const { return num_joints; }
     int GetNumBodies() const { return num_bodies; }
     int GetNumBodyQuaternions() const { return num_body_quaternions; }
@@ -261,6 +263,7 @@ struct MotionSequence {
     int num_smpl_poses = 0;
 
     // Body part mapping (crucial for alignment!)
+    // 这里定义存放的数组，这里还只是构造一个空的vector对象，注意vector是一个动态空间
     std::vector<int> body_part_indexes; // Maps 14 body parts to body indices
 
     // Joint data (timesteps x joints) - using double precision
@@ -681,6 +684,7 @@ class MotionDataReader {
 
     /// Load all motion sub-directories from @p base_directory.
     /// @return True if at least one motion was loaded successfully.
+    // 里面这个对象是专门去读取运动序列的
     bool ReadFromCSV(const std::string& base_directory) {
       std::cout << "Reading motion data from CSV files in: " << base_directory << std::endl;
 

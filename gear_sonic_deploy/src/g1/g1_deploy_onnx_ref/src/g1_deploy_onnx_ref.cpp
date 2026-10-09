@@ -232,7 +232,7 @@ class G1Deploy {
     // New unified planner interface
     std::string planner_path;
     std::unique_ptr<LocalMotionPlannerBase> planner_;
-    // 数据集有两个来源，要么是预加载的离线数据MotionDataReader要么是planner生成的planner_motion_
+    // 数据集有两个来源，要么是预加载的离线数据MotionDataReader的motion_reader_要么是planner生成的planner_motion_
     // 但最后policy是不在乎reference从哪里来的，因为最后都会赋值给current_frame_，policy读的是这个变量
     std::shared_ptr<MotionSequence> planner_motion_;
     
@@ -2346,16 +2346,27 @@ class G1Deploy {
       imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
       // Load motion data
-      // 根据运动序列的路径去读取数据，这里必须要求是csv类型的文件
+      // 根据运动序列的路径通过调用motion_reader_的ReadFromCSV函数来加载运动数据
+      // 然后后续可以通过调用motion_reader_的函数来获得运动序列内部的数据比如
+      // JointPositions(target_frame)获得目标帧的关节位置，JointVelocities(target_frame)获得目标帧的关节速度
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
+        // 如果该运动序列不为空
         if (!motion_reader_.motions.empty()) {
           std::cout << "✓ Motion data loaded successfully!" << std::endl;
           // motion_reader_.PrintSummary();
+          // 初始化当前运动序列的索引，为0，也就是第一个运动序列
           motion_reader_.current_motion_index_ = 0;
           std::string motion_name;
           {
+            // 加锁，防止多线程访问current_motion_时出现数据竞争，离开代码块的时候自动解锁
+            // 这段代码是把动作库中当前选中的动作设为正在使用的动作也就是current_motion_index_
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            // 这里加锁主要是保护两个变量，current_motion_和current_frame_
+            // 其中current_motion_是一个指针，指向当前正在播放的运动序列也就是current_motion_index_所指向的运动序列
+            // 而current_frame_是一个整数，表示当前正在播放的运动序列的帧数
+            // 比如planner线程是10hz的频率去生成运动序列，其和current_frame_
             current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
+            // 并把播放位置重置到第0帧
             current_frame_ = 0;
             motion_name = current_motion_->name;
           }
@@ -2984,8 +2995,10 @@ class G1Deploy {
       // SDK订阅获得的数据就是放在low_state_buffer_和imu_torso_buffer_下，这里赋值过来
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       auto imu_data = imu_torso_buffer_.GetDataWithTime();
+      // 然后设置指针ls就指向low_state_data，以及另一个指针imu_torso指向imu_data.data
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       const std::shared_ptr<const IMUState_> imu_torso = imu_data.data;
+      // 只要任意一类还没收到，就无法构建完整状态，函数返回false
       if (!ls || !imu_torso) {
         std::cout << "✗ Error: LowState or IMUState is not available in the middle of the control loop!" << std::endl;
         return false;
@@ -2993,26 +3006,29 @@ class G1Deploy {
       used_low_state_data_ = (low_state_data);
       used_imu_torso_data_ = (imu_data);
       // robot state data
+      // 创建关节位置、关节速度数组
       std::array<double, G1_NUM_MOTOR> body_q = {0.0};
       std::array<double, G1_NUM_MOTOR> body_dq = {0.0};
       // 这里ls是从 low_state_buffer_ 取出的最新一条 Unitree LowState_ 消息
-      // 所以这句话就是这条 LowState_ 消息中取出 motor_state()，并把结果赋给 unitree_joint_state
+      // 所以这句话就是这条 LowState_ 消息中取出29个电机状态
       auto unitree_joint_state = ls->motor_state();
       std::array<double, G1_NUM_MOTOR * 2> motor_temperature = {0.0};
       std::array<double, G1_NUM_MOTOR> motor_error = {0.0};
       std::array<double, G1_NUM_MOTOR> motor_torque = {0.0};
-      // 因为unitree_joint_state是从真机中获得的数据，这是mujoco的顺序，这里换成isaaclab的顺序赋值给body_q
-      // 和body_dq
+      // 因为unitree_joint_state是从真机中获得的数据，这是mujoco的顺序，这里换成isaaclab的顺序赋值给
+      // body_q和body_dq
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
         body_q[i] =
             unitree_joint_state[mujoco_to_isaaclab[i]].q() - default_angles[mujoco_to_isaaclab[i]]; // URDF order
         body_dq[i] = unitree_joint_state[mujoco_to_isaaclab[i]].dq(); // URDF order
+        // 如果速度大于35并且没有关闭CRC检查模式，就报错
         if (body_dq[i] > 35 && !disable_crc_check_) {
           std::cout << "✗ Error: body_dq[" << i << "] = " << body_dq[i] << " > 35."
                     << std::endl;
           return false;
         }
         // Extract motor temperature (2 values per motor: winding, driver) in hardware order
+        // 提取电机温度、故障码和力矩
         motor_temperature[i * 2]     = static_cast<double>(unitree_joint_state[i].temperature()[0]);
         motor_temperature[i * 2 + 1] = static_cast<double>(unitree_joint_state[i].temperature()[1]);
         // Extract motor error code in hardware order
@@ -3021,6 +3037,7 @@ class G1Deploy {
         motor_torque[i] = static_cast<double>(unitree_joint_state[i].tau_est());
 
         // High temperature hysteresis check (enter >= 90, exit < 85)
+        // 取该电机的两个温度读数中较高的一个
         int16_t max_temp = std::max(unitree_joint_state[i].temperature()[0],
                                     unitree_joint_state[i].temperature()[1]);
         if (motor_high_temp_[i]) {
