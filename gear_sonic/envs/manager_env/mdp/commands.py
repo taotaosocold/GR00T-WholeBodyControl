@@ -2259,7 +2259,8 @@ class TrackingCommand(CommandTerm):
             + quat_apply(self.reward_point_body_quat_w, self.reward_point_body_offsets)
             + self._env.scene.env_origins[:, None, :]
         )
-
+    # 训练的时候vr三点的数据集来源本质上是g1数据集的
+    # left_wrist_yaw_link和right_wrist_yaw_link和torso_link
     @property
     def vr_3point_body_pos_w(self) -> torch.Tensor:
         """Return reference VR 3-point body positions (with offsets) in world frame.

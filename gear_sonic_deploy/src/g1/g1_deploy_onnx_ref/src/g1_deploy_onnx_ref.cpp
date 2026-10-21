@@ -758,6 +758,10 @@ class G1Deploy {
     /// Gather joint positions from N future frames.  If joint_indexes is empty, gathers all 29.
     /// When upper-body control is active (has_upper_body_data_), replaces upper-body joints with
     /// the externally-provided targets.
+    // 这里target_buffer是一个输出缓冲区，会将这个函数调用的结果写入这个缓冲区
+    // 这里size_t就是选择第几帧，num_frames就是在这帧后取多少帧，step_size就是隔多少帧取一帧，joint_indexes就是选择哪些关节的索引
+    // 然后这里会直接循环调用JointPositions这个函数获得target_frame的关节位置，然后将这个关节位置写入target_buffer中
+    // 如果是g1默认配置是间隔5帧，smpl是间隔1帧，都是采样10帧
     bool GatherMotionJointPositionsMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, std::vector<int> joint_indexes = {}) {
       if (!current_motion_ || current_motion_->timesteps == 0) { 
         return false; 
@@ -779,6 +783,7 @@ class G1Deploy {
       }
       saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
       // Gather positions from multiple future frames with step intervals
+      // 循环所需要取的帧
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
         int target_frame = static_cast<int>(current_frame_);
@@ -789,7 +794,7 @@ class G1Deploy {
             target_frame = static_cast<int>(current_motion_->timesteps) - 1;
           }
         }
-
+        //调用函数获得当前帧的关节位置数据
         const auto motion_joint_pos = current_motion_->JointPositions(target_frame);
 
         // If body part indexes are empty, gather all joints
@@ -1839,6 +1844,7 @@ class G1Deploy {
     }
     
     // Initialize observation functions
+    // 初始化观测函数
     void InitializeObservationFunctions() {
       // Get all available observations from registry (single source of truth!)
       // 取得所有可用的观测定义，返回一个观测注册表，每个条目包含：观测名称 + 维度 + 对应的观测计算函数
@@ -1879,6 +1885,7 @@ class G1Deploy {
         }
         
         // Add to active functions (get function directly from registry)
+        // 会将启用的观测项加入active_obs_functions_列表中，并记录该观测在模型输入向量中的偏移位置和维度。
         active_obs_functions_.emplace_back(config.name, registry_it->function, current_offset, dimension);
         current_offset += dimension;
       }
@@ -2037,9 +2044,11 @@ class G1Deploy {
     // Gather observations (simplified - functions read from internal state)
     bool GatherObservations() {
       // Clear observation buffer
+      // 先清空观测缓冲区
       std::fill(obs_buffer_.begin(), obs_buffer_.end(), 0.0);
       
       // Process observations using pre-built active functions (no map lookup needed!)
+      // 逐项执行已启用的观测函数，把结果写入缓冲区obs_buffer_
       for (const auto& active_obs : active_obs_functions_) {
         bool success = active_obs.function(obs_buffer_, active_obs.offset);
         
@@ -3993,7 +4002,7 @@ class G1Deploy {
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
-    // 控制端线程，会以0.02s的频率被线程调用执行
+    // 最重要的控制端线程，会以0.02s的频率被线程调用执行
     void Control() {
       // 如果停止标志已经设置为true则直接返回
       if (operator_state.stop) { return; }

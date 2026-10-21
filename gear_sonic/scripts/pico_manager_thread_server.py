@@ -465,6 +465,7 @@ def process_smpl_joints(body_pose, global_orient, transl):
     global_orient_new = quaternion_to_angle_axis(global_orient_quat)
 
     # Compute joints and vertices using SMPL model (single forward pass)
+    # 前项运动学获得关节转角
     joints = compute_human_joints(
         body_pose=body_pose[..., :63],
         global_orient=global_orient_new,
@@ -557,18 +558,20 @@ class YawAccumulator:
             self.heading = [np.cos(self.yaw_angle_rad), np.sin(self.yaw_angle_rad), 0.0]
         return self.heading
 
-
+# 将从pico获得的数据集转换，传入的body_poses_np就是sample["body_poses_np"]就是pico获得的数据
 def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndarray):
     """
     Compute local joints and body orientation from provided body_poses_np.
     """
+    # 获得全局位置和全局朝向，并将其换成wxyz的格式
     positions = body_poses_np[:, :3]
     global_quats = body_poses_np[:, [6, 3, 4, 5]]
 
     # Convert to local rotations
+    # 旋转处理
     global_rots = sRot.from_quat(global_quats, scalar_first=True)
     global_rots = global_rots * sRot.from_euler("y", 180, degrees=True)
-
+    # 全局关节旋转去计算局部关节旋转
     local_rots = []
     for i in range(24):
         if parent_indices[i] == -1:
@@ -576,9 +579,9 @@ def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndar
         else:
             local_rot = global_rots[parent_indices[i]].inv() * global_rots[i]
             local_rots.append(local_rot)
-
+    # 将局部旋转转换成轴角
     pose_aa = np.array([rot.as_rotvec() for rot in local_rots])
-
+    # 轴角的[0]是根的全局朝向，而[1:]是其他连杆的局部朝向
     body_pose = torch.from_numpy(pose_aa[1:].flatten()).float().to(device).unsqueeze(0)
     global_orient = torch.from_numpy(pose_aa[0]).float().to(device).unsqueeze(0)
     transl = torch.from_numpy(positions[0]).float().to(device).unsqueeze(0)
@@ -855,6 +858,17 @@ class PicoReader:
             t_realtime = time.time()
             t_monotonic = time.monotonic()
             try:
+                # 直接通过pico获得人体的数据集，shape为[24,7]也就是每个连杆的世界坐标位置和世界朝向
+                # pico初始化的时候会构建世界坐标系，然后你后续的动作都是基于这个坐标系的
+                # [x,y,z,qx,qy,qz,qw]的格式
+                # 0	Pelvis	骨盆、根节点    # 1 LEFT_HIP	左髋 # 2	RIGHT_HIP	右髋
+                # 3	SPINE1	脊柱第一段      # 4	LEFT_KNEE	左膝 # 5	RIGHT_KNEE	右膝
+                # 6	SPINE2	脊柱第二段 # 7	LEFT_ANKLE	左踝  8	RIGHT_ANKLE	右踝
+                # 9	SPINE3	脊柱第三段 # 10	LEFT_FOOT	左脚 # 11	RIGHT_FOOT	右脚
+                # 12	NECK	颈部 # 13	LEFT_COLLAR	左锁骨 # 14	RIGHT_COLLAR	右锁骨
+                # 15	HEAD	头部 # 16	LEFT_SHOULDER	左肩 # 17	RIGHT_SHOULDER	右肩
+                # 18	LEFT_ELBOW	左肘 # 19	RIGHT_ELBOW	右肘 # 20	LEFT_WRIST	左腕
+                # 21	RIGHT_WRIST	右腕 # 22	LEFT_HAND	左手 # 23	RIGHT_HAND	右手
                 body_poses = xrt.get_body_joints_pose()
 
                 sample = {
@@ -1344,7 +1358,7 @@ class PoseStreamer:
         if sample is None:
             time.sleep(0.005)
             return
-
+        # 这里传入的就是smaple的["body_poses_np"]
         latest_data = compute_from_body_poses(
             self.parent_indices, self.device, sample["body_poses_np"]
         )
