@@ -25,10 +25,39 @@ python gear_sonic/train_agent_trl.py \
 
 The trainer resolves state and action dimensions from the environment. Settings
 live in `gear_sonic/config/trainer/wam.yaml`; the dynamics architecture lives in
-`gear_sonic/config/world_model/wam_dynamics.yaml`. This path supports a single
-process and direct joint actions with an FSQ MLP actor. Temporal attention and
+`gear_sonic/config/world_model/wam_dynamics.yaml`. This path supports single-GPU
+and data-parallel multi-GPU training with direct joint actions and an FSQ MLP
+actor. Actor-side RunningMeanStd/BatchNorm, temporal attention, and
 hierarchical action transforms are rejected explicitly. Observation histories
 already flattened into `actor_obs` remain supported.
+
+For eight GPUs, keep the same training arguments and launch with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m accelerate.commands.launch \
+  --multi_gpu --num_machines=1 --num_processes=8 --machine_rank=0 \
+  --main_process_ip=127.0.0.1 --main_process_port=29519 \
+  gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/all_modes/sonic_release \
+  trainer=wam world_model=wam_dynamics \
+  num_envs=64 headless=True \
+  experiment_dir=logs_rl/wam_eight_gpu \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=sample_data/robot_filtered \
+  ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=sample_data/smpl_filtered
+```
+
+`num_envs`, replay capacity, and `trainer.settings.batch_size` are **per rank**:
+64 environments on eight ranks mean 512 simulator environments in total. Each
+rank collects its own trajectories and samples its own replay. Actor, dynamics,
+and critic gradients are averaged after each backward pass; initial weights and
+world-model normalization statistics are synchronized. Rank-specific unused
+modality encoders participate safely. A non-finite loss/gradient on any rank
+rejects the update on all ranks. Adaptive motion sampling remains local.
+
+For a five-iteration smoke test that includes actor updates, override
+`trainer.settings.world_updates=2` and
+`trainer.settings.warmup_world_updates=4`. With the defaults, five iterations
+produce only 50 world updates, below the 100-update actor warmup threshold.
 
 The base config leaves WAM disabled. Omitting `trainer=wam world_model=wam_dynamics`
 keeps the existing PPO path. `checkpoint=/path/to/last.pt` loads a compatible
@@ -36,6 +65,14 @@ FSQ policy; adding `+resume=true` restores WAM, critic, optimizers, and counters
 from a WAM checkpoint. Policy weights remain under `policy_state_dict`, so the
 existing policy evaluation loader can read them. The trainer uses its own
 checkpoint and logging loop rather than PPO-specific callbacks.
+
+Only rank zero writes the shared `last.pt`. Multi-process saves additionally
+write generation-specific rank sidecars beside it for independent RNG states
+and optional replay. Keep the referenced sidecars when copying a checkpoint
+for a full resume. A full resume requires the same process count. To change
+GPU count, use `resume=false` to load the policy and start fresh dynamics/replay.
+Resume preserves rank-local replay boundaries but does not restore simulator
+physics or promise bitwise continuation. Logs report averages across ranks.
 
 ## Observations, references, and replay
 
@@ -89,6 +126,7 @@ With PyTorch, Hydra, TensorDict, and vector-quantize-pytorch installed:
 ```bash
 python -m unittest gear_sonic.tests.test_sequence_replay gear_sonic.tests.test_wam_training -v
 python -m gear_sonic.tests.test_wam
+GLOO_SOCKET_IFNAME=lo python -m unittest gear_sonic.tests.test_wam_distributed -v
 ```
 
 The tests include the original `Actor`, `UniversalTokenModule`, `BaseModule`,
@@ -96,3 +134,6 @@ and actual FSQ quantizer with all three modality encoders, vector replay,
 auto-resets, BPTT parameter updates, frozen dynamics, reference projection,
 checkpoint restoration, and latent utility edge cases. They use a small toy
 environment and do not validate humanoid simulation or sim-to-real behavior.
+The distributed tests use two real CPU/Gloo processes, different seeds/data,
+different modality selections, and rank-local checkpoint restoration. They do
+not establish CUDA/NCCL performance or eight-GPU humanoid convergence.

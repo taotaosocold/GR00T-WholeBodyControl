@@ -60,6 +60,29 @@ python gear_sonic/data_process/filter_and_copy_bones_data.py \
 This removes ~8.7% of motions (~130K of 142K remain). Use `--dry-run` to
 preview, or `--add-keywords` to add custom filters.
 
+### Optional Robot/SMPL tail alignment
+
+For paired clips that already share the target frame rate (normally 50 Hz),
+small differences confined to the end can be handled by adding these overrides
+to the training command:
+
+```bash
+++manager_env.commands.motion.motion_lib_cfg.paired_frame_alignment.mode=trim_trailing \
+++manager_env.commands.motion.motion_lib_cfg.paired_frame_alignment.max_frame_delta=2
+```
+
+This keeps the shorter common prefix and applies the same window to Robot and
+SMPL `pose_aa`, `smpl_joints`, and `transl`. The motion remains in training and
+source PKLs are unchanged. Adaptive sampling uses the same effective length.
+Strict alignment remains the default. More than two trailing frames, internally
+inconsistent SMPL fields, or non-target-rate pairs raise an error; clips are not
+silently skipped. Their start times must already match.
+At least three common frames must remain for the FK velocity calculation.
+
+This option does not convert 30 Hz data to 50 Hz. If your SMPL PKLs are 30 Hz,
+resample all three SMPL fields consistently before using this option. The
+existing loader's pose-only interpolation does not resample joints/transl.
+
 ### Data layout
 
 Place processed data at the repo root:

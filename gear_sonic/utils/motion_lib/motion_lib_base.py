@@ -49,6 +49,74 @@ def is_navigation_motion(motion_key):
     )
 
 
+def validate_paired_frame_alignment_config(alignment_cfg):
+    """Validate the opt-in tail-trimming policy before starting loading workers."""
+    cfg = alignment_cfg or {}
+    mode = cfg.get("mode", "strict")
+    if mode not in ("strict", "trim_trailing"):
+        raise ValueError(f"paired_frame_alignment.mode must be strict or trim_trailing, got {mode!r}")
+    limit = cfg.get("max_frame_delta", 0)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("paired_frame_alignment.max_frame_delta must be a nonnegative integer")
+    return mode, limit
+
+
+def resolve_paired_frame_alignment(
+    robot_num_frames, robot_fps, smpl_data, target_fps, alignment_cfg
+):
+    """Return the common source length for already time-aligned Robot/SMPL clips.
+
+    trim_trailing only accepts clips already at target_fps. It trims the longer
+    tail, without changing the start, resampling, padding, or skipping the motion.
+    The three SMPL fields must agree internally. Strict mode keeps the original
+    resampling path, but rejects target-rate length mismatches before slicing.
+    """
+    mode, limit = validate_paired_frame_alignment_config(alignment_cfg)
+    if smpl_data is None:
+        return int(robot_num_frames)
+    smpl_fps = smpl_data.get("fps")
+    same_target_rate = (
+        smpl_fps is not None
+        and float(robot_fps) == float(target_fps)
+        and float(smpl_fps) == float(target_fps)
+    )
+    fields = ("pose_aa", "smpl_joints", "transl")
+    if mode == "strict":
+        if same_target_rate:
+            lengths = {key: len(smpl_data[key]) for key in fields if key in smpl_data}
+            if any(length != robot_num_frames for length in lengths.values()):
+                raise ValueError(
+                    "strict mode requires equal Robot/SMPL lengths at target_fps: "
+                    f"robot={robot_num_frames}, smpl={lengths}"
+                )
+        return int(robot_num_frames)
+
+    if not same_target_rate:
+        raise ValueError(
+            "trim_trailing requires both clips already at target_fps (目标帧率); "
+            f"robot_fps={robot_fps}, smpl_fps={smpl_fps}, target_fps={target_fps}. "
+            "Resample SMPL pose_aa/smpl_joints/transl together before enabling it."
+        )
+    missing = [key for key in fields if key not in smpl_data]
+    if missing:
+        raise ValueError(f"SMPL is missing temporal fields: {missing}")
+    lengths = {key: len(smpl_data[key]) for key in fields}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"SMPL temporal fields have inconsistent lengths: {lengths}")
+    smpl_num_frames = lengths["pose_aa"]
+    delta = smpl_num_frames - robot_num_frames
+    if abs(delta) > limit:
+        raise ValueError(
+            "Robot/SMPL trailing frame difference exceeds max_frame_delta: "
+            f"robot={robot_num_frames}, smpl={smpl_num_frames}, delta={delta}, limit={limit}"
+        )
+    common_frames = min(int(robot_num_frames), int(smpl_num_frames))
+    # FK appends the penultimate finite-difference velocity, which needs T >= 3.
+    if common_frames < 3:
+        raise ValueError("A trimmed Robot/SMPL pair must contain at least three frames for FK velocities")
+    return common_frames
+
+
 def interpolate_translation_data(
     data,
     source_fps,
@@ -221,6 +289,8 @@ class MotionLibBase:
         self.motion_fps_scale = self.m_cfg.get("motion_fps_scale", 1.0)
         self._sim_fps = 1 / self.m_cfg.get("step_dt", 1 / 50)
         self.target_fps = self.m_cfg.get("target_fps", 50)
+        self.paired_frame_alignment_cfg = self.m_cfg.get("paired_frame_alignment", {"mode": "strict"})
+        validate_paired_frame_alignment_config(self.paired_frame_alignment_cfg)
         self.adaptive_sampling_cfg = self.m_cfg.get("adaptive_sampling", {})
         self.all_motions_loaded = False
 
@@ -236,8 +306,6 @@ class MotionLibBase:
         logger.info(f"Loading motion data from {self.m_cfg.motion_file}...")
         self.load_data(self.m_cfg.motion_file)
         self.use_adaptive_sampling = self.adaptive_sampling_cfg.get("enable", True)
-        if self.use_adaptive_sampling:
-            self.init_adaptive_sampling()
         self.setup_constants(
             fix_height=motion_lib_cfg.get("fix_height", FixHeightMode.no_fix),
             multi_thread=self.m_cfg.get("multi_thread", True),
@@ -278,6 +346,11 @@ class MotionLibBase:
                 self.smpl_data = [None] * len(self._motion_data_keys)
 
         self.smpl_y_up = motion_lib_cfg.get("smpl_y_up", False)
+
+        # Tail trimming changes the actual usable length. Build stable adaptive
+        # bins only after the SMPL index is available, using the same length rule.
+        if self.use_adaptive_sampling:
+            self.init_adaptive_sampling()
 
         # SOMA skeleton data loading (parallel to SMPL)
         self.soma_data = None
@@ -1097,6 +1170,15 @@ class MotionLibBase:
             smpl_data_list = [self.smpl_data[idx] for idx in sample_idxes.cpu().numpy()]
         else:
             smpl_data_list = None
+        if self.paired_frame_alignment_cfg.get("mode", "strict") == "trim_trailing":
+            # A worker that raises before queue.put can leave the parent waiting.
+            # Validate selected pairs in the parent, even with adaptive sampling off.
+            paired_smpl = smpl_data_list if smpl_data_list is not None else [None] * len(motion_data_list)
+            for motion_data, smpl_data in zip(motion_data_list, paired_smpl):
+                if smpl_data is not None:
+                    if max_len != -1 and max_len < 3:
+                        raise ValueError("trim_trailing requires max_len >= 3 for FK velocities")
+                    self._get_paired_source_frames(motion_data, smpl_data)
         if self.object_data is not None:
             object_data_list = [self.object_data[idx] for idx in sample_idxes.cpu().numpy()]
         else:
@@ -1760,7 +1842,24 @@ class MotionLibBase:
                     curr_file["path"]
                 ).values()  # First value since it's a single item dictionary
 
+            curr_smpl_data = None
+            if smpl_data_list is not None and smpl_data_list[f] is not None:
+                curr_smpl_data = smpl_data_list[f]
+                if "path" in curr_smpl_data:
+                    curr_smpl_data = joblib.load(curr_smpl_data["path"])
+
             seq_len = curr_file["root_trans_offset"].shape[0]
+            if curr_smpl_data is not None:
+                try:
+                    seq_len = resolve_paired_frame_alignment(
+                        seq_len, curr_file.get("fps", 30.0), curr_smpl_data,
+                        self.target_fps, self.paired_frame_alignment_cfg,
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"{self.curr_motion_keys[curr_id]}: {exc}") from exc
+                if self.paired_frame_alignment_cfg.get("mode", "strict") == "trim_trailing":
+                    if max_len != -1 and max_len < 3:
+                        raise ValueError("trim_trailing requires max_len >= 3 for FK velocities")
             if max_len == -1 or seq_len < max_len:
                 start, end = 0, seq_len
             else:
@@ -1882,11 +1981,7 @@ class MotionLibBase:
                     use_parallel_fk=self.use_parallel_fk,
                 )
                 if self.smpl_data is not None:
-                    curr_smpl_data = smpl_data_list[f]
                     if curr_smpl_data is not None:
-                        if "path" in curr_smpl_data:
-                            curr_smpl_data = joblib.load(curr_smpl_data["path"])
-
                         if curr_smpl_data["fps"] != self.target_fps:
                             smpl_pose = torch.tensor(curr_smpl_data["pose_aa"][start:end]).float()
                             smpl_pose[:, -6:] = 0.0
@@ -1894,12 +1989,17 @@ class MotionLibBase:
                                 None, smpl_pose[None,], curr_smpl_data["fps"], self.target_fps
                             )[1][0]
                         else:
-                            smpl_pose = torch.tensor(curr_smpl_data["pose_aa"]).float()
+                            same_target_rate = curr_file["fps"] == self.target_fps
+                            smpl_slice = slice(start, end) if same_target_rate else slice(None)
+                            smpl_pose = torch.tensor(curr_smpl_data["pose_aa"][smpl_slice]).float()
                             smpl_pose[:, -6:] = 0.0
                             # new_seq_len = curr_motion['global_translation'].shape[1]
                             curr_motion["smpl_pose"] = smpl_pose
                         if "smpl_joints" in curr_smpl_data:
-                            smpl_joints = torch.tensor(curr_smpl_data["smpl_joints"]).float()
+                            smpl_joints_data = curr_smpl_data["smpl_joints"]
+                            if curr_file["fps"] == self.target_fps and curr_smpl_data["fps"] == self.target_fps:
+                                smpl_joints_data = smpl_joints_data[start:end]
+                            smpl_joints = torch.tensor(smpl_joints_data).float()
                             curr_motion["smpl_joints"] = smpl_joints
                             if (
                                 curr_motion["smpl_joints"].shape[0]
@@ -1921,7 +2021,10 @@ class MotionLibBase:
                                 curr_motion["global_translation"]
                             )
                         if "transl" in curr_smpl_data:
-                            transl = torch.tensor(curr_smpl_data["transl"]).float()
+                            transl_data = curr_smpl_data["transl"]
+                            if curr_file["fps"] == self.target_fps and curr_smpl_data["fps"] == self.target_fps:
+                                transl_data = transl_data[start:end]
+                            transl = torch.tensor(transl_data).float()
                             curr_motion["smpl_transl"] = transl
                             assert (
                                 curr_motion["smpl_transl"].shape[0]
@@ -2257,6 +2360,17 @@ class MotionLibBase:
         dof_pos = rotations.quat_to_exp_map(local_rot[:, 1:])
         return dof_pos.reshape(B, -1)
 
+    def _get_paired_source_frames(self, motion_data, smpl_data):
+        """Use source PKLs, not possibly untrimmed metadata, to validate a pair."""
+        if "path" in motion_data:
+            motion_data, *_ = joblib.load(motion_data["path"]).values()
+        if "path" in smpl_data:
+            smpl_data = joblib.load(smpl_data["path"])
+        return resolve_paired_frame_alignment(
+            len(motion_data["root_trans_offset"]), motion_data.get("fps", 30.0),
+            smpl_data, self.target_fps, self.paired_frame_alignment_cfg,
+        )
+
     def init_adaptive_sampling(self):
         """Initialize adaptive sampling data structures over all unique motions.
 
@@ -2303,7 +2417,15 @@ class MotionLibBase:
             # Match fk_batch behavior: when fps == target_fps, interpolation is
             # skipped and raw frames are used. Otherwise use the canonical
             # interploate_pose formula (arange with exclusive end).
-            if original_fps == self.target_fps:
+            if (
+                self.paired_frame_alignment_cfg.get("mode", "strict") == "trim_trailing"
+                and self.smpl_data is not None
+                and self.smpl_data[i] is not None
+            ):
+                # trim_trailing only permits target-rate pairs, so this source
+                # length is also the FK length. Robot-only clips keep all frames.
+                num_frames = self._get_paired_source_frames(motion_data, self.smpl_data[i])
+            elif original_fps == self.target_fps:
                 num_frames = original_num_frames
             else:
                 num_frames = len(torch.arange(0, original_duration, 1 / self.target_fps))

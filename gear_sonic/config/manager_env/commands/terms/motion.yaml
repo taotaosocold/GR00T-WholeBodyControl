@@ -11,6 +11,11 @@ motion:
       urdfFileName: ""
     extend_config: []
     target_fps: 50
+    # Opt in with mode: trim_trailing only for pairs already at target_fps.
+    # max_frame_delta limits tail removal; it never resamples or pads frames.
+    paired_frame_alignment:
+      mode: strict
+      max_frame_delta: 2
     multi_thread: true
     filter_motion_keys:
     adaptive_sampling:

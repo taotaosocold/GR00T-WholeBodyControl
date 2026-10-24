@@ -13,10 +13,12 @@ from pathlib import Path
 import time
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
 from gear_sonic.trl.modules.wam import StateSpaceWorldModel, WAMConfig
+from gear_sonic.trl.world_model.distributed import DistributedContext
 from gear_sonic.trl.world_model.sequence_replay import SequenceReplayBuffer
 
 
@@ -93,10 +95,11 @@ class ObservationLayout:
 class WAMTrainer:
     """Simulator collection -> k-step WAM fit -> FSQ BPTT -> bootstrapped critic.
 
-    The constructor matches ``train_agent_trl.py``. The initial implementation
-    supports one process and direct joint actions; unsupported hierarchical
-    transforms and distributed runs fail explicitly instead of training a
-    mismatched dynamics model. PPO remains available through the old trainer.
+    The constructor matches ``train_agent_trl.py``. Data parallel ranks collect
+    independent simulator/replay data and average gradients after each of the
+    three backward passes. Manual synchronization supports repeated FSQ
+    forwards and alternating frozen world-model/critic phases without DDP's
+    per-forward reducer bookkeeping. PPO remains a separate trainer.
     """
 
     def __init__(
@@ -104,15 +107,18 @@ class WAMTrainer:
         checkpoint=None, resume=False, world_model_config=None, settings=None, **kwargs,
     ):
         del kwargs
-        if accelerator is not None and accelerator.num_processes != 1:
-            raise ValueError("WAMTrainer currently supports a single process; launch without DDP")
         if getattr(env, "action_transform_module", None) is not None:
             raise ValueError("WAMTrainer requires direct joint actions; hierarchical ATM is unsupported")
         if getattr(model, "max_rollout_history", 1) > 1:
             raise ValueError("WAMTrainer expects an FSQ MLP actor with max_rollout_history=1")
+        if getattr(model, "running_mean_std", None) is not None:
+            raise ValueError("WAMTrainer expects FSQ actors without an actor observation normalizer")
         self.args, self.config, self.env, self.policy = args, config, env, model
         self.accelerator = accelerator
         self.device = next(model.parameters()).device
+        self.distributed = DistributedContext(self.device)
+        if accelerator is not None and accelerator.num_processes != self.distributed.world_size:
+            raise ValueError("Accelerator and initialized torch.distributed world sizes disagree")
         self.settings = dict(settings or {})
         for name in ["window", "horizon", "batch_size", "world_updates", "critic_epochs",
                      "replay_steps", "replay_envs", "collect_steps", "actor_updates"]:
@@ -122,7 +128,12 @@ class WAMTrainer:
             raise ValueError("replay_steps must be at least the fitting window")
         if int(self.settings.get("replay_steps", 256)) < int(self.settings.get("horizon", 32)):
             raise ValueError("replay_steps must be at least the imagination horizon")
-        self.log_dir = Path(log_dir or "logs_rl/wam")
+        # The default Hydra timestamp can be evaluated in different seconds on
+        # different ranks. All rank sidecars must use rank zero's actual path.
+        shared_path = [str(log_dir or "logs_rl/wam")]
+        if self.distributed.world_size > 1:
+            dist.broadcast_object_list(shared_path, src=0)
+        self.log_dir = Path(shared_path[0])
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.iteration = 0
         self.world_updates = 0
@@ -132,6 +143,12 @@ class WAMTrainer:
         self.layout = ObservationLayout(
             self.obs, keys, getattr(backbone, "tokenizer_obs_specs", ()),
             self.settings.get("exogenous_tokenizer_features"),
+        )
+        self.distributed.check_consistent(
+            (self.layout.specs, self.layout.tokenizer_specs, self.settings,
+             args.num_total_batches, config.get("num_learning_iterations"),
+             config.get("gamma", 0.99), config.get("lam", 0.95)),
+            "WAM layout/settings",
         )
         cfg = dict(world_model_config or {})
         if cfg and not str(cfg.get("_target_", "")).endswith("StateSpaceWorldModel"):
@@ -144,6 +161,7 @@ class WAMTrainer:
             raise ValueError("Explicit simulation context is not yet wired in WAMTrainer")
         if not cfg.get("learn_reward", True) or not cfg.get("learn_termination", True):
             raise ValueError("WAMTrainer requires both reward and termination heads")
+        self.distributed.check_consistent(cfg, "WAM dynamics settings")
         self.world_model = StateSpaceWorldModel(WAMConfig(**cfg)).to(self.device)
         self.world_step = self.world_model.forward
         if self.settings.get("compile", False):
@@ -160,8 +178,30 @@ class WAMTrainer:
         self.replay = SequenceReplayBuffer(int(self.settings.get("replay_steps", 256)))
         tracked = min(env.num_envs, int(self.settings.get("replay_envs", 256)))
         self.replay_env_ids = torch.randperm(env.num_envs, device=self.device)[:tracked]
+        self._last_runtime_path = None
+        self._last_checkpoint_path = None
+        self.distributed.check_consistent((str(checkpoint), resume), "checkpoint source")
         if checkpoint is not None:
-            self.load_checkpoint(checkpoint, resume=resume)
+            error = None
+            try:
+                self.load_checkpoint(checkpoint, resume=resume)
+            except Exception as exc:
+                error = exc
+            if not self.distributed.all_finite(error is None):
+                raise RuntimeError("A rank failed to load the WAM checkpoint") from error
+        self.distributed.check_consistent(
+            [(name, tuple(value.shape), str(value.dtype))
+             for module in (self.policy, self.world_model, self.critic)
+             for name, value in module.state_dict().items()],
+            "WAM model shapes",
+        )
+        self.distributed.broadcast_modules(self.policy, self.world_model, self.critic)
+
+    def _normalizers(self):
+        return [module for module in (
+            self.world_model.state_norm, self.world_model.action_norm,
+            self.world_model.context_norm, self.world_model.delta_norm,
+        ) if module is not None]
 
     def _action(self, state, *, auxiliary=False):
         obs = self.layout.unpack(state)
@@ -175,15 +215,17 @@ class WAMTrainer:
         return action
 
     @staticmethod
-    def optimizer_step(loss, optimizer, parameters, *, clip_value=None):
+    def optimizer_step(loss, optimizer, parameters, *, clip_value=None, distributed=None):
         """Fail before mutating weights if imagination produces non-finite gradients."""
         parameters = list(parameters)
+        distributed = distributed or DistributedContext(loss.device)
         optimizer.zero_grad(set_to_none=True)
-        if not torch.isfinite(loss).all():
+        if not distributed.all_finite(loss):
             raise FloatingPointError("Non-finite WAM loss; inspect model fit and imagination horizon")
         loss.backward()
+        distributed.average_gradients(parameters)
         norm = nn.utils.clip_grad_norm_(parameters, 1.0)
-        if not torch.isfinite(norm):
+        if not distributed.all_finite(norm):
             optimizer.zero_grad(set_to_none=True)
             raise FloatingPointError("Non-finite WAM gradient; optimizer update was rejected")
         if clip_value is not None:
@@ -194,6 +236,8 @@ class WAMTrainer:
     @torch.no_grad()
     def collect(self, steps):
         self.policy.eval()
+        norms = self._normalizers()
+        before = self.distributed.snapshot_running_norms(norms)
         total = 0.0
         for _ in range(steps):
             state = self.layout.pack(self.obs)
@@ -220,6 +264,7 @@ class WAMTrainer:
                 )
             self.obs = next_obs
             total += reward.mean().item()
+        self.distributed.sync_running_norms(norms, before)
         return total / max(steps, 1)
 
     def fit_world_model(self):
@@ -237,7 +282,8 @@ class WAMTrainer:
                 ),
             )
             self.optimizer_step(
-                losses["loss"], self.world_optimizer, self.world_model.parameters()
+                losses["loss"], self.world_optimizer, self.world_model.parameters(),
+                distributed=self.distributed,
             )
             self.world_updates += 1
             metrics = {f"world/{key}": float(value.detach()) for key, value in losses.items()}
@@ -287,7 +333,8 @@ class WAMTrainer:
             loss = -objective.mean() / horizon
             loss = loss + float(self.settings.get("aux_loss_scale", 1.0)) * auxiliary_loss
             grad = self.optimizer_step(
-                loss, self.actor_optimizer, self.policy.parameters(), clip_value=0.1
+                loss, self.actor_optimizer, self.policy.parameters(), clip_value=0.1,
+                distributed=self.distributed,
             )
 
         # GAE/lambda targets are fixed once per imagined trajectory. The critic
@@ -311,7 +358,10 @@ class WAMTrainer:
             predicted = self.critic(inputs[:, :-1]).squeeze(-1)
             critic_errors = F.mse_loss(predicted, targets, reduction="none")
             critic_loss = (critic_errors * batch["mask"]).sum() / batch["mask"].sum().clamp_min(1)
-            self.optimizer_step(critic_loss, self.critic_optimizer, self.critic.parameters())
+            self.optimizer_step(
+                critic_loss, self.critic_optimizer, self.critic.parameters(),
+                distributed=self.distributed,
+            )
         return {
             "actor/loss": float(loss.detach()), "actor/grad_norm": float(grad),
             "actor/imagined_return": float(objective.detach().mean()),
@@ -327,32 +377,100 @@ class WAMTrainer:
         for iteration in range(self.iteration, iterations):
             started = time.perf_counter()
             metrics = {"real/reward": self.collect(int(self.settings.get("collect_steps", 32)))}
-            if len(self.replay) >= window:
+            if self.distributed.all_finite(len(self.replay) >= window):
                 metrics.update(self.fit_world_model())
-                if self.world_updates >= int(self.settings.get("warmup_world_updates", 100)) and (
+            can_imagine = (
+                self.world_updates >= int(self.settings.get("warmup_world_updates", 100)) and (
                     len(self.replay) >= int(self.settings.get("horizon", 32))
-                ):
-                    for _ in range(int(self.settings.get("actor_updates", 1))):
-                        metrics.update(self.improve_policy())
+                )
+            )
+            if self.distributed.all_finite(can_imagine):
+                for _ in range(int(self.settings.get("actor_updates", 1))):
+                    metrics.update(self.improve_policy())
             if hasattr(self.env, "sync_and_compute_adaptive_sampling"):
                 self.env.sync_and_compute_adaptive_sampling(
                     self.accelerator, sync_across_gpus=False
                 )
             self.iteration = iteration + 1
             metrics.update(iteration=self.iteration, seconds=time.perf_counter() - started)
-            print("WAM " + " ".join(f"{key}={value:.5g}" for key, value in metrics.items()))
-            try:
-                import wandb
-                if wandb.run is not None:
-                    wandb.log(metrics, step=self.iteration)
-            except ImportError:
-                pass
+            metrics = self.distributed.reduce_metrics(metrics)
+            if self.distributed.is_main:
+                print("WAM " + " ".join(f"{key}={value:.5g}" for key, value in metrics.items()))
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log(metrics, step=self.iteration)
+                except ImportError:
+                    pass
             frequency = int(self.settings.get("save_interval", 500))
             if frequency > 0 and self.iteration % frequency == 0:
                 self.save_checkpoint(self.log_dir / "last.pt")
         self.save_checkpoint(self.log_dir / "last.pt")
 
     def save_checkpoint(self, path):
+        path = Path(path)
+        self.distributed.check_consistent(str(path.resolve()), "checkpoint destination")
+        runtime = {
+            "rank": self.distributed.rank,
+            "world_size": self.distributed.world_size,
+            "iteration": self.iteration,
+            "torch_rng": torch.get_rng_state(),
+        }
+        if self.device.type == "cuda":
+            runtime["cuda_rng_local"] = torch.cuda.get_rng_state(self.device)
+        if self.settings.get("save_replay", False):
+            runtime["wam_replay"] = self.replay.state_dict()
+            runtime["wam_replay_env_ids"] = self.replay_env_ids.cpu()
+
+        # Shared weights/optimizers have one writer. Replay and RNG are local
+        # to each rank and stored in generation-specific sidecars, so a failed
+        # save cannot pair an old shared checkpoint with a new rank state.
+        previous_runtime = (
+            self._last_runtime_path if self._last_checkpoint_path == path.resolve() else None
+        )
+        runtime_path = None
+        runtime_names = None
+        if self.distributed.world_size > 1:
+            generation = [f"{self.iteration}-{time.time_ns()}" if self.distributed.is_main else None]
+            dist.broadcast_object_list(generation, src=0)
+            runtime_names = [
+                f"{path.stem}.{generation[0]}.rank{rank}{path.suffix}"
+                for rank in range(self.distributed.world_size)
+            ]
+            runtime_path = path.parent / runtime_names[self.distributed.rank]
+            error = None
+            try:
+                self._atomic_save(runtime, runtime_path)
+            except Exception as exc:
+                error = exc
+            if not self.distributed.all_finite(error is None):
+                raise RuntimeError("A rank failed to write its WAM checkpoint sidecar") from error
+
+        error = None
+        if self.distributed.is_main:
+            try:
+                payload = self._checkpoint_payload()
+                payload["wam_world_size"] = self.distributed.world_size
+                if runtime_names is None:
+                    payload.update(runtime)
+                else:
+                    payload["wam_runtime_files"] = runtime_names
+                self._atomic_save(payload, path)
+            except Exception as exc:
+                error = exc
+        if not self.distributed.all_finite(error is None):
+            raise RuntimeError("Rank zero failed to publish the WAM checkpoint") from error
+        self._last_runtime_path = runtime_path
+        self._last_checkpoint_path = path.resolve()
+        # Keep only the rank's previous successful sidecar; the shared manifest
+        # now points at the new complete generation.
+        if previous_runtime is not None and previous_runtime != runtime_path:
+            try:
+                previous_runtime.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _checkpoint_payload(self):
         payload = {
             "policy_state_dict": self.policy.state_dict(),
             "world_model_state_dict": self.world_model.state_dict(),
@@ -364,13 +482,11 @@ class WAMTrainer:
             "wam_layout": self.layout.specs, "wam_settings": self.settings,
             "wam_tokenizer_specs": self.layout.tokenizer_specs,
             "wam_exogenous_indices": self.layout.exogenous_indices,
-            "torch_rng": torch.get_rng_state(),
         }
-        if torch.cuda.is_available():
-            payload["cuda_rng"] = torch.cuda.get_rng_state_all()
-        if self.settings.get("save_replay", False):
-            payload["wam_replay"] = self.replay.state_dict()
-            payload["wam_replay_env_ids"] = self.replay_env_ids.cpu()
+        return payload
+
+    @staticmethod
+    def _atomic_save(payload, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
@@ -390,6 +506,10 @@ class WAMTrainer:
             raise ValueError("Checkpoint contains no compatible FSQ policy weights")
         self.policy.load_state_dict(policy_state, strict=True)
         if resume:
+            if checkpoint.get("wam_world_size", 1) != self.distributed.world_size:
+                raise ValueError(
+                    "WAM resume requires the saved process count; use resume=false to load policy only"
+                )
             if checkpoint.get("wam_layout") != self.layout.specs:
                 raise ValueError("Cannot resume WAM with a different observation layout")
             if checkpoint.get("wam_tokenizer_specs") != self.layout.tokenizer_specs or (
@@ -403,16 +523,34 @@ class WAMTrainer:
             self.critic_optimizer.load_state_dict(checkpoint["wam_critic_optimizer"])
             self.iteration = checkpoint["wam_iteration"]
             self.world_updates = checkpoint["wam_world_updates"]
-            if "wam_replay" in checkpoint:
-                self.replay.load_state_dict(checkpoint["wam_replay"])
+            runtime = checkpoint
+            if "wam_runtime_files" in checkpoint:
+                runtime_files = checkpoint["wam_runtime_files"]
+                if len(runtime_files) != self.distributed.world_size:
+                    raise ValueError("Incomplete WAM rank-state manifest")
+                runtime_path = Path(path).parent / runtime_files[self.distributed.rank]
+                runtime = torch.load(runtime_path, map_location="cpu", weights_only=False)
+                if runtime["rank"] != self.distributed.rank or (
+                    runtime["world_size"] != self.distributed.world_size
+                    or runtime["iteration"] != self.iteration
+                ):
+                    raise ValueError("WAM rank checkpoint does not match the shared checkpoint")
+                self._last_runtime_path = runtime_path
+                self._last_checkpoint_path = Path(path).resolve()
+            if "wam_replay" in runtime:
+                self.replay.load_state_dict(runtime["wam_replay"])
                 self.replay.mark_discontinuity()
-                ids = checkpoint["wam_replay_env_ids"].to(self.device)
+                ids = runtime["wam_replay_env_ids"].to(self.device)
                 if ids.max() >= self.env.num_envs:
                     raise ValueError("Restored replay requires the original simulator environment count")
                 self.replay_env_ids = ids
             else:
                 # Refill the replay on restart before using imagination again.
                 self.world_updates = 0
-            torch.set_rng_state(checkpoint["torch_rng"].cpu())
-            if torch.cuda.is_available() and "cuda_rng" in checkpoint:
-                torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng"]])
+            torch.set_rng_state(runtime["torch_rng"].cpu())
+            if self.device.type == "cuda":
+                if "cuda_rng_local" in runtime:
+                    torch.cuda.set_rng_state(runtime["cuda_rng_local"].cpu(), self.device)
+                elif "cuda_rng" in runtime:
+                    # Compatibility with the previous single-process format.
+                    torch.cuda.set_rng_state(runtime["cuda_rng"][0].cpu(), self.device)
