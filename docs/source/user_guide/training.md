@@ -79,9 +79,15 @@ inconsistent SMPL fields, or non-target-rate pairs raise an error; clips are not
 silently skipped. Their start times must already match.
 At least three common frames must remain for the FK velocity calculation.
 
-This option does not convert 30 Hz data to 50 Hz. If your SMPL PKLs are 30 Hz,
-resample all three SMPL fields consistently before using this option. The
-existing loader's pose-only interpolation does not resample joints/transl.
+This tail-trimming option is separate from frame-rate conversion. The default
+loader samples SMPL `pose_aa`, `smpl_joints`, and `transl` on the actual robot
+FK output timeline, using the robot crop's start time in seconds. Positions
+use linear interpolation and axis-angle rotations use quaternion SLERP.
+Matching source frames retain their original values. This supports paired
+30/50/60 Hz sources without changing the motion's playback speed, provided
+the FPS metadata and time origins are correct. Insufficient SMPL coverage or
+internally inconsistent fields produce an explicit error; no frame padding
+or duration stretching is applied. Source PKLs remain unchanged.
 
 ### Data layout
 

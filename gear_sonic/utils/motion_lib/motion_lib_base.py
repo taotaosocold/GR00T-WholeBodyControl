@@ -20,6 +20,7 @@ import torch.multiprocessing as mp
 from gear_sonic.isaac_utils import rotations
 from gear_sonic.trl.utils import common
 from gear_sonic.utils.motion_lib import skeleton
+from gear_sonic.utils.motion_lib.paired_resampling import resample_smpl_to_robot_window
 
 
 class FixHeightMode(enum.Enum):
@@ -1982,63 +1983,35 @@ class MotionLibBase:
                 )
                 if self.smpl_data is not None:
                     if curr_smpl_data is not None:
-                        if curr_smpl_data["fps"] != self.target_fps:
-                            smpl_pose = torch.tensor(curr_smpl_data["pose_aa"][start:end]).float()
-                            smpl_pose[:, -6:] = 0.0
-                            curr_motion["smpl_pose"] = self.mesh_parsers.interploate_pose(
-                                None, smpl_pose[None,], curr_smpl_data["fps"], self.target_fps
-                            )[1][0]
-                        else:
-                            same_target_rate = curr_file["fps"] == self.target_fps
-                            smpl_slice = slice(start, end) if same_target_rate else slice(None)
-                            smpl_pose = torch.tensor(curr_smpl_data["pose_aa"][smpl_slice]).float()
-                            smpl_pose[:, -6:] = 0.0
-                            # new_seq_len = curr_motion['global_translation'].shape[1]
-                            curr_motion["smpl_pose"] = smpl_pose
-                        if "smpl_joints" in curr_smpl_data:
-                            smpl_joints_data = curr_smpl_data["smpl_joints"]
-                            if curr_file["fps"] == self.target_fps and curr_smpl_data["fps"] == self.target_fps:
-                                smpl_joints_data = smpl_joints_data[start:end]
-                            smpl_joints = torch.tensor(smpl_joints_data).float()
-                            curr_motion["smpl_joints"] = smpl_joints
-                            if (
-                                curr_motion["smpl_joints"].shape[0]
-                                != curr_motion["global_translation"].shape[1]
-                            ):
-                                print(  # noqa: T201
-                                    f"Length mismatch: smpl_joints={curr_motion['smpl_joints'].shape[0]}, "
-                                    f"global_translation={curr_motion['global_translation'].shape[1]}"
-                                )
-                                print(smpl_data_list[f], motion_data_list[f])  # noqa: T201
-
-                            assert (
-                                curr_motion["smpl_joints"].shape[0]
-                                == curr_motion["global_translation"].shape[1]
+                        num_frames = curr_motion["global_translation"].shape[1]
+                        try:
+                            aligned_smpl = resample_smpl_to_robot_window(
+                                curr_smpl_data,
+                                robot_start_frame=start,
+                                robot_fps=curr_file["fps"],
+                                target_fps=self.target_fps,
+                                num_output_frames=num_frames,
                             )
-                        else:
-                            num_frames = curr_motion["global_translation"].shape[1]
-                            curr_motion["smpl_joints"] = torch.zeros(num_frames, 24, 3).to(
-                                curr_motion["global_translation"]
-                            )
-                        if "transl" in curr_smpl_data:
-                            transl_data = curr_smpl_data["transl"]
-                            if curr_file["fps"] == self.target_fps and curr_smpl_data["fps"] == self.target_fps:
-                                transl_data = transl_data[start:end]
-                            transl = torch.tensor(transl_data).float()
-                            curr_motion["smpl_transl"] = transl
-                            assert (
-                                curr_motion["smpl_transl"].shape[0]
-                                == curr_motion["global_translation"].shape[1]
-                            )
-                        else:
-                            num_frames = curr_motion["global_translation"].shape[1]
-                            curr_motion["smpl_transl"] = torch.zeros(num_frames, 3).to(
-                                curr_motion["global_translation"]
-                            )
-                        assert (
-                            curr_motion["smpl_pose"].shape[0]
-                            == curr_motion["global_translation"].shape[1]
-                        )
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Motion {self.curr_motion_keys[curr_id]!r}: SMPL/robot time alignment "
+                                f"failed (robot_fps={curr_file['fps']}, "
+                                f"smpl_fps={curr_smpl_data.get('fps')}, "
+                                f"target_fps={self.target_fps}, robot_window=[{start}:{end}], "
+                                f"FK_frames={num_frames}): {exc}"
+                            ) from exc
+                        # All SMPL fields use the actual FK output time grid,
+                        # including its exclusive endpoint when resampling.
+                        # Preserve the original neutral hand-joint convention.
+                        smpl_pose = aligned_smpl["pose_aa"].clone()
+                        smpl_pose[:, -6:] = 0.0
+                        curr_motion["smpl_pose"] = smpl_pose.to(curr_motion["global_translation"])
+                        curr_motion["smpl_joints"] = aligned_smpl.get(
+                            "smpl_joints", torch.zeros(num_frames, 24, 3)
+                        ).to(curr_motion["global_translation"])
+                        curr_motion["smpl_transl"] = aligned_smpl.get(
+                            "transl", torch.zeros(num_frames, 3)
+                        ).to(curr_motion["global_translation"])
 
                         if freeze_frame_aug:
                             freeze_idx_new_fps = int(
