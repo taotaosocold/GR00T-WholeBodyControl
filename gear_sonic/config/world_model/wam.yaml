@@ -1,0 +1,19 @@
+# Optional SuperMimic-style latent world model. Include this config from an
+# experiment with ``- world_model: wam`` and pass the instantiated model to a
+# ModelBasedActorCriticTrainer. The actor's FSQ token interface is unchanged.
+_target_: gear_sonic.trl.world_model.WAM
+_recursive_: false
+obs_dim: null  # LazyLinear resolves concatenated multimodal/FSQ feature size
+# Override from ``env_config.robot.actions_dim`` for robots with a different
+# action layout. 29 is the G1 body-control default used by SuperMimic.
+action_dim: 29
+latent_dim: 256
+hidden_dim: 512
+depth: 2
+adapter:
+  _target_: gear_sonic.trl.world_model.FSQObservationAdapter
+  token_key: full_tokens
+  feature_order: [full_tokens, actor_obs]
+latent_loss_weight: 1.0
+reward_loss_weight: 1.0
+termination_loss_weight: 0.1

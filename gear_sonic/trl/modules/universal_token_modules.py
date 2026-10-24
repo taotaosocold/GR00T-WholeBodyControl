@@ -177,6 +177,11 @@ class UniversalTokenModule(nn.Module):
         # These are populated during forward() and can be read afterwards
         self._last_encoded_tokens = None  # dict[encoder_name -> Tensor]
         self._last_encoded_latents = None  # dict[encoder_name -> Tensor] (pre-quantization)
+        # Full batch-aligned representations are kept on-device for optional
+        # model-based consumers (WAM/imagination). The historical per-encoder
+        # caches above remain detached CPU tensors for callback compatibility.
+        self._last_full_tokens = None
+        self._last_full_latent = None
 
         self.env_config = env_config
         self.algo_config = algo_config
@@ -755,6 +760,7 @@ class UniversalTokenModule(nn.Module):
         return_dict=False,
         latent_residual=None,
         latent_residual_mode="post_quantization",
+        cache_encoded_tensors=True,
         **kwargs,  # noqa: ARG002
     ):
         """Run the full encode → quantize → decode pipeline.
@@ -885,13 +891,31 @@ class UniversalTokenModule(nn.Module):
                 )
         all_tokens = self.assemble_all_tokens(encoded_tokens, encoder_masks, batch_size, seq_len)
 
+        # Keep the raw multimodal latent aligned with ``all_tokens``. This is
+        # useful when a differentiable world model consumes the FSQ interface:
+        # callers can choose quantized tokens (with FSQ's straight-through
+        # gradient) or the continuous pre-quantization latent without rerunning
+        # any encoder. Do not detach these tensors; they are valid only for the
+        # current forward pass and should participate in the actor graph.
+        all_latents = self.assemble_all_tokens(
+            encoded_latents, encoder_masks, batch_size, seq_len
+        )
+
         # POST-QUANTIZATION MODE: add residual after FSQ tokens (default)
         if latent_residual is not None and latent_residual_mode == "post_quantization":
             all_tokens = all_tokens + residual_reshaped
 
         # Cache tokens for external access (e.g., by callbacks)
-        self._last_encoded_tokens = {k: v.detach().cpu() for k, v in encoded_tokens.items()}
-        self._last_encoded_latents = {k: v.detach().cpu() for k, v in encoded_latents.items()}
+        if cache_encoded_tensors:
+            self._last_encoded_tokens = {k: v.detach().cpu() for k, v in encoded_tokens.items()}
+            self._last_encoded_latents = {k: v.detach().cpu() for k, v in encoded_latents.items()}
+            self._last_full_tokens = all_tokens
+            self._last_full_latent = all_latents
+        else:
+            self._last_encoded_tokens = None
+            self._last_encoded_latents = None
+            self._last_full_tokens = None
+            self._last_full_latent = None
 
         # Cache flattened full latent on device for reward computation (token smoothness)
         # all_tokens is the post-quantization token that gets sent to decoder
@@ -1036,6 +1060,8 @@ class UniversalTokenModule(nn.Module):
                 "tokenizer_obs": tokenizer_obs,
                 "encoded_tokens": encoded_tokens,
                 "encoded_latents": encoded_latents,
+                "full_tokens": all_tokens,
+                "full_latent": all_latents,
                 "encoder_masks": encoder_masks,
                 "decoded_outputs": decoded_outputs,
                 "action_mean": action_mean,
@@ -1067,6 +1093,8 @@ class UniversalTokenModule(nn.Module):
                 "encoder_masks": encoder_masks,
                 "encoded_tokens": encoded_tokens,
                 "encoded_latents": encoded_latents,
+                "full_tokens": all_tokens,
+                "full_latent": all_latents,
                 "encoders_cfg": self.encoders_cfg,
                 "decoders_cfg": self.decoders_cfg,
             }
@@ -1080,12 +1108,30 @@ class UniversalTokenModule(nn.Module):
                 "encoder_masks": encoder_masks,
                 "encoded_tokens": encoded_tokens,
                 "encoded_latents": encoded_latents,
+                "full_tokens": all_tokens,
+                "full_latent": all_latents,
                 "encoders_cfg": self.encoders_cfg,
                 "decoders_cfg": self.decoders_cfg,
             }
         else:
             output = action_mean
         return output
+
+    def get_last_multimodal_representation(self, *, detach: bool = False):
+        """Return the latest batch-aligned FSQ representation.
+
+        The returned dictionary has ``tokens`` (post-FSQ, including any latent
+        residual) and ``latent`` (continuous pre-FSQ). By default the tensors
+        stay attached to the current actor graph, which is required when a WAM
+        imagination loss backpropagates through the policy. Set ``detach=True``
+        for logging or replay-buffer storage.
+        """
+        if self._last_full_tokens is None:
+            return None
+        tokens, latent = self._last_full_tokens, self._last_full_latent
+        if detach:
+            tokens, latent = tokens.detach(), latent.detach()
+        return {"tokens": tokens, "latent": latent}
 
     def get_token_info(self):
         """Return a summary of the FSQ token configuration.

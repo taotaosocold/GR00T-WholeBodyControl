@@ -1,0 +1,19 @@
+_target_: gear_sonic.trl.trainer.wam_trainer.WAMTrainer
+settings:
+  observation_keys: [actor_obs, tokenizer]
+  collect_steps: 32
+  replay_steps: 256
+  replay_envs: 256
+  window: 8
+  horizon: 32
+  batch_size: 256
+  world_updates: 10
+  warmup_world_updates: 100
+  actor_updates: 1
+  critic_epochs: 5
+  learning_rate: 0.0002
+  action_noise: 0.05
+  aux_loss_scale: 1.0
+  save_interval: 500
+  save_replay: false
+  compile: false

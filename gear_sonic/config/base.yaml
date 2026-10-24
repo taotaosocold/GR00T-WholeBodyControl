@@ -7,6 +7,7 @@ defaults:
   - callbacks/model_save
   - callbacks/wandb
   - trainer: trl
+  - optional world_model: null
   - opt/wandb
 
 num_gpus: 1

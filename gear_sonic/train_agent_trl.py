@@ -448,6 +448,13 @@ def main(config: OmegaConf):
     ################
     # Training
     ################
+    trainer_kwargs = {}
+    if config.trainer.get("_target_", "").endswith("WAMTrainer"):
+        if config.get("world_model") is None:
+            raise ValueError("trainer=wam requires world_model=wam_dynamics")
+        trainer_kwargs["world_model_config"] = OmegaConf.to_container(
+            config.world_model, resolve=True
+        )
     trainer = custom_instantiate(
         config.trainer,
         args=training_args,
@@ -467,6 +474,7 @@ def main(config: OmegaConf):
         log_dir=experiment_save_dir,
         accelerator=accelerator,
         _resolve=False,
+        **trainer_kwargs,
     )
 
     # Training loop

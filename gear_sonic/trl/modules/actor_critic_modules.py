@@ -530,6 +530,19 @@ class Actor(nn.Module):
         actions_mean = actions_mean[:, -1]
         return actions_mean
 
+    def get_last_multimodal_representation(self, *, detach: bool = False):
+        """Return the latest FSQ representation produced by the actor backbone.
+
+        ``UniversalTokenModule`` caches a batch-aligned continuous latent and
+        post-FSQ token tensor on every forward pass.  This accessor keeps the
+        model-based training hook optional: older backbones simply return
+        ``None`` and all existing PPO callers continue unchanged.
+        """
+        getter = getattr(self.actor_module, "get_last_multimodal_representation", None)
+        if getter is None:
+            return None
+        return getter(detach=detach)
+
     def to_cpu(self):
         """Move the actor and its normalizers to CPU."""
         if self.running_mean_std is not None:

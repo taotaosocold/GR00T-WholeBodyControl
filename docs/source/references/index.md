@@ -9,3 +9,4 @@ These pages contain the original standalone documentation that previously lived 
 - [Kinematic Planner ONNX Model](planner_onnx.md) — detailed input/output specification for the ONNX-exported kinematic planner
 - [JetPack 6 Flashing Guide](jetpack6.md) — flash the Orin NX on the Unitree G1
 - [Decoupled WBC (N1.5 / N1.6)](decoupled_wbc.md) — the earlier Decoupled WBC stack used in Gr00t N1.5 and N1.6
+- [Model-based WAM training](model_based_wam.md) — optional SuperMimic-style WAM, FSQ integration, replay, imagination, and MPC

@@ -917,6 +917,7 @@ class ManagerEnvWrapper:
             )
 
         extras["time_outs"] = truncated
+        extras["terminated"] = terminated
         extras["episode"] = {}
         extras["to_log"] = {}
         for k, v in extras["log"].items():

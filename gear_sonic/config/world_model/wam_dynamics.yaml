@@ -1,0 +1,16 @@
+# Residual WAM branch for model-based whole-body control. The state/context
+# vectors are filled from the resolved environment dimensions by the launcher.
+_target_: gear_sonic.trl.modules.wam.StateSpaceWorldModel
+_recursive_: false
+cfg:
+  _target_: gear_sonic.trl.modules.wam.WAMConfig
+  state_dim: 256
+  action_dim: 29
+  context_dim: 0
+  hidden: [512, 512, 512]
+  term_hidden: [128, 128]
+  reward_hidden: [128, 128]
+  learn_termination: true
+  learn_reward: true
+  reward_loss_coef: 1.0
+  residual_scale: 1.0
