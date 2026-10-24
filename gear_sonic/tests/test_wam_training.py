@@ -227,6 +227,30 @@ class TrainingTests(unittest.TestCase):
             WAMTrainer.optimizer_step(loss, optimizer, model.parameters())
         self.assertTrue(torch.equal(before, model.weight))
 
+    def test_motion_reload_refreshes_observations_and_seals_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory)
+            trainer.collect(2)
+            calls = []
+
+            def reload_motion():
+                calls.append(True)
+                trainer.env.x.fill_(7.0)
+                trainer.env.goals.fill_(9.0)
+
+            trainer.env.resample_motion = reload_motion
+            trainer.settings["motion_resample_frequency"] = 2
+            self.assertFalse(trainer._maybe_resample_motions(0))
+            self.assertFalse(trainer._maybe_resample_motions(1))
+            self.assertTrue(trainer._maybe_resample_motions(2))
+            self.assertEqual(len(calls), 1)
+            self.assertTrue((trainer.obs["actor_obs"] == 7.0).all())
+            self.assertTrue((trainer.obs["tokenizer"][:, :9] == 9.0).all())
+            self.assertTrue(trainer.replay.state_dict()["storage"]["done"][-1].all())
+            self.assertFalse(trainer.replay.state_dict()["storage"]["terminated"][-1].any())
+            trainer.settings["motion_resample_frequency"] = 0
+            self.assertFalse(trainer._maybe_resample_motions(4))
+
     def test_original_actor_universal_token_fsq_end_to_end(self):
         torch.manual_seed(31)
         policy = make_original_fsq_actor()

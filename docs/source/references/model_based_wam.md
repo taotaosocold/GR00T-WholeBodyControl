@@ -66,6 +66,12 @@ from a WAM checkpoint. Policy weights remain under `policy_state_dict`, so the
 existing policy evaluation loader can read them. The trainer uses its own
 checkpoint and logging loop rather than PPO-specific callbacks.
 
+Long runs refresh the loaded motion subset every 250 iterations through
+`trainer.settings.motion_resample_frequency`. Set it to zero to disable
+refreshing. The trainer seals the old replay segment and obtains fresh
+observations after a reload, preventing transitions across different resets.
+Replay retains its already logged reference timelines from older subsets.
+
 Only rank zero writes the shared `last.pt`. Multi-process saves additionally
 write generation-specific rank sidecars beside it for independent RNG states
 and optional replay. Keep the referenced sidecars when copying a checkpoint

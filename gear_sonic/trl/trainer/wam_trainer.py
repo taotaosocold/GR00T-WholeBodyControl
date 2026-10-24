@@ -376,6 +376,7 @@ class WAMTrainer:
         window = int(self.settings.get("window", 8))
         for iteration in range(self.iteration, iterations):
             started = time.perf_counter()
+            self._maybe_resample_motions(iteration)
             metrics = {"real/reward": self.collect(int(self.settings.get("collect_steps", 32)))}
             if self.distributed.all_finite(len(self.replay) >= window):
                 metrics.update(self.fit_world_model())
@@ -406,6 +407,24 @@ class WAMTrainer:
             if frequency > 0 and self.iteration % frequency == 0:
                 self.save_checkpoint(self.log_dir / "last.pt")
         self.save_checkpoint(self.log_dir / "last.pt")
+
+    def _maybe_resample_motions(self, iteration):
+        """Refresh the loaded motion subset without splicing replay episodes.
+
+        PPO's ImResampleCallback is not run by this trainer. Follow its default
+        250-iteration refresh cadence so long runs can visit the full library.
+        A reload may reset the simulator, so seal the old replay segment and
+        fetch fresh observations before the next action.
+        """
+        frequency = int(self.settings.get("motion_resample_frequency", 250))
+        if frequency <= 0 or iteration == 0 or iteration % frequency:
+            return False
+        if not hasattr(self.env, "resample_motion"):
+            return False
+        self.replay.mark_discontinuity()
+        self.env.resample_motion()
+        self.obs = self.env.reset_all()
+        return True
 
     def save_checkpoint(self, path):
         path = Path(path)

@@ -2,6 +2,7 @@ _target_: gear_sonic.trl.trainer.wam_trainer.WAMTrainer
 settings:
   observation_keys: [actor_obs, tokenizer]
   collect_steps: 32
+  motion_resample_frequency: 250
   replay_steps: 256
   replay_envs: 256
   window: 8
