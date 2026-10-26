@@ -52,6 +52,7 @@ import yaml
 from gear_sonic import train_agent_trl
 from gear_sonic.trl.utils import common as trl_utils_common
 from gear_sonic.trl.utils import scheduler
+from gear_sonic.trl.utils.checkpoint import get_checkpoint_step
 from gear_sonic.utils import common as rl_utils_common
 from gear_sonic.utils import config_utils, obs_utils
 
@@ -461,7 +462,7 @@ def main(override_config: omegaconf.OmegaConf):
         model.policy.load_state_dict(state_dict)
         logger.info("Successfully loaded policy state dict")
 
-    state.global_step = checkpoint["state"].global_step
+    state.global_step = get_checkpoint_step(checkpoint)
 
     schedule_wrapper = easydict.EasyDict(env=env, model=model)
     if "schedule_dict" in config.trainer:
@@ -470,7 +471,7 @@ def main(override_config: omegaconf.OmegaConf):
         )
     env.reinit_dr()
 
-    global_step = checkpoint["state"].global_step
+    global_step = state.global_step
     exported_policy_path = os.path.join(config.experiment_dir, "exported")
     os.makedirs(exported_policy_path, exist_ok=True)
     exported_onnx_name = f"model_step_{global_step:06d}.onnx"

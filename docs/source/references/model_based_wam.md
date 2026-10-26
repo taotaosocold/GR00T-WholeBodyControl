@@ -177,6 +177,32 @@ held-out real transitions. These statistics use different states and actions,
 so they are not directly comparable success rates. Avoid judging calibration
 from fitting loss alone.
 
+## Recording real simulator videos
+
+Use the saved FSQ policy to record actual Isaac Lab rollouts, independently of
+the world model's imagined survival probability:
+
+```bash
+bash gear_sonic/record_wam_video.sh /path/to/training_run /path/to/new_video_dir
+```
+
+The script accepts a run directory containing `last.pt` and `config.yaml`, or
+a checkpoint path. It snapshots the checkpoint and config before evaluation,
+records one environment on GPU 0, and saves approximately ten seconds to
+`/path/to/new_video_dir/mp4/000000.mp4`. No desktop display is required. It
+uses the original training termination conditions and continues across resets,
+so frequent failures remain visible. It skips the full-dataset evaluation
+callback and does not start a WAM training process.
+
+Set `WAM_VIDEO_GPU`, `WAM_VIDEO_NUM_ENVS`, `WAM_VIDEO_STEPS`, or
+`WAM_VIDEO_PYTHON` to override the defaults. `WAM_VIDEO_ENCODER` selects `g1`
+(default), `smpl`, `teleop`, or `mixed` (the saved sampling configuration).
+For example, use `WAM_VIDEO_ENCODER=smpl` to inspect the SMPL interface in a
+separate output directory. Rendering requires additional GPU memory; release
+training resources or choose a GPU with sufficient space before recording.
+The evaluator reads PPO's `state.global_step` or WAM's `wam_iteration`; WAM
+policy-only evaluation does not need the rank sidecars used for full resume.
+
 ## Optional utilities and acceleration
 
 `gear_sonic.trl.world_model` also exposes a separate latent `WAM`,
