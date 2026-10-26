@@ -1,5 +1,7 @@
 """Numerical training-loop checks with real FSQ and a small vector environment."""
 
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -186,9 +188,160 @@ class TrainingTests(unittest.TestCase):
     def test_full_training_entry_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             trainer = self.make_trainer(directory)
-            trainer.train()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trainer.train()
             self.assertEqual(trainer.iteration, 1)
             self.assertTrue((Path(directory) / "last.pt").exists())
+            line = output.getvalue()
+            for name in (
+                "real/done_fraction", "real/terminated_fraction", "real/truncated_fraction",
+                "real/action_rms", "real/reward_std", "actor/effective_horizon",
+                "actor/aux_loss", "world/last_valid_fraction",
+            ):
+                self.assertIn(name + "=", line)
+
+    def test_collection_diagnostics_measure_real_steps_and_filter_scalar_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory)
+            trainer.settings["action_noise"] = 0.0
+            trainer._action = lambda state: state.new_full((state.shape[0], 2), 2.0)
+            rewards_by_step = [
+                torch.tensor([-6., -4., -6., -4., -6., -4.]),
+                torch.tensor([-2., 0., -2., 0., -2., 0.]),
+            ]
+            calls = []
+
+            def step(payload):
+                index = len(calls)
+                calls.append(True)
+                self.assertTrue((payload["actions"] == 1.0).all())
+                terminated = torch.tensor([True, index == 0, False, False, False, False])
+                truncated = torch.tensor([False, index == 1, True, False, False, False])
+                logs = {
+                    "Episode_Reward/action_rate_l2": torch.tensor(-4. + 2. * index),
+                    "Episode_Termination/foot": 0.25 + 0.5 * index,
+                    "Metrics/motion/error": torch.tensor(0.5 + index),
+                    "Metrics/motion/one_element": torch.tensor([8.]),
+                    "Episode_Reward/occasionally_nan": torch.tensor(float("nan") if index == 0 else 2.),
+                    "Episode_Reward/always_nan": torch.tensor(float("nan")),
+                    "Metrics/motion/vector": torch.tensor([1., 2.]),
+                    "Metrics/motion/empty": torch.tensor([]),
+                    "Episode_Reward/string": "not a scalar",
+                    "unrelated": torch.tensor(99.),
+                }
+                if index == 0:
+                    logs["Episode_Reward/sparse"] = torch.tensor(7.)
+                return trainer.env._obs(), rewards_by_step[index], terminated | truncated, {
+                    "terminated": terminated, "time_outs": truncated, "to_log": logs,
+                }
+
+            trainer.env.step = step
+            mean_reward = trainer.collect(2)
+            metrics = trainer._last_collection_metrics
+            self.assertEqual(mean_reward, -3.0)
+            self.assertAlmostEqual(metrics["real/done_fraction"], 0.5)
+            self.assertAlmostEqual(metrics["real/terminated_fraction"], 0.25)
+            self.assertAlmostEqual(metrics["real/truncated_fraction"], 0.25)
+            self.assertAlmostEqual(metrics["real/action_rms"], 1.0)
+            self.assertAlmostEqual(metrics["real/action_abs_max"], 1.0)
+            self.assertAlmostEqual(metrics["real/action_at_limit_fraction"], 1.0)
+            expected_std = torch.cat(rewards_by_step).std(unbiased=False).item()
+            self.assertAlmostEqual(metrics["real/reward_std"], expected_std, places=6)
+            self.assertEqual(metrics["real/Episode_Reward/action_rate_l2"], -3.0)
+            self.assertEqual(metrics["real/Episode_Termination/foot"], 0.5)
+            self.assertEqual(metrics["real/Metrics/motion/error"], 1.0)
+            self.assertEqual(metrics["real/Metrics/motion/one_element"], 8.0)
+            self.assertEqual(metrics["real/Episode_Reward/sparse"], 7.0)
+            self.assertEqual(metrics["real/Episode_Reward/occasionally_nan"], 2.0)
+            for key in (
+                "Episode_Reward/always_nan", "Metrics/motion/vector", "Metrics/motion/empty",
+                "Episode_Reward/string", "unrelated",
+            ):
+                self.assertNotIn("real/" + key, metrics)
+
+    def test_imagination_reports_effective_horizon_and_auxiliary_contribution(self):
+        class AuxiliaryPolicy(FSQPolicy):
+            def __init__(self):
+                super().__init__()
+                self.has_aux_loss = True
+                self.aux_loss_coef = {"decoder_penalty": 0.25}
+                self.aux_losses = {}
+
+            def forward(self, obs, is_training=False, **kwargs):
+                action = super().forward(obs, is_training=is_training, **kwargs)
+                if is_training:
+                    self.aux_losses = {"decoder_penalty": self.decoder.weight.square().mean()}
+                return action
+
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory, policy=AuxiliaryPolicy())
+            trainer.collect(6)
+            trainer.fit_world_model()
+            batch = trainer.replay.sample(24, 3, device=trainer.device)
+            lengths = torch.tensor([1, 2, 3], device=trainer.device).repeat(8)
+            batch["mask"] = torch.arange(3, device=trainer.device)[None, :] < lengths[:, None]
+            batch["dynamics_mask"] = batch["mask"] & ~batch["dones"]
+            trainer.replay.sample = lambda *args, **kwargs: batch
+            expected_aux = 0.25 * trainer.policy.decoder.weight.detach().square().mean().item()
+            metrics = trainer.improve_policy()
+            self.assertEqual(metrics["actor/effective_horizon"], 2.0)
+            self.assertAlmostEqual(metrics["actor/aux_loss"], expected_aux, places=7)
+            self.assertAlmostEqual(
+                metrics["actor/loss"], -metrics["actor/imagined_return"] / 3 + expected_aux,
+                places=6,
+            )
+
+    def test_actor_projects_reference_before_predicting_termination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory)
+            trainer.collect(6)
+            trainer.fit_world_model()
+            # The toy tokenizer's first nine coordinates are three goal inputs;
+            # its final three coordinates route those inputs to FSQ encoders.
+            trainer.layout.exogenous_indices = list(range(4, 13))
+            batch = trainer.replay.sample(24, 3, device=trainer.device)
+            seed = batch["states"][:, 0].detach().clone()
+            for step in range(1, 4):
+                batch["states"][:, step, 4:13] = seed[:, 4:13] + 0.25 * step
+                # Even if the next logged route differs, this rollout keeps
+                # the seed modality rather than predicting a fractional route.
+                batch["states"][:, step, 13:16] = seed[:, 13:16].roll(1, dims=-1)
+            lengths = torch.tensor([1, 2, 3], device=trainer.device).repeat(8)
+            batch["mask"] = torch.arange(3, device=trainer.device)[None, :] < lengths[:, None]
+            batch["dones"] = torch.zeros_like(batch["mask"])
+            batch["dones"][lengths < 3, lengths[lengths < 3] - 1] = True
+            batch["terminated"] = batch["dones"].clone()
+            batch["dynamics_mask"] = batch["mask"] & ~batch["dones"]
+            trainer.replay.sample = lambda *args, **kwargs: batch
+            # Make unprojected reference and routing predictions wrong so the
+            # checks cannot accidentally pass with an identity dynamics model.
+            with torch.no_grad():
+                trainer.world_model.dynamics[-1].bias.fill_(0.37)
+            calls = []
+
+            def checked_world_step(state, action, **kwargs):
+                self.assertIn("next_state_projector", kwargs)
+                self.assertTrue(callable(kwargs["next_state_projector"]))
+                step = len(calls)
+                prediction = trainer.world_model(state, action, **kwargs)
+                next_state = prediction["next_state"]
+                next_reference = torch.where(
+                    batch["dynamics_mask"][:, step, None],
+                    batch["states"][:, step + 1], batch["states"][:, step],
+                )
+                self.assertTrue(torch.equal(next_state[:, 4:13], next_reference[:, 4:13]))
+                self.assertTrue(torch.equal(next_state[:, 13:16], seed[:, 13:16]))
+                expected_logits = trainer.world_model.termination_head(
+                    trainer.world_model.state_norm(next_state)
+                ).squeeze(-1)
+                torch.testing.assert_close(prediction["termination_logits"], expected_logits)
+                calls.append(step)
+                return prediction
+
+            trainer.world_step = checked_world_step
+            trainer.improve_policy()
+            self.assertEqual(calls, [0, 1, 2])
 
     def test_layout_copies_categorical_routing(self):
         env = VectorEnv()

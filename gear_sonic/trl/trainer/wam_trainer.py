@@ -8,7 +8,9 @@ decoder. This is an observation-space baseline, not SuperMimic's robot-specific
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
+from numbers import Real
 from pathlib import Path
 import time
 
@@ -239,6 +241,11 @@ class WAMTrainer:
         norms = self._normalizers()
         before = self.distributed.snapshot_running_norms(norms)
         total = 0.0
+        # Accumulate on-device and transfer the diagnostic scalars once per
+        # collection, rather than synchronizing CUDA for every new metric.
+        diagnostic_sums = torch.zeros(7, dtype=torch.float64, device=self.device)
+        action_abs_max = torch.zeros((), device=self.device)
+        episode_logs = {}
         for _ in range(steps):
             state = self.layout.pack(self.obs)
             action = self._action(state)
@@ -252,6 +259,38 @@ class WAMTrainer:
             reward = rewards.reshape(state.shape[0], -1).sum(-1)
             timeout = infos.get("time_outs", torch.zeros_like(dones)).bool()
             terminated = infos.get("terminated", dones.bool() & ~timeout).bool()
+            at_limit = (
+                (executed.abs() >= limit).float().mean()
+                if limit is not None and limit > 0 else executed.new_zeros(())
+            )
+            diagnostic_sums += torch.stack((
+                dones.float().mean(), terminated.float().mean(), timeout.float().mean(),
+                executed.square().mean(), at_limit, reward.mean(), reward.square().mean(),
+            )).double()
+            action_abs_max = torch.maximum(action_abs_max, executed.abs().max())
+            to_log = infos.get("to_log", {})
+            if isinstance(to_log, Mapping):
+                for name, value in to_log.items():
+                    if not isinstance(name, str) or not name.startswith((
+                        "Episode_Reward/", "Episode_Termination/", "Metrics/motion/",
+                    )):
+                        continue
+                    if isinstance(value, torch.Tensor):
+                        if value.numel() != 1:
+                            continue
+                        value = value.detach().reshape(()).to(self.device, dtype=torch.float64)
+                    elif isinstance(value, Real):
+                        value = diagnostic_sums.new_tensor(value)
+                    else:
+                        continue
+                    # Empty episode-reset batches may produce NaN telemetry;
+                    # do not let missing diagnostic values poison all ranks.
+                    finite = torch.isfinite(value)
+                    if name not in episode_logs:
+                        episode_logs[name] = diagnostic_sums.new_zeros(2)
+                    accumulator = episode_logs[name]
+                    accumulator[0] += torch.where(finite, value, value.new_zeros(()))
+                    accumulator[1] += finite
             indices = self.replay_env_ids
             self.replay.add(
                 state[indices], executed[indices], reward[indices], next_state[indices],
@@ -265,6 +304,21 @@ class WAMTrainer:
             self.obs = next_obs
             total += reward.mean().item()
         self.distributed.sync_running_norms(norms, before)
+        means = diagnostic_sums / max(steps, 1)
+        reward_std = (means[6] - means[5].square()).clamp_min(0).sqrt()
+        values = torch.stack((
+            means[0], means[1], means[2], means[3].sqrt(), means[4],
+            reward_std, action_abs_max.double(),
+        )).cpu().tolist()
+        self._last_collection_metrics = dict(zip((
+            "real/done_fraction", "real/terminated_fraction", "real/truncated_fraction",
+            "real/action_rms", "real/action_at_limit_fraction", "real/reward_std",
+            "real/action_abs_max",
+        ), values))
+        for name, accumulator in episode_logs.items():
+            value_sum, count = accumulator.cpu().tolist()
+            if count:
+                self._last_collection_metrics[f"real/{name}"] = value_sum / count
         return total / max(steps, 1)
 
     def fit_world_model(self):
@@ -312,19 +366,23 @@ class WAMTrainer:
                     coefficients = self.policy.aux_loss_coef or {}
                     for name, loss in (self.policy.aux_losses or {}).items():
                         auxiliary_loss = auxiliary_loss + coefficients.get(name, 0.0) * loss
-                prediction = self.world_step(state, action)
-                reward = prediction["reward"]
-                done = prediction["termination_logits"].sigmoid()
-                objective = objective + gamma**step * survival * reward * valid
-                survival = torch.where(valid, survival * (1.0 - done), survival)
                 # At an auto-reset boundary the following reference belongs to
                 # another clip. Hold the last valid reference for bootstrapping.
                 next_reference = torch.where(
                     batch["dynamics_mask"][:, step, None],
                     batch["states"][:, step + 1], batch["states"][:, step],
                 )
-                predicted_state = self.layout.project(prediction["next_state"], seed, next_reference)
-                state = torch.where(valid[:, None], predicted_state, state)
+                prediction = self.world_step(
+                    state, action,
+                    next_state_projector=lambda predicted: self.layout.project(
+                        predicted, seed, next_reference
+                    ),
+                )
+                reward = prediction["reward"]
+                done = prediction["termination_logits"].sigmoid()
+                objective = objective + gamma**step * survival * reward * valid
+                survival = torch.where(valid, survival * (1.0 - done), survival)
+                state = torch.where(valid[:, None], prediction["next_state"], state)
                 rewards.append(reward)
                 dones.append(done)
             bootstrap = self.critic(self.world_model.state_norm(state)).squeeze(-1)
@@ -366,6 +424,8 @@ class WAMTrainer:
             "actor/loss": float(loss.detach()), "actor/grad_norm": float(grad),
             "actor/imagined_return": float(objective.detach().mean()),
             "actor/survival": float(survival.detach().mean()),
+            "actor/effective_horizon": float(batch["mask"].sum(-1).float().mean()),
+            "actor/aux_loss": float(auxiliary_loss.detach()),
             "critic/loss": float(critic_loss.detach()),
         }
 
@@ -378,6 +438,7 @@ class WAMTrainer:
             started = time.perf_counter()
             self._maybe_resample_motions(iteration)
             metrics = {"real/reward": self.collect(int(self.settings.get("collect_steps", 32)))}
+            metrics.update(self._last_collection_metrics)
             if self.distributed.all_finite(len(self.replay) >= window):
                 metrics.update(self.fit_world_model())
             can_imagine = (

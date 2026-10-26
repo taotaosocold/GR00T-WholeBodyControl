@@ -95,6 +95,9 @@ model gradients. Robot-relative orientation features remain predictions of the
 world model. Encoder routing bits are copied from the seed. New tokenizer terms
 must be classified using `settings.exogenous_tokenizer_features`; this setting
 replaces the built-in reference-feature list when provided.
+The termination head receives the same projected next state that is returned
+to the caller, so it cannot classify termination from a separate, unprojected
+set of reference or routing predictions.
 
 `SequenceReplayBuffer` stores actual noisy, clipped actions. Samples stay in
 one environment and in chronological order across ring wraparound. Reward and
@@ -108,6 +111,60 @@ The defaults warm up the WAM before updating the actor. Non-finite losses or
 gradients reject the update. Real simulator reward and imagined reward are
 logged separately. Validation must compare open-loop model errors and real
 tracking returns, not just an increasing imagined return.
+
+## Reading the training diagnostics
+
+These diagnostics describe the current simulator collection and training replay;
+they are not an independent validation set. There are no established convergence
+thresholds for this observation-space WAM baseline. Compare fixed validation
+motions, actual tracking errors, and complete-motion success rates for each
+input modality before judging control quality or a speedup over PPO.
+
+| Metric | Meaning and interpretation |
+| --- | --- |
+| `real/reward` | Mean real simulator reward per environment step, including the environment's reward weights and timestep scaling. It is not an episode return or the original PPO logger's `rewards/total`. |
+| `real/reward_std` | Population standard deviation of all real reward samples collected by this rank in the iteration. Compare reward prediction RMSE with this scale and with a mean-reward baseline. |
+| `real/done_fraction` | Fraction of collected environment steps that ended an episode, including real terminations and time-limit truncations. |
+| `real/terminated_fraction`, `real/truncated_fraction` | Separate rates for real termination and time-limit truncation; a time limit is not treated as a learned physical failure. |
+| `real/action_rms`, `real/action_abs_max` | Magnitudes of the noisy, clipped actions actually sent to the simulator. These help identify action growth that may cause rate or joint-limit penalties. |
+| `real/action_at_limit_fraction` | Fraction of executed action coordinates at the configured absolute action limit. It is not the fraction of raw policy outputs that were clipped. |
+| `world/valid_steps_mean` | Mean number of usable reward/termination steps in each sampled fitting window, up to `window`. |
+| `world/dynamics_valid_fraction` | Fraction of fitting-window steps with a usable, non-reset next state for dynamics supervision. |
+| `world/last_valid_fraction` | Fraction of sampled windows with a usable final dynamics step. Interpret `world/state_error_last` only when this is positive. |
+| `actor/effective_horizon` | Mean number of valid reference steps before the sampled replay boundary, up to `horizon`; this can be far shorter than the configured imagination horizon. |
+| `actor/aux_loss` | Coefficient-weighted FSQ auxiliary loss at the imagined seed. `actor/loss` adds this term multiplied by `aux_loss_scale` to the negative horizon-normalized imagined return. |
+
+Scalar environment summaries with the prefixes `Episode_Reward/`,
+`Episode_Termination/`, and `Metrics/motion/` are also logged under `real/`.
+Each is averaged over the collection steps where that scalar was available;
+missing, empty, non-scalar, or non-finite values do not count as zeros. These
+summaries retain the simulator's episode-summary definitions and normalization,
+so they need not equal instantaneous reward terms.
+
+Final logged statistics are averages across ranks. In particular,
+`real/reward_std` is the average of per-rank standard deviations, not a pooled
+global standard deviation; `real/action_abs_max` is the average of rank maxima,
+not the maximum across all GPUs. `world/*` describe the final fitting batch of
+the iteration rather than the average of all world-model updates.
+
+If every sampled trajectory terminates before the fitting window's last step,
+`world/state_error_last` is zero because there are no valid final-step targets.
+That is missing evidence, not a perfect prediction. The accompanying
+`world/last_valid_fraction=0` makes this case explicit. Masking terminal reset
+observations must remain enabled: removing the masks would train the model to
+predict artificial jumps into a new episode.
+
+Persistently worsening real reward, frequent real terminations, and a short
+effective horizon warrant stopping a long run and inspecting the reward
+components, executed actions, and checkpoint history. A smaller state loss can
+coincide with worse control because it is computed only on surviving valid
+steps and includes reference dimensions that are directly projected. Likewise,
+`actor/survival` is a model prediction, not the real success rate; a small critic
+loss only shows agreement with imagined value targets. The actor objective can
+also prefer avoiding future negative rewards through predicted termination,
+so inspect real failure rates rather than treating rising imagined return as
+proof of improvement. The projection and diagnostic changes do not establish
+convergence or resolve every possible cause of policy collapse.
 
 ## Optional utilities and acceleration
 

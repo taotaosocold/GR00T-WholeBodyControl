@@ -189,11 +189,21 @@ class StateSpaceWorldModel(nn.Module):
         state: torch.Tensor,
         action: torch.Tensor,
         context: Optional[torch.Tensor] = None,
+        *,
+        next_state_projector: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
-        """Predict next state, reward, and termination logits for one transition."""
+        """Predict next state, reward, and termination logits for one transition.
+
+        Project known references and routing bits before evaluating termination,
+        so its head sees the same next state returned to the rollout. Otherwise
+        unconstrained predictions of projected features can provide a shortcut
+        to the termination objective and its policy gradients.
+        """
         x = self._model_input(state, action, context)
         delta = self.dynamics(x) * self.residual_scale
         next_state = state + delta * self.delta_norm.std()
+        if next_state_projector is not None:
+            next_state = next_state_projector(next_state)
         out = {"next_state": next_state, "delta": delta}
         if self.reward_head is not None:
             out["reward"] = self.reward_head(x).squeeze(-1)
@@ -298,11 +308,13 @@ class StateSpaceWorldModel(nn.Module):
         state_errors, reward_preds, term_logits = [], [], []
         for t in range(actions.shape[1]):
             result = self.forward(
-                current, actions[:, t], None if context is None else context[:, t]
+                current, actions[:, t], None if context is None else context[:, t],
+                next_state_projector=(
+                    (lambda predicted, step=t: state_projector(predicted, step))
+                    if state_projector is not None else None
+                ),
             )
             current = result["next_state"]
-            if state_projector is not None:
-                current = state_projector(current, t)
             state_errors.append(
                 ((current - states[:, t + 1]) / self.state_norm.std()).square().mean(-1)
             )
@@ -331,6 +343,12 @@ class StateSpaceWorldModel(nn.Module):
             term_loss = (term_loss * valid).sum() / valid.sum().clamp_min(1)
             losses["termination_loss"] = term_loss
             losses["loss"] = losses["loss"] + term_loss
+        losses["last_valid_fraction"] = state_valid[:, -1].mean()
+        losses["dynamics_valid_fraction"] = state_valid.mean()
+        losses["valid_steps_mean"] = valid.sum(-1).mean()
+        # Preserve the historical zero when the final step has no valid state
+        # target. Read it together with last_valid_fraction: zero coverage means
+        # the error is unobserved, rather than a perfect multi-step prediction.
         losses["state_error_last"] = (error[:, -1] * state_valid[:, -1]).sum() / (
             state_valid[:, -1].sum().clamp_min(1)
         )
