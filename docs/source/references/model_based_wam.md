@@ -98,6 +98,11 @@ replaces the built-in reference-feature list when provided.
 The termination head receives the same projected next state that is returned
 to the caller, so it cannot classify termination from a separate, unprojected
 set of reference or routing predictions.
+Both model fitting and policy imagination use the same reference-selection
+rule: advance the logged target only when the next state is not an auto-reset.
+At termination or truncation, keep the last pre-reset target. Feeding a reset
+episode's new target to the termination head during fitting would leak the
+termination label through a reference change unavailable during imagination.
 
 `SequenceReplayBuffer` stores actual noisy, clipped actions. Samples stay in
 one environment and in chronological order across ring wraparound. Reward and
@@ -165,6 +170,12 @@ also prefer avoiding future negative rewards through predicted termination,
 so inspect real failure rates rather than treating rising imagined return as
 proof of improvement. The projection and diagnostic changes do not establish
 convergence or resolve every possible cause of policy collapse.
+
+A tiny termination fitting loss together with optimistic imagined survival
+and frequent real terminations warrants checking the termination model on
+held-out real transitions. These statistics use different states and actions,
+so they are not directly comparable success rates. Avoid judging calibration
+from fitting loss alone.
 
 ## Optional utilities and acceleration
 

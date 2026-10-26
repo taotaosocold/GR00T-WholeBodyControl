@@ -292,6 +292,63 @@ class TrainingTests(unittest.TestCase):
                 places=6,
             )
 
+    def test_fit_and_imagination_hold_reference_at_reset_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory)
+            trainer.settings.update(window=1, horizon=1, world_updates=1, batch_size=3)
+            trainer.layout.exogenous_indices = list(range(4, 13))
+            seed = trainer.layout.pack(trainer.obs)[:3].detach().clone()
+            seed[:, 4:13] = 10.0
+            logged_next = seed.clone()
+            logged_next[:, 4:13] = torch.tensor([20.0, 100.0, 200.0])[:, None]
+            logged_next[:, 13:16] = seed[:, 13:16].roll(1, dims=-1)
+            # The first transition advances normally. The next two contain
+            # auto-reset observations after real termination and truncation.
+            batch = {
+                "states": torch.stack((seed, logged_next), dim=1),
+                "actions": torch.zeros(3, 1, 2),
+                "rewards": torch.zeros(3, 1),
+                "dones": torch.tensor([[False], [True], [True]]),
+                "terminated": torch.tensor([[False], [True], [False]]),
+                "mask": torch.ones(3, 1, dtype=torch.bool),
+                "dynamics_mask": torch.tensor([[True], [False], [False]]),
+            }
+            trainer.replay.sample = lambda *args, **kwargs: batch
+            expected_reference = seed.clone()
+            expected_reference[0, 4:13] = 20.0
+            termination_inputs, predictions = [], []
+            original_forward = trainer.world_model.forward
+            hook = trainer.world_model.termination_head.register_forward_pre_hook(
+                lambda module, inputs: termination_inputs.append(inputs[0].detach().clone())
+            )
+
+            def checked_forward(state, action, context=None, **kwargs):
+                output = original_forward(state, action, context, **kwargs)
+                predictions.append(output["next_state"].detach().clone())
+                torch.testing.assert_close(
+                    termination_inputs[-1], trainer.world_model.state_norm(output["next_state"]),
+                )
+                return output
+
+            trainer.world_model.forward = checked_forward
+            trainer.world_step = checked_forward
+            try:
+                trainer.fit_world_model()
+                self.assertEqual(len(predictions), 1)
+                trainer.improve_policy()
+            finally:
+                hook.remove()
+            self.assertEqual(len(predictions), 2)
+            self.assertEqual(len(termination_inputs), 2)
+            for prediction, terminal_input in zip(predictions, termination_inputs):
+                # Both phases must keep the seed route and hold old goals at
+                # resets. Exposing 100/200 only during fitting leaks the label.
+                torch.testing.assert_close(prediction[:, 4:16], expected_reference[:, 4:16])
+                torch.testing.assert_close(
+                    terminal_input[:, 4:16],
+                    trainer.world_model.state_norm(expected_reference)[:, 4:16],
+                )
+
     def test_actor_projects_reference_before_predicting_termination(self):
         with tempfile.TemporaryDirectory() as directory:
             trainer = self.make_trainer(directory)

@@ -321,6 +321,21 @@ class WAMTrainer:
                 self._last_collection_metrics[f"real/{name}"] = value_sum / count
         return total / max(steps, 1)
 
+    @staticmethod
+    def _next_reference(batch, step):
+        """Advance references only when the logged next state is not a reset.
+
+        Reward and termination targets include terminal transitions, while their
+        next observation may already contain a different motion's goals. Both
+        model fitting and imagination must hold the current reference there;
+        otherwise the terminal classifier can identify the reset goal instead
+        of learning a failure that the imagined rollout can predict.
+        """
+        return torch.where(
+            batch["dynamics_mask"][:, step, None],
+            batch["states"][:, step + 1], batch["states"][:, step],
+        )
+
     def fit_world_model(self):
         window = int(self.settings.get("window", 8))
         batch_size = int(self.settings.get("batch_size", 256))
@@ -332,7 +347,7 @@ class WAMTrainer:
                 mask=batch["mask"], dynamics_mask=batch["dynamics_mask"],
                 rewards=batch["rewards"],
                 state_projector=lambda state, step: self.layout.project(
-                    state, batch["states"][:, 0], batch["states"][:, step + 1]
+                    state, batch["states"][:, 0], self._next_reference(batch, step)
                 ),
             )
             self.optimizer_step(
@@ -368,10 +383,7 @@ class WAMTrainer:
                         auxiliary_loss = auxiliary_loss + coefficients.get(name, 0.0) * loss
                 # At an auto-reset boundary the following reference belongs to
                 # another clip. Hold the last valid reference for bootstrapping.
-                next_reference = torch.where(
-                    batch["dynamics_mask"][:, step, None],
-                    batch["states"][:, step + 1], batch["states"][:, step],
-                )
+                next_reference = self._next_reference(batch, step)
                 prediction = self.world_step(
                     state, action,
                     next_state_projector=lambda predicted: self.layout.project(

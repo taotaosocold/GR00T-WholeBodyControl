@@ -148,8 +148,9 @@ python gear_sonic/train_agent_trl.py \
 
 Add `trainer=wam world_model=wam_dynamics` to the basic command to train the
 existing multimodal FSQ actor with differentiable world-model rollouts.
-This experimental observation-space baseline supports a single process and
-direct joint actions. See [the WAM reference](../references/model_based_wam.md)
+This experimental observation-space baseline supports single-GPU and
+data-parallel multi-GPU training with direct joint actions.
+See [the WAM reference](../references/model_based_wam.md)
 for configuration, checkpoint behavior, validation, and implementation limits.
 
 ### Adaptive sampling attribution
