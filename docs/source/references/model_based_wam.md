@@ -180,28 +180,35 @@ from fitting loss alone.
 ## Recording real simulator videos
 
 Use the saved FSQ policy to record actual Isaac Lab rollouts, independently of
-the world model's imagined survival probability:
+the world model's imagined survival probability. The existing evaluator and
+render recorder already support this; no additional recording script is needed:
 
 ```bash
-bash gear_sonic/record_wam_video.sh /path/to/training_run /path/to/new_video_dir
+CUDA_VISIBLE_DEVICES=0 python gear_sonic/eval_agent_trl.py \
+  checkpoint=/path/to/training_run/last.pt \
+  ++headless=true \
+  ++num_envs=1 \
+  '++eval_callbacks=[]' \
+  ++run_eval_loop=true \
+  ++run_once=false \
+  ++max_render_steps=500 \
+  ++manager_env.config.render_results=true \
+  ++manager_env.config.save_rendering_dir=/path/to/new_video_dir \
+  manager_env/recorders=render
 ```
 
-The script accepts a run directory containing `last.pt` and `config.yaml`, or
-a checkpoint path. It snapshots the checkpoint and config before evaluation,
-records one environment on GPU 0, and saves approximately ten seconds to
-`/path/to/new_video_dir/mp4/000000.mp4`. No desktop display is required. It
-uses the original training termination conditions and continues across resets,
-so frequent failures remain visible. It skips the full-dataset evaluation
-callback and does not start a WAM training process.
+Keep `config.yaml` beside the checkpoint. This command records approximately
+ten seconds to `/path/to/new_video_dir/000000.mp4`, using the original training
+termination conditions and continuing across resets so failures remain visible.
+It skips full-dataset evaluation and does not start WAM training. Add
+`++use_encoder=g1` or `++use_encoder=smpl` to select one of those modalities.
+Rendering requires additional GPU memory; use a GPU with sufficient space.
 
-Set `WAM_VIDEO_GPU`, `WAM_VIDEO_NUM_ENVS`, `WAM_VIDEO_STEPS`, or
-`WAM_VIDEO_PYTHON` to override the defaults. `WAM_VIDEO_ENCODER` selects `g1`
-(default), `smpl`, `teleop`, or `mixed` (the saved sampling configuration).
-For example, use `WAM_VIDEO_ENCODER=smpl` to inspect the SMPL interface in a
-separate output directory. Rendering requires additional GPU memory; release
-training resources or choose a GPU with sufficient space before recording.
-The evaluator reads PPO's `state.global_step` or WAM's `wam_iteration`; WAM
-policy-only evaluation does not need the rank sidecars used for full resume.
+The evaluator's existing render flags differ from Isaac Lab's standard
+`play.py --video --video_length ...` interface. WAM checkpoint evaluation also
+requires the step-metadata compatibility fix: read `wam_iteration` when PPO's
+`state.global_step` is absent. Policy-only evaluation does not need the rank
+sidecars used for full training resume.
 
 ## Optional utilities and acceleration
 
