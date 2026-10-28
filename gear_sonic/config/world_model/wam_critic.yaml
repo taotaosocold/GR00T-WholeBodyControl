@@ -1,0 +1,5 @@
+# Shared robot-state value function for the model-based WAM trainer.
+_target_: gear_sonic.trl.modules.wam.WAMCritic
+_recursive_: false
+input_dim: 1  # resolved from WAM state/context dimensions by the trainer
+hidden: [256, 128]

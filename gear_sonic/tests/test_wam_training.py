@@ -160,6 +160,43 @@ class TrainingTests(unittest.TestCase):
             }, checkpoint=checkpoint, resume=resume,
         )
 
+    def test_goal_free_single_step_wam_keeps_fsq_on_actor_path(self):
+        class SingleStepEnv(VectorEnv):
+            def _obs(self):
+                obs = super()._obs()
+                obs["wam"] = self.x.clone()
+                return obs
+
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = WAMTrainer(
+                args=SimpleNamespace(num_total_batches=1),
+                config=Config(gamma=0.99, lam=0.95),
+                env=SingleStepEnv(),
+                model=FSQPolicy(),
+                log_dir=directory,
+                settings={
+                    "state_observation_keys": ["wam"],
+                    "goal_observation_keys": ["tokenizer"],
+                    "window": 3,
+                    "horizon": 3,
+                    "batch_size": 4,
+                    "world_updates": 1,
+                    "critic_epochs": 1,
+                    "replay_steps": 8,
+                    "collect_steps": 4,
+                    "warmup_world_updates": 1,
+                },
+                world_model_config={
+                    "_target_": "gear_sonic.trl.modules.wam.StateSpaceWorldModel",
+                    "cfg": {"hidden": [8, 8], "term_hidden": [4], "reward_hidden": [4]},
+                },
+            )
+            self.assertEqual(trainer.world_model.goal_dim, 0)
+            trainer.collect(4)
+            trainer.fit_world_model()
+            metrics = trainer.improve_policy()
+            self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in metrics.values()))
+
     def test_collection_fit_imagination_and_checkpoint(self):
         torch.manual_seed(13)
         with tempfile.TemporaryDirectory() as directory:

@@ -1,8 +1,8 @@
-"""Differentiable latent world models for model-based whole-body control.
+"""World-model utilities for model-based whole-body control.
 
-The public API intentionally does not depend on the environment implementation.
-``WAM`` can therefore be used with IsaacLab rollouts, replay buffers, or a
-standalone simulator while the existing FSQ tokenizer remains unchanged.
+``StateSpaceWorldModel`` is the canonical goal-free dynamics used by
+``trainer=wam``. ``WAM`` and ``ModelBasedActorCriticTrainer`` remain available
+for legacy latent-model experiments and do not participate in that trainer.
 """
 
 from gear_sonic.trl.modules.wam import StateSpaceWorldModel, WAMConfig

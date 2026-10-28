@@ -23,13 +23,19 @@ python gear_sonic/train_agent_trl.py \
   ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=sample_data/smpl_filtered
 ```
 
-The trainer resolves state and action dimensions from the environment. Settings
-live in `gear_sonic/config/trainer/wam.yaml`; the dynamics architecture lives in
-`gear_sonic/config/world_model/wam_dynamics.yaml`. This path supports single-GPU
+The WAM path has three separate observation groups. `wam_state` is the
+SuperMimic physical state `p(3), quat(wxyz)(4), v(3), w(3), q(29), qd(29)`;
+`wam` is the single-step Sonic proprioceptive frame used to reconstruct the
+actor input; and `wam_reference` is the corresponding reference physical
+state. Settings live in `gear_sonic/config/trainer/wam.yaml`; the dynamics
+architecture lives in `gear_sonic/config/world_model/wam_dynamics.yaml` and
+the critic architecture in `gear_sonic/config/world_model/wam_critic.yaml`.
+This path supports single-GPU
 and data-parallel multi-GPU training with direct joint actions and an FSQ MLP
 actor. Actor-side RunningMeanStd/BatchNorm, temporal attention, and
-hierarchical action transforms are rejected explicitly. Observation histories
-already flattened into `actor_obs` remain supported.
+hierarchical action transforms are rejected explicitly. The actor's normal
+`actor_obs` history is retained separately and is never fed to WAM as a
+dynamics state.
 
 For eight GPUs, keep the same training arguments and launch with:
 
@@ -59,8 +65,10 @@ For a five-iteration smoke test that includes actor updates, override
 `trainer.settings.warmup_world_updates=4`. With the defaults, five iterations
 produce only 50 world updates, below the 100-update actor warmup threshold.
 
-The base config leaves WAM disabled. Omitting `trainer=wam world_model=wam_dynamics`
-keeps the existing PPO path. `checkpoint=/path/to/last.pt` loads a compatible
+The extra WAM observation groups are passive when PPO is selected; PPO's policy,
+reward, termination, and optimizer configuration is unchanged. Omitting
+`trainer=wam world_model=wam_dynamics` keeps the existing PPO update path.
+`checkpoint=/path/to/last.pt` loads a compatible
 FSQ policy; adding `+resume=true` restores WAM, critic, optimizers, and counters
 from a WAM checkpoint. Policy weights remain under `policy_state_dict`, so the
 existing policy evaluation loader can read them. The trainer uses its own
@@ -82,46 +90,56 @@ physics or promise bitwise continuation. Logs report averages across ranks.
 
 ## Observations, references, and replay
 
-This implementation is an **observation-space baseline**. It predicts the
-original flat `actor_obs` and robot-relative tokenizer features, rather than
-SuperMimic's canonical rigid-body state, analytic kinematics/rewards, and
-explicit randomized simulator context. Thus it is not a numerical reproduction
-of the paper. Noise and unobserved physical context can reduce its accuracy.
+The WAM state is the canonical 71-dimensional physical state. The actor's
+single-step proprioceptive frame is reconstructed from predicted physical
+states, so it does not need to equal the WAM state. The `tokenizer` group
+remains outside the dynamics model: G1 retargeted,
+teleoperation, and SMPL observations follow their logged timeline and enter
+Sonic's original encoder -> FSQ -> decoder path at every imagined step. WAM
+therefore receives only `(physical_state, action, ξ)` and shares one robot
+dynamics model across all three target representations. FSQ tokens are never
+passed to WAM. The physical WAM uses SuperMimic's frame-local invariant input
+and predicts local `dp, dtheta, dv, dw, dq, dqd` increments before integrating
+them back into the 71-dimensional state.
+If the environment exposes physical randomization observations, list them as
+`context_observation_keys`; they become the optional `ξ` input to WAM and the
+shared critic.
 
-Known action-independent reference features, including reference joint
-trajectories, SMPL local joints, VR targets, and reference heights, advance
-along their logged replay timeline. The actor cannot change these goals through
-model gradients. Robot-relative orientation features remain predictions of the
-world model. Encoder routing bits are copied from the seed. New tokenizer terms
-must be classified using `settings.exogenous_tokenizer_features`; this setting
-replaces the built-in reference-feature list when provided.
-The termination head receives the same projected next state that is returned
-to the caller, so it cannot classify termination from a separate, unprojected
-set of reference or routing predictions.
-Both model fitting and policy imagination use the same reference-selection
-rule: advance the logged target only when the next state is not an auto-reset.
-At termination or truncation, keep the last pre-reset target. Feeding a reset
-episode's new target to the termination head during fitting would leak the
-termination label through a reference change unavailable during imagination.
+Replay stores the current and next physical state, reference state, full critic
+tracking/reference features, actor observations, and raw goals needed to re-run
+the Sonic actor, together with the previous executed body action for the
+SuperMimic action-rate term. Those goal tensors are not WAM inputs and no
+modality label is used by the dynamics model. The old combined
+observation format remains accepted for compatibility with earlier tests and
+checkpoints.
 
 `SequenceReplayBuffer` stores actual noisy, clipped actions. Samples stay in
 one environment and in chronological order across ring wraparound. Reward and
 termination supervision include the final transition. Dynamics supervision
 excludes auto-reset next observations; later steps are masked. Truncations are
-not learned as physical termination. Imagined rollouts stop at the logged
-reference boundary and bootstrap there. Optional replay checkpoints seal that
-boundary before collecting from a reset simulator.
+not learned as physical termination. Imagined rollouts advance the replayed
+goal sequence independently of WAM and bootstrap at the sampled horizon. The
+actor history is advanced from the predicted single-step proprioceptive
+observation.
+Optional replay checkpoints seal episode boundaries before collecting from a
+reset simulator.
 
-The defaults warm up the WAM before updating the actor. Non-finite losses or
-gradients reject the update. Real simulator reward and imagined reward are
-logged separately. Validation must compare open-loop model errors and real
-tracking returns, not just an increasing imagined return.
+The WAM defaults follow SuperMimic's training scale: 1000 replay steps per
+environment, world-model batch size 2048 (policy imagination batch 4096), action noise 0.1, learning rate
+2e-4 with cosine decay to 3% over 250k iterations, five critic epochs with
+four minibatches, UTD 0.4, 64-step warmup, and 500 world-model-only
+iterations. Reward and termination are analytic functions of predicted and
+reference physical states; they are not learned heads. Observation noise on
+the WAM actor frame follows SuperMimic's table. IsaacLab remains the simulator.
+Non-finite losses or gradients reject the update. Real simulator reward and
+imagined reward are logged separately. Validation must compare open-loop model
+errors and real tracking returns, not just an increasing imagined return.
 
 ## Reading the training diagnostics
 
 These diagnostics describe the current simulator collection and training replay;
 they are not an independent validation set. There are no established convergence
-thresholds for this observation-space WAM baseline. Compare fixed validation
+thresholds for this WAM baseline. Compare fixed validation
 motions, actual tracking errors, and complete-motion success rates for each
 input modality before judging control quality or a speedup over PPO.
 
@@ -163,13 +181,13 @@ Persistently worsening real reward, frequent real terminations, and a short
 effective horizon warrant stopping a long run and inspecting the reward
 components, executed actions, and checkpoint history. A smaller state loss can
 coincide with worse control because it is computed only on surviving valid
-steps and includes reference dimensions that are directly projected. Likewise,
+steps and does not measure target tracking quality. Likewise,
 `actor/survival` is a model prediction, not the real success rate; a small critic
 loss only shows agreement with imagined value targets. The actor objective can
 also prefer avoiding future negative rewards through predicted termination,
 so inspect real failure rates rather than treating rising imagined return as
-proof of improvement. The projection and diagnostic changes do not establish
-convergence or resolve every possible cause of policy collapse.
+proof of improvement. These diagnostic changes do not establish convergence or
+resolve every possible cause of policy collapse.
 
 A tiny termination fitting loss together with optimistic imagined survival
 and frequent real terminations warrants checking the termination model on
@@ -238,8 +256,8 @@ GLOO_SOCKET_IFNAME=lo python -m unittest gear_sonic.tests.test_wam_distributed -
 
 The tests include the original `Actor`, `UniversalTokenModule`, `BaseModule`,
 and actual FSQ quantizer with all three modality encoders, vector replay,
-auto-resets, BPTT parameter updates, frozen dynamics, reference projection,
-checkpoint restoration, and latent utility edge cases. They use a small toy
+auto-resets, BPTT parameter updates, frozen dynamics, goal timeline replay,
+legacy projection compatibility, checkpoint restoration, and latent utility edge cases. They use a small toy
 environment and do not validate humanoid simulation or sim-to-real behavior.
 The distributed tests use two real CPU/Gloo processes, different seeds/data,
 different modality selections, and rank-local checkpoint restoration. They do

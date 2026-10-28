@@ -1,0 +1,42 @@
+# Single-step robot proprioception for the differentiable world model.
+# This group intentionally has no tokenizer/reference observations and no
+# temporal history. The actor's normal policy history remains independent.
+
+defaults:
+  - ../terms/gravity_dir@_here_
+  - ../terms/base_ang_vel@_here_
+  - ../terms/joint_pos@_here_
+  - ../terms/joint_vel@_here_
+  - ../terms/actions@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.WAMCfg
+enable_corruption: true
+concatenate_terms: true
+
+# SuperMimic Table A.1 noise (the WAM state and reference groups stay clean).
+gravity_dir:
+  noise:
+    _target_: isaaclab.utils.noise.AdditiveUniformNoiseCfg
+    n_min: 0.0
+    n_max: 0.0
+base_ang_vel:
+  noise:
+    _target_: isaaclab.utils.noise.AdditiveUniformNoiseCfg
+    n_min: -0.05
+    n_max: 0.05
+joint_pos:
+  noise:
+    _target_: isaaclab.utils.noise.AdditiveUniformNoiseCfg
+    n_min: -0.01
+    n_max: 0.01
+joint_vel:
+  noise:
+    _target_: isaaclab.utils.noise.AdditiveUniformNoiseCfg
+    n_min: -0.5
+    n_max: 0.5
+actions:
+  noise:
+    _target_: isaaclab.utils.noise.AdditiveUniformNoiseCfg
+    n_min: 0.0
+    n_max: 0.0
+

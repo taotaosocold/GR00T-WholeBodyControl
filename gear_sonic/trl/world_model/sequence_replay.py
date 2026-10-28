@@ -23,7 +23,16 @@ class SequenceReplayBuffer:
     keep the same ordering on every insertion.
     """
 
-    _FIELDS = ("state", "action", "reward", "next_state", "done", "terminated")
+    _BASE_FIELDS = ("state", "action", "reward", "next_state", "done", "terminated")
+    _GOAL_FIELDS = ("goal", "next_goal")
+    _ACTOR_FIELDS = ("actor_state", "next_actor_state")
+    _CONTEXT_FIELDS = ("context",)
+    _REFERENCE_FIELDS = ("reference", "next_reference")
+    _CRITIC_FIELDS = ("critic_state", "next_critic_state")
+    _PREVIOUS_ACTION_FIELDS = ("previous_action",)
+    # Preserve the old introspection hook for callers that only use the base
+    # observation replay format.
+    _FIELDS = _BASE_FIELDS
 
     def __init__(self, capacity_steps: int = 256) -> None:
         if capacity_steps < 1:
@@ -49,6 +58,16 @@ class SequenceReplayBuffer:
         next_state: Tensor,
         done: Tensor,
         terminated: Tensor | None = None,
+        goal: Tensor | None = None,
+        next_goal: Tensor | None = None,
+        actor_state: Tensor | None = None,
+        next_actor_state: Tensor | None = None,
+        context: Tensor | None = None,
+        reference: Tensor | None = None,
+        next_reference: Tensor | None = None,
+        critic_state: Tensor | None = None,
+        next_critic_state: Tensor | None = None,
+        previous_action: Tensor | None = None,
     ) -> None:
         """Store one vectorized step, including actual executed actions.
 
@@ -70,6 +89,40 @@ class SequenceReplayBuffer:
             terminated = done
         if terminated.numel() != n:
             raise ValueError("terminated must contain one value per environment")
+        if (goal is None) != (next_goal is None):
+            raise ValueError("goal and next_goal must be provided together")
+        if goal is not None:
+            if goal.ndim != 2 or next_goal.ndim != 2:
+                raise ValueError("goal and next_goal must have shapes [N,G]")
+            if goal.shape != next_goal.shape or goal.shape[0] != n or goal.shape[1] < 1:
+                raise ValueError("goal and next_goal batches must match [N,G]")
+        if (actor_state is None) != (next_actor_state is None):
+            raise ValueError("actor_state and next_actor_state must be provided together")
+        if actor_state is not None:
+            if actor_state.ndim != 2 or next_actor_state.ndim != 2:
+                raise ValueError("actor_state and next_actor_state must have shapes [N,D]")
+            if actor_state.shape != next_actor_state.shape or actor_state.shape[0] != n:
+                raise ValueError("actor state batches must match [N,D]")
+        if context is not None:
+            if context.ndim != 2 or context.shape[0] != n or context.shape[1] < 1:
+                raise ValueError("context must have shape [N,C]")
+        if (reference is None) != (next_reference is None):
+            raise ValueError("reference and next_reference must be provided together")
+        if reference is not None:
+            if reference.ndim != 2 or next_reference.ndim != 2:
+                raise ValueError("reference tensors must have shapes [N,D]")
+            if reference.shape != next_reference.shape or reference.shape[0] != n:
+                raise ValueError("reference batches must match")
+        if (critic_state is None) != (next_critic_state is None):
+            raise ValueError("critic_state and next_critic_state must be provided together")
+        if critic_state is not None:
+            if critic_state.ndim != 2 or next_critic_state.ndim != 2:
+                raise ValueError("critic tensors must have shapes [N,D]")
+            if critic_state.shape != next_critic_state.shape or critic_state.shape[0] != n:
+                raise ValueError("critic batches must match")
+        if previous_action is not None:
+            if previous_action.ndim != 2 or previous_action.shape[0] != n:
+                raise ValueError("previous_action must have shape [N,A]")
         values = {
             "state": state.detach().to(device="cpu", dtype=torch.float32),
             "action": action.detach().to(device="cpu", dtype=torch.float32),
@@ -78,6 +131,22 @@ class SequenceReplayBuffer:
             "done": done.detach().reshape(n).to(device="cpu", dtype=torch.bool),
             "terminated": terminated.detach().reshape(n).to(device="cpu", dtype=torch.bool),
         }
+        if goal is not None:
+            values["goal"] = goal.detach().to(device="cpu", dtype=torch.float32)
+            values["next_goal"] = next_goal.detach().to(device="cpu", dtype=torch.float32)
+        if actor_state is not None:
+            values["actor_state"] = actor_state.detach().to(device="cpu", dtype=torch.float32)
+            values["next_actor_state"] = next_actor_state.detach().to(device="cpu", dtype=torch.float32)
+        if context is not None:
+            values["context"] = context.detach().to(device="cpu", dtype=torch.float32)
+        if reference is not None:
+            values["reference"] = reference.detach().to(device="cpu", dtype=torch.float32)
+            values["next_reference"] = next_reference.detach().to(device="cpu", dtype=torch.float32)
+        if critic_state is not None:
+            values["critic_state"] = critic_state.detach().to(device="cpu", dtype=torch.float32)
+            values["next_critic_state"] = next_critic_state.detach().to(device="cpu", dtype=torch.float32)
+        if previous_action is not None:
+            values["previous_action"] = previous_action.detach().to(device="cpu", dtype=torch.float32)
         if (values["terminated"] & ~values["done"]).any():
             raise ValueError("terminated=True requires done=True")
         if not self._storage:
@@ -85,6 +154,8 @@ class SequenceReplayBuffer:
                 key: torch.empty((self.capacity_steps, *value.shape), dtype=value.dtype)
                 for key, value in values.items()
             }
+        elif set(values) != set(self._storage):
+            raise ValueError("optional replay fields must be present on every transition")
         for key, value in values.items():
             if value.shape != self._storage[key].shape[1:]:
                 raise ValueError("transition dimensions changed after buffer initialization")
@@ -138,6 +209,24 @@ class SequenceReplayBuffer:
             "mask": mask,
             "dynamics_mask": mask & ~done,
         }
+        if "goal" in windows:
+            output["goals"] = torch.cat([windows["goal"][:, :1], windows["next_goal"]], dim=1)
+        if "actor_state" in windows:
+            output["actor_states"] = torch.cat(
+                [windows["actor_state"][:, :1], windows["next_actor_state"]], dim=1
+            )
+        if "context" in windows:
+            output["contexts"] = windows["context"]
+        if "reference" in windows:
+            output["references"] = torch.cat(
+                [windows["reference"][:, :1], windows["next_reference"]], dim=1
+            )
+        if "critic_state" in windows:
+            output["critic_states"] = torch.cat(
+                [windows["critic_state"][:, :1], windows["next_critic_state"]], dim=1
+            )
+        if "previous_action" in windows:
+            output["previous_actions"] = windows["previous_action"]
         if device is not None:
             output = {key: value.to(device=device) for key, value in output.items()}
         return output
@@ -169,8 +258,27 @@ class SequenceReplayBuffer:
         storage = state["storage"]
         if capacity < 1 or not 0 <= size <= capacity:
             raise ValueError("invalid replay capacity or size")
-        if size and set(storage) != set(self._FIELDS):
+        fields = set(storage)
+        if size and not fields.issubset(
+            set(self._BASE_FIELDS)
+            | set(self._GOAL_FIELDS)
+            | set(self._ACTOR_FIELDS)
+            | set(self._CONTEXT_FIELDS)
+            | set(self._REFERENCE_FIELDS)
+            | set(self._CRITIC_FIELDS)
+            | set(self._PREVIOUS_ACTION_FIELDS)
+        ):
+            raise ValueError("replay snapshot contains unknown transition tensors")
+        if size and not set(self._BASE_FIELDS).issubset(fields):
             raise ValueError("replay snapshot is missing transition tensors")
+        if fields.intersection(self._GOAL_FIELDS) and not set(self._GOAL_FIELDS).issubset(fields):
+            raise ValueError("replay snapshot must contain both goal tensors")
+        if fields.intersection(self._ACTOR_FIELDS) and not set(self._ACTOR_FIELDS).issubset(fields):
+            raise ValueError("replay snapshot must contain both actor state tensors")
+        if fields.intersection(self._REFERENCE_FIELDS) and not set(self._REFERENCE_FIELDS).issubset(fields):
+            raise ValueError("replay snapshot must contain both reference tensors")
+        if fields.intersection(self._CRITIC_FIELDS) and not set(self._CRITIC_FIELDS).issubset(fields):
+            raise ValueError("replay snapshot must contain both critic tensors")
         restored = {}
         for key, value in storage.items():
             if not isinstance(value, Tensor) or value.ndim < 2 or value.shape[0] != size:

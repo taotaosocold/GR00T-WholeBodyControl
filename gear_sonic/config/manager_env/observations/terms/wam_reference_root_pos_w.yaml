@@ -1,0 +1,5 @@
+root_pos:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:wam_reference_root_pos_w
+  params:
+    command_name: "motion"

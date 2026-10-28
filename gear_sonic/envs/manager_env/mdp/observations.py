@@ -278,6 +278,58 @@ class TeacherCfg(ObsGroup):
 
 
 @configclass
+class WAMCfg(ObsGroup):
+    """Single-step proprioception used to reconstruct Sonic's actor input."""
+
+    gravity_dir = None
+    base_ang_vel = None
+    joint_pos = None
+    joint_vel = None
+    actions = None
+
+
+@configclass
+class WAMStateCfg(ObsGroup):
+    """Canonical SuperMimic physical state consumed by the WAM.
+
+    The concatenated order is ``p, quat(wxyz), v, w, q, qd``.  It is separate
+    from :class:`WAMCfg`, because the actor's proprioceptive input is derived
+    from this state during imagined rollouts.
+    """
+
+    root_pos = None
+    root_quat = None
+    root_lin_vel = None
+    root_ang_vel = None
+    joint_pos = None
+    joint_vel = None
+
+
+@configclass
+class WAMReferenceCfg(ObsGroup):
+    """Reference physical state used by analytic reward and termination."""
+
+    root_pos = None
+    root_quat = None
+    root_lin_vel = None
+    root_ang_vel = None
+    joint_pos = None
+    joint_vel = None
+
+
+@configclass
+class WAMContextCfg(ObsGroup):
+    """SuperMimic physical context ξ used by the differentiable WAM.
+
+    ``xi`` is intentionally a separate group from both the actor history and
+    the physical robot state.  It contains simulator parameters, not motion
+    tokens: friction, joint-default calibration offsets, and torso CoM offset.
+    """
+
+    xi = None
+
+
+@configclass
 class PrivilegedCfg(ObsGroup):
     """Privileged observations for the critic network (asymmetric actor-critic)."""
 
@@ -477,6 +529,10 @@ class ObservationsCfg:
     disc: DiscriminatorCfg = None
     tokenizer: TokenizerCfg = None
     policy_atm: PolicyAtmCfg = None  # Body-only obs for pre-trained action_transform_module
+    wam: WAMCfg = None  # Single-step proprioception for model-based WAM training
+    wam_state: WAMStateCfg = None  # Canonical physical WAM state
+    wam_reference: WAMReferenceCfg = None  # Reference state for analytic heads
+    wam_context: WAMContextCfg = None  # SuperMimic physical context ξ
     height_map: HeightMapCfg = None
     teacher: TeacherCfg = None  # Teacher observations for distillation
     camera_rgb: CameraRGBCfg = None  # Separate vision observation group
@@ -809,6 +865,126 @@ def robot_anchor_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Ten
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
 
     return command.robot_anchor_vel_w[:, 3:6].view(env.num_envs, -1)
+
+
+def wam_root_pos_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Return the simulated anchor position in the local IsaacLab world."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.robot_anchor_pos_w - env.scene.env_origins
+
+
+def wam_root_quat_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Return the simulated anchor quaternion in SuperMimic's wxyz order."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.robot_anchor_quat_w
+
+
+def wam_root_lin_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.robot_anchor_lin_vel_w
+
+
+def wam_root_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.robot_anchor_ang_vel_w
+
+
+def wam_joint_pos(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return the 29 body joint coordinates in the canonical MuJoCo order."""
+    asset = env.scene[asset_cfg.name]
+    indices = joint_utils.get_body_joint_indices(asset)
+    values = asset.data.joint_pos[:, indices]
+    if values.shape[-1] != len(isaaclab_to_mujoco_dof):
+        return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
+    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    return values[:, order]
+
+
+def wam_joint_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return the 29 body joint velocities in the canonical MuJoCo order."""
+    asset = env.scene[asset_cfg.name]
+    indices = joint_utils.get_body_joint_indices(asset)
+    values = asset.data.joint_vel[:, indices]
+    if values.shape[-1] != len(isaaclab_to_mujoco_dof):
+        return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
+    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    return values[:, order]
+
+
+def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return SuperMimic's 33-dimensional physical context ξ.
+
+    The first value is the effective friction, the next 29 values are the
+    randomized default-joint offsets in MuJoCo order, and the last three are
+    the torso CoM offset.  Event terms maintain the friction/CoM entries when
+    the Isaac Lab version exposes those randomized properties; joint offsets
+    are read directly from the current articulation defaults every step.
+    """
+    asset = env.scene[asset_cfg.name]
+    num_envs = int(env.scene.num_envs)
+    xi = getattr(env, "_wam_xi", None)
+    if xi is None or tuple(xi.shape) != (num_envs, 33):
+        xi = torch.zeros(num_envs, 33, device=asset.device, dtype=asset.data.joint_pos.dtype)
+        xi[:, 0] = 1.0
+        env._wam_xi = xi
+    elif xi.device != asset.device:
+        xi = xi.to(device=asset.device)
+        env._wam_xi = xi
+
+    indices = joint_utils.get_body_joint_indices(asset)
+    current = asset.data.default_joint_pos[:, indices]
+    nominal = getattr(asset.data, "default_joint_pos_nominal", None)
+    if nominal is None:
+        nominal_body = current[:1]
+    else:
+        if nominal.ndim == 1:
+            nominal = nominal.unsqueeze(0)
+        nominal_body = nominal[..., indices]
+    offsets = current - nominal_body
+    if offsets.shape[-1] == len(isaaclab_to_mujoco_dof):
+        order = torch.as_tensor(isaaclab_to_mujoco_dof, device=offsets.device)
+        xi[:, 1:30] = offsets[:, order]
+    else:
+        xi[:, 1:30] = 0.0
+    return xi
+
+
+def wam_reference_root_pos_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.anchor_pos_w - env.scene.env_origins
+
+
+def wam_reference_root_quat_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.anchor_quat_w
+
+
+def wam_reference_root_lin_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.anchor_lin_vel_w
+
+
+def wam_reference_root_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.anchor_ang_vel_w
+
+
+def wam_reference_joint_pos(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    values = command.joint_pos
+    if values.shape[-1] != len(isaaclab_to_mujoco_dof):
+        return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
+    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    return values[:, order]
+
+
+def wam_reference_joint_vel(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    values = command.joint_vel
+    if values.shape[-1] != len(isaaclab_to_mujoco_dof):
+        return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
+    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    return values[:, order]
 
 
 def robot_body_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

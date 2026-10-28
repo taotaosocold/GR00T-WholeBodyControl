@@ -1,0 +1,5 @@
+joint_pos:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:wam_reference_joint_pos
+  params:
+    command_name: "motion"

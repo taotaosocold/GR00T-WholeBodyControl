@@ -1,0 +1,13 @@
+# Reference physical state used by analytic WAM reward and termination.
+
+defaults:
+  - ../terms/wam_reference_root_pos_w@_here_
+  - ../terms/wam_reference_root_quat_w@_here_
+  - ../terms/wam_reference_root_lin_vel_w@_here_
+  - ../terms/wam_reference_root_ang_vel_w@_here_
+  - ../terms/wam_reference_joint_pos@_here_
+  - ../terms/wam_reference_joint_vel@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.WAMReferenceCfg
+enable_corruption: false
+concatenate_terms: true

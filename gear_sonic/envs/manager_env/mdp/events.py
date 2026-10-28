@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 from isaaclab.assets import Articulation
-from isaaclab.envs.mdp.events import _randomize_prop_by_op
+from isaaclab.envs.mdp.events import (
+    _randomize_prop_by_op,
+    randomize_rigid_body_material as _randomize_rigid_body_material,
+)
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 import isaaclab.utils.math as math_utils
@@ -29,6 +32,63 @@ class EventCfg:
     push_robot = None
 
     randomize_rigid_body_mass = None
+
+
+def _wam_xi_buffer(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return the per-environment SuperMimic physical-context buffer.
+
+    The buffer deliberately lives on the environment rather than in the WAM
+    trainer.  Domain-randomization events are the source of truth for these
+    values, so replay and imagined rollouts see the same ``xi`` that was used
+    by the simulator.
+    """
+    xi = getattr(env, "_wam_xi", None)
+    num_envs = int(env.scene.num_envs)
+    device = env.device
+    if xi is None or tuple(xi.shape) != (num_envs, 33):
+        xi = torch.zeros(num_envs, 33, device=device)
+        xi[:, 0] = 1.0
+        env._wam_xi = xi
+    return xi
+
+
+def randomize_rigid_body_material(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    static_friction_range: tuple[float, float],
+    dynamic_friction_range: tuple[float, float],
+    restitution_range: tuple[float, float],
+    num_buckets: int,
+):
+    """Apply Isaac Lab material randomization and expose its friction as ξ."""
+    _randomize_rigid_body_material(
+        env,
+        env_ids,
+        static_friction_range=static_friction_range,
+        dynamic_friction_range=dynamic_friction_range,
+        restitution_range=restitution_range,
+        num_buckets=num_buckets,
+        asset_cfg=asset_cfg,
+    )
+    xi = _wam_xi_buffer(env)
+    asset = env.scene[asset_cfg.name]
+    # Isaac Lab exposes material properties through the PhysX view. Keep this
+    # optional so older Isaac Lab releases still fall back to the nominal
+    # friction value instead of breaking environment construction.
+    try:
+        properties = asset.root_physx_view.get_material_properties()
+        friction = properties[..., 0].reshape(properties.shape[0], -1).mean(-1)
+        ids = (
+            torch.arange(env.scene.num_envs, device=xi.device)
+            if env_ids is None
+            else torch.as_tensor(env_ids, device=xi.device)
+        )
+        xi[ids, 0] = friction[ids].to(device=xi.device, dtype=xi.dtype)
+    except (AttributeError, RuntimeError, TypeError, IndexError):
+        # The exact material getter is version-dependent. The simulator has
+        # still been randomized; leave ξ at its nominal value when unavailable.
+        pass
 
 
 def randomize_joint_default_pos(
@@ -58,6 +118,7 @@ def randomize_joint_default_pos(
 
     # save nominal value for export
     asset.data.default_joint_pos_nominal = torch.clone(asset.data.default_joint_pos[0])
+    _wam_xi_buffer(env)
 
     # resolve environment ids
     if env_ids is None:
@@ -131,6 +192,10 @@ def randomize_rigid_body_com(
     rand_samples = math_utils.sample_uniform(
         ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device="cpu"
     ).unsqueeze(1)
+
+    xi = _wam_xi_buffer(env)
+    xi_ids = torch.as_tensor(env_ids, device=xi.device)
+    xi[xi_ids, 30:33] = rand_samples[:, 0].to(device=xi.device, dtype=xi.dtype)
 
     # get the current com of the bodies (num_assets, num_bodies)
     coms = asset.root_physx_view.get_coms().clone()

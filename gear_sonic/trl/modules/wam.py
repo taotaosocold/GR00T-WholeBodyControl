@@ -1,17 +1,18 @@
-"""Differentiable world-action model utilities for model-based WBC training.
+"""Differentiable world model used by the SuperMimic-style Sonic trainer.
 
-The original SONIC/GR00T policy is kept intact: observations still enter the
-FSQ token bottleneck and the existing decoders still produce joint actions.
-This module is an optional model-based branch.  It learns a residual dynamics
-model from transitions collected by Isaac Lab and provides short imagined
-rollouts through which an actor can be updated with BPTT.
+The Sonic policy remains responsible for multimodal goals: G1 retargeted,
+teleoperation, and SMPL goal observations are encoded by their original
+encoders, quantized by FSQ, and decoded into actions. The WAM dynamics model
+is deliberately goal-agnostic. It predicts the robot-side state transition
+from ``(state, action, context)``. In physical mode, reward and termination
+are computed analytically from predicted and reference robot states. Raw goals
+and FSQ tokens stay on the actor/alignment path.
 
-The implementation deliberately uses flat tensors instead of a robot-specific
-state layout.  A caller can therefore use proprioception, privileged state, or
-an FSQ token embedding as ``state`` while keeping the same API.  The model is
-deterministic, which matches the SuperMimic setting and keeps inference cheap;
-stochastic environment effects can be represented by the optional ``context``
-vector (for example terrain/friction or motion-command features).
+The canonical WAM path uses the 71-dimensional physical state from
+SuperMimic. A compatibility ``flat`` mode remains available for existing
+unit-test integrations. In either case, goal tensors are never part of the
+dynamics input and are supplied separately during fitting and imagined
+rollouts.
 """
 
 from __future__ import annotations
@@ -22,6 +23,125 @@ from typing import Callable, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+NUM_G1_JOINTS = 29
+PHYSICAL_STATE_DIM = 3 + 4 + 3 + 3 + NUM_G1_JOINTS + NUM_G1_JOINTS
+PHYSICAL_DELTA_DIM = 3 + 3 + 3 + 3 + NUM_G1_JOINTS + NUM_G1_JOINTS
+
+
+def _quat_to_mat(quaternion: torch.Tensor) -> torch.Tensor:
+    """Convert wxyz quaternions to matrices, matching SuperMimic's state layout."""
+    quaternion = F.normalize(quaternion, dim=-1)
+    w, x, y, z = quaternion.unbind(-1)
+    return torch.stack(
+        (
+            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+        ), dim=-1,
+    ).reshape(quaternion.shape[:-1] + (3, 3))
+
+
+def _mat_to_quat(matrix: torch.Tensor) -> torch.Tensor:
+    """Stable matrix-to-wxyz conversion used for differentiable integration."""
+    trace = matrix.diagonal(dim1=-2, dim2=-1).sum(-1)
+    qw = torch.sqrt((1 + trace).clamp_min(1e-8)) * 0.5
+    qx = (matrix[..., 2, 1] - matrix[..., 1, 2]) / (4 * qw.clamp_min(1e-4))
+    qy = (matrix[..., 0, 2] - matrix[..., 2, 0]) / (4 * qw.clamp_min(1e-4))
+    qz = (matrix[..., 1, 0] - matrix[..., 0, 1]) / (4 * qw.clamp_min(1e-4))
+    return F.normalize(torch.stack((qw, qx, qy, qz), dim=-1), dim=-1)
+
+
+def _skew(vector: torch.Tensor) -> torch.Tensor:
+    x, y, z = vector.unbind(-1)
+    zero = torch.zeros_like(x)
+    return torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), dim=-1).reshape(
+        vector.shape[:-1] + (3, 3)
+    )
+
+
+def _so3_exp(vector: torch.Tensor) -> torch.Tensor:
+    theta2 = vector.square().sum(-1, keepdim=True)
+    theta = torch.sqrt(theta2 + 1e-12)
+    a = torch.where(theta2 < 1e-8, 1 - theta2 / 6, torch.sin(theta) / theta)
+    b = torch.where(
+        theta2 < 1e-8,
+        0.5 - theta2 / 24,
+        (1 - torch.cos(theta)) / (theta2 + 1e-12),
+    )
+    skew = _skew(vector)
+    eye = torch.eye(3, device=vector.device, dtype=vector.dtype).expand(skew.shape)
+    return eye + a[..., None] * skew + b[..., None] * (skew @ skew)
+
+
+def _yaw_mat(matrix: torch.Tensor) -> torch.Tensor:
+    forward_x, forward_y = matrix[..., 0, 0], matrix[..., 1, 0]
+    norm = torch.sqrt(forward_x.square() + forward_y.square() + 1e-9)
+    cosine, sine = forward_x / norm, forward_y / norm
+    zero, one = torch.zeros_like(cosine), torch.ones_like(cosine)
+    return torch.stack(
+        (cosine, -sine, zero, sine, cosine, zero, zero, zero, one), dim=-1
+    ).reshape(matrix.shape[:-2] + (3, 3))
+
+
+def physical_state_parts(state: torch.Tensor):
+    """Unpack the canonical SuperMimic physical state ``(p,R,v,w,q,qd)``."""
+    if state.shape[-1] != PHYSICAL_STATE_DIM:
+        raise ValueError(f"physical WAM state must have {PHYSICAL_STATE_DIM} values")
+    return (
+        state[..., 0:3],
+        _quat_to_mat(state[..., 3:7]),
+        state[..., 7:10],
+        state[..., 10:13],
+        state[..., 13:42],
+        state[..., 42:71],
+    )
+
+
+def physical_state_invariant_features(state: torch.Tensor) -> torch.Tensor:
+    """Heading/position invariant input used by SuperMimic's WAM."""
+    position, rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = physical_state_parts(state)
+    heading = _yaw_mat(rotation)
+    rotation_t = rotation.transpose(-1, -2)
+    return torch.cat(
+        (
+            position[..., 2:3],
+            (heading.transpose(-1, -2) @ rotation)[..., :, :2].reshape(state.shape[:-1] + (6,)),
+            (rotation_t @ linear_velocity.unsqueeze(-1)).squeeze(-1),
+            (rotation_t @ angular_velocity.unsqueeze(-1)).squeeze(-1),
+            joint_position,
+            joint_velocity,
+        ), dim=-1,
+    )
+
+
+def physical_state_transition_error(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Frame-local state error matching SuperMimic's autoregressive objective."""
+    position, rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = physical_state_parts(predicted)
+    target_position, target_rotation, target_linear_velocity, target_angular_velocity, target_joint_position, target_joint_velocity = physical_state_parts(target)
+    heading = _yaw_mat(rotation)
+    rotation_t = rotation.transpose(-1, -2)
+    relative_rotation = rotation_t @ target_rotation
+    cosine = ((relative_rotation.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2).clamp(-1 + 1e-6, 1 - 1e-6)
+    angle = torch.acos(cosine).unsqueeze(-1)
+    axis = torch.stack(
+        (relative_rotation[..., 2, 1] - relative_rotation[..., 1, 2],
+         relative_rotation[..., 0, 2] - relative_rotation[..., 2, 0],
+         relative_rotation[..., 1, 0] - relative_rotation[..., 0, 1]), dim=-1
+    )
+    axis = F.normalize(axis, dim=-1)
+    dtheta = axis * angle
+    return torch.cat(
+        (
+            (heading.transpose(-1, -2) @ (target_position - position).unsqueeze(-1)).squeeze(-1),
+            dtheta,
+            (rotation_t @ (target_linear_velocity - linear_velocity).unsqueeze(-1)).squeeze(-1),
+            (rotation_t @ (target_angular_velocity - angular_velocity).unsqueeze(-1)).squeeze(-1),
+            target_joint_position - joint_position,
+            target_joint_velocity - joint_velocity,
+        ), dim=-1,
+    )
 
 
 def _mlp(in_dim: int, hidden: tuple[int, ...], out_dim: int) -> nn.Sequential:
@@ -87,7 +207,7 @@ class RunningNorm(nn.Module):
 
 @dataclass
 class WAMConfig:
-    """Configuration for :class:`DifferentiableWorldModel`.
+    """Configuration for :class:`StateSpaceWorldModel`.
 
     ``hidden`` is intentionally smaller than the 2048-wide SuperMimic model by
     default.  The dimensions of GR00T observations are usually larger, so the
@@ -96,6 +216,9 @@ class WAMConfig:
 
     state_dim: int
     action_dim: int
+    # Kept for checkpoint/config compatibility. WAMTrainer sets this to zero;
+    # goals are never part of the Sonic dynamics input.
+    goal_dim: int = 0
     context_dim: int = 0
     hidden: tuple[int, ...] = (512, 512, 512)
     term_hidden: tuple[int, ...] = (128, 128)
@@ -104,16 +227,22 @@ class WAMConfig:
     learn_reward: bool = True
     reward_loss_coef: float = 1.0
     residual_scale: float = 1.0
+    # ``flat`` preserves the original GR00T prototype. ``physical`` uses the
+    # canonical SuperMimic state and frame-local invariant deltas.
+    state_type: str = "flat"
+    reward_mode: str = "learned"
+    termination_mode: str = "learned"
 
 
 class StateSpaceWorldModel(nn.Module):
-    """Learned residual dynamics, reward, and differentiable termination predictors.
+    """Learned dynamics with flat compatibility and physical SuperMimic modes.
 
-    The model predicts ``s[t+1] = s[t] + delta(s[t], a[t], context[t])``.  A
-    residual parameterisation is easier to fit for high-dimensional humanoid
-    states and lets the model be initialised as an identity map.  All methods
-    support leading batch dimensions, so tensors from vectorised Isaac Lab
-    environments can be passed without reshaping by the caller.
+    In ``flat`` mode the model predicts ``s[t+1] = s[t] + delta``. In
+    ``physical`` mode it consumes SuperMimic invariant features and predicts
+    frame-local ``dp, dtheta, dv, dw, dq, dqd`` increments, which are
+    integrated with the current root rotation. All methods support leading
+    batch dimensions, so tensors from vectorised Isaac Lab environments can be
+    passed without reshaping by the caller.
 
     Args:
         cfg: :class:`WAMConfig` or a Hydra-compatible mapping/object exposing
@@ -125,16 +254,32 @@ class StateSpaceWorldModel(nn.Module):
         self.cfg = cfg
         self.state_dim = int(cfg.state_dim)
         self.action_dim = int(cfg.action_dim)
+        self.goal_dim = int(getattr(cfg, "goal_dim", 0))
         self.context_dim = int(getattr(cfg, "context_dim", 0))
         self.residual_scale = float(getattr(cfg, "residual_scale", 1.0))
+        self.state_type = str(getattr(cfg, "state_type", "flat"))
+        self.reward_mode = str(getattr(cfg, "reward_mode", "learned"))
+        self.termination_mode = str(getattr(cfg, "termination_mode", "learned"))
         hidden = tuple(int(v) for v in getattr(cfg, "hidden", (512, 512, 512)))
         term_hidden = tuple(int(v) for v in getattr(cfg, "term_hidden", (128, 128)))
         reward_hidden = tuple(int(v) for v in getattr(cfg, "reward_hidden", term_hidden))
         self.reward_loss_coef = float(getattr(cfg, "reward_loss_coef", 1.0))
-        if self.state_dim < 1 or self.action_dim < 1:
-            raise ValueError("state_dim and action_dim must be positive")
+        if self.state_dim < 1 or self.action_dim < 1 or self.goal_dim < 0:
+            raise ValueError("state/action dimensions must be positive and goal_dim non-negative")
         model_in = self.state_dim + self.action_dim + self.context_dim
-        self.dynamics = _mlp(model_in, hidden, self.state_dim)
+        if self.state_type == "physical":
+            if self.state_dim != PHYSICAL_STATE_DIM:
+                raise ValueError(
+                    f"physical WAM state must have {PHYSICAL_STATE_DIM} values, got {self.state_dim}"
+                )
+            model_in = PHYSICAL_STATE_DIM + self.action_dim + self.context_dim
+            dynamics_out = PHYSICAL_DELTA_DIM
+        elif self.state_type == "flat":
+            dynamics_out = self.state_dim
+        else:
+            raise ValueError(f"unknown WAM state_type: {self.state_type}")
+        reward_in = model_in + self.goal_dim
+        self.dynamics = _mlp(model_in, hidden, dynamics_out)
         # Zero initial residual keeps the model compatible with a warm-started
         # policy and avoids unstable imagined rollouts before fitting starts.
         final = self.dynamics[-1]
@@ -143,14 +288,18 @@ class StateSpaceWorldModel(nn.Module):
             nn.init.zeros_(final.bias)
         self.state_norm = RunningNorm(self.state_dim)
         self.action_norm = RunningNorm(self.action_dim)
+        self.goal_norm = RunningNorm(self.goal_dim) if self.goal_dim else None
         self.context_norm = RunningNorm(self.context_dim) if self.context_dim else None
-        self.delta_norm = RunningNorm(self.state_dim)
-        learn_term = bool(getattr(cfg, "learn_termination", True))
+        self.delta_dim = dynamics_out
+        self.delta_norm = RunningNorm(self.delta_dim)
+        learn_term = bool(getattr(cfg, "learn_termination", True)) and self.termination_mode == "learned"
         self.termination_head = (
-            _mlp(self.state_dim, term_hidden, 1) if learn_term else None
+            _mlp(self.state_dim + self.goal_dim, term_hidden, 1) if learn_term else None
         )
-        learn_reward = bool(getattr(cfg, "learn_reward", True))
+        learn_reward = bool(getattr(cfg, "learn_reward", True)) and self.reward_mode == "learned"
         self.reward_head = _mlp(model_in, reward_hidden, 1) if learn_reward else None
+        if self.reward_head is not None and self.goal_dim:
+            self.reward_head = _mlp(reward_in, reward_hidden, 1)
 
     def _context(self, context: Optional[torch.Tensor], state: torch.Tensor) -> torch.Tensor:
         if self.context_dim == 0:
@@ -162,6 +311,17 @@ class StateSpaceWorldModel(nn.Module):
                 f"context last dimension must be {self.context_dim}, got {context.shape[-1]}"
             )
         return context
+
+    def _goal(self, goal: Optional[torch.Tensor], state: torch.Tensor) -> torch.Tensor:
+        if self.goal_dim == 0:
+            return state.new_zeros(*state.shape[:-1], 0)
+        if goal is None:
+            raise ValueError("goal is required when WAMConfig.goal_dim is non-zero")
+        if goal.shape[-1] != self.goal_dim:
+            raise ValueError(
+                f"goal last dimension must be {self.goal_dim}, got {goal.shape[-1]}"
+            )
+        return goal
 
     def _model_input(
         self,
@@ -178,7 +338,11 @@ class StateSpaceWorldModel(nn.Module):
                 f"action last dimension must be {self.action_dim}, got {action.shape[-1]}"
             )
         context = self._context(context, state)
-        state_n = self.state_norm(state)
+        model_state = (
+            physical_state_invariant_features(state)
+            if self.state_type == "physical" else state
+        )
+        state_n = self.state_norm(model_state)
         action_n = self.action_norm(action)
         if self.context_norm is not None:
             context = self.context_norm(context)
@@ -190,6 +354,7 @@ class StateSpaceWorldModel(nn.Module):
         action: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         *,
+        goal: Optional[torch.Tensor] = None,
         next_state_projector: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         """Predict next state, reward, and termination logits for one transition.
@@ -200,17 +365,43 @@ class StateSpaceWorldModel(nn.Module):
         to the termination objective and its policy gradients.
         """
         x = self._model_input(state, action, context)
+        goal = self._goal(goal, state)
+        goal_n = self.goal_norm(goal) if self.goal_norm is not None else goal
         delta = self.dynamics(x) * self.residual_scale
-        next_state = state + delta * self.delta_norm.std()
+        if self.state_type == "physical":
+            position, rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = physical_state_parts(state)
+            delta = delta * self.delta_norm.std() + self.delta_norm.mean
+            dp, dtheta, dv, dw, dq, dqd = delta.split((3, 3, 3, 3, NUM_G1_JOINTS, NUM_G1_JOINTS), -1)
+            heading = _yaw_mat(rotation)
+            next_position = position + (heading @ dp.unsqueeze(-1)).squeeze(-1)
+            next_rotation = rotation @ _so3_exp(dtheta)
+            next_linear_velocity = linear_velocity + (rotation @ dv.unsqueeze(-1)).squeeze(-1)
+            next_angular_velocity = angular_velocity + (rotation @ dw.unsqueeze(-1)).squeeze(-1)
+            next_state = torch.cat(
+                (
+                    next_position,
+                    _mat_to_quat(next_rotation),
+                    next_linear_velocity,
+                    next_angular_velocity,
+                    joint_position + dq,
+                    joint_velocity + dqd,
+                ), dim=-1,
+            )
+        else:
+            next_state = state + delta * self.delta_norm.std()
         if next_state_projector is not None:
             next_state = next_state_projector(next_state)
         out = {"next_state": next_state, "delta": delta}
         if self.reward_head is not None:
-            out["reward"] = self.reward_head(x).squeeze(-1)
+            reward_input = torch.cat((x, goal_n), dim=-1) if self.goal_dim else x
+            out["reward"] = self.reward_head(reward_input).squeeze(-1)
         if self.termination_head is not None:
-            out["termination_logits"] = self.termination_head(
-                self.state_norm(next_state)
-            ).squeeze(-1)
+            term_state = (
+                physical_state_invariant_features(next_state)
+                if self.state_type == "physical" else next_state
+            )
+            term_input = torch.cat((self.state_norm(term_state), goal_n), dim=-1)
+            out["termination_logits"] = self.termination_head(term_input).squeeze(-1)
         return out
 
     def step(
@@ -218,15 +409,18 @@ class StateSpaceWorldModel(nn.Module):
         state: torch.Tensor,
         action: torch.Tensor,
         context: Optional[torch.Tensor] = None,
+        *,
+        goal: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Differentiable one-step transition used by imagined rollouts."""
-        return self.forward(state, action, context)["next_state"]
+        return self.forward(state, action, context, goal=goal)["next_state"]
 
     def rollout(
         self,
         state: torch.Tensor,
         actions: torch.Tensor,
         context: Optional[torch.Tensor] = None,
+        goal: Optional[torch.Tensor] = None,
         *,
         detach: bool = False,
     ) -> dict[str, torch.Tensor]:
@@ -251,13 +445,17 @@ class StateSpaceWorldModel(nn.Module):
             context = context.unsqueeze(1).expand(-1, actions.shape[1], -1)
         if context is not None and context.shape[:2] != actions.shape[:2]:
             raise ValueError("context must have shape (B,H,C) or (B,C)")
+        if self.goal_dim:
+            if goal is None or goal.ndim != 3 or goal.shape[:2] != actions.shape[:2]:
+                raise ValueError("goal must have shape (B,H,goal_dim) when goal_dim is non-zero")
         states = [state]
         rewards = []
         terms = []
         current = state
         for t in range(actions.shape[1]):
             ctx_t = None if context is None else context[:, t]
-            result = self.forward(current, actions[:, t], ctx_t)
+            goal_t = None if goal is None else goal[:, t]
+            result = self.forward(current, actions[:, t], ctx_t, goal=goal_t)
             current = result["next_state"]
             if detach:
                 current = current.detach()
@@ -281,6 +479,7 @@ class StateSpaceWorldModel(nn.Module):
         context: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         rewards: Optional[torch.Tensor] = None,
+        goals: Optional[torch.Tensor] = None,
         dynamics_mask: Optional[torch.Tensor] = None,
         state_projector: Optional[Callable] = None,
     ) -> dict[str, torch.Tensor]:
@@ -304,20 +503,29 @@ class StateSpaceWorldModel(nn.Module):
             context = context.unsqueeze(1).expand(-1, actions.shape[1], -1)
         if context is not None and context.shape[:2] != actions.shape[:2]:
             raise ValueError("context must have shape (B,H,C) or (B,C)")
+        if self.goal_dim:
+            if goals is None or goals.shape[:2] != actions.shape[:2]:
+                raise ValueError("goals must have shape (B,H,goal_dim) when goal_dim is non-zero")
         current = states[:, 0]
         state_errors, reward_preds, term_logits = [], [], []
         for t in range(actions.shape[1]):
             result = self.forward(
                 current, actions[:, t], None if context is None else context[:, t],
+                goal=None if goals is None else goals[:, t],
                 next_state_projector=(
                     (lambda predicted, step=t: state_projector(predicted, step))
                     if state_projector is not None else None
                 ),
             )
             current = result["next_state"]
-            state_errors.append(
-                ((current - states[:, t + 1]) / self.state_norm.std()).square().mean(-1)
-            )
+            error_target = states[:, t + 1]
+            if self.state_type == "physical":
+                transition = physical_state_transition_error(current, error_target)
+                state_errors.append((transition / self.delta_norm.std()).square().mean(-1))
+            else:
+                state_errors.append(
+                    ((current - error_target) / self.state_norm.std()).square().mean(-1)
+                )
             if "reward" in result:
                 reward_preds.append(result["reward"])
             if "termination_logits" in result:
@@ -361,14 +569,23 @@ class StateSpaceWorldModel(nn.Module):
         actions: torch.Tensor,
         next_states: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
+        goals: Optional[torch.Tensor] = None,
     ) -> None:
         """Update running statistics from real transitions only."""
-        self.state_norm.update(states)
+        if self.state_type == "physical":
+            self.state_norm.update(physical_state_invariant_features(states))
+        else:
+            self.state_norm.update(states)
         self.action_norm.update(actions)
+        if self.goal_norm is not None and goals is not None:
+            self.goal_norm.update(goals)
         if self.context_norm is not None and context is not None:
             self.context_norm.update(context)
         if next_states is not None:
-            self.delta_norm.update(next_states - states)
+            if self.state_type == "physical":
+                self.delta_norm.update(physical_state_transition_error(states, next_states))
+            else:
+                self.delta_norm.update(next_states - states)
 
     def imagine(
         self,
@@ -376,6 +593,7 @@ class StateSpaceWorldModel(nn.Module):
         state: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         horizon: int = 1,
+        goal: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Generate a short differentiable rollout from a policy callback.
 
@@ -386,6 +604,9 @@ class StateSpaceWorldModel(nn.Module):
         """
         if horizon < 1:
             raise ValueError("horizon must be positive")
+        if self.goal_dim:
+            if goal is None or goal.ndim != 3 or goal.shape[:2] != (state.shape[0], horizon):
+                raise ValueError("goal must have shape (B,H,goal_dim) when goal_dim is non-zero")
         requires_grad = [p.requires_grad for p in self.parameters()]
         self.requires_grad_(False)
         try:
@@ -396,7 +617,8 @@ class StateSpaceWorldModel(nn.Module):
                 if context is not None and context.ndim == 3:
                     ctx_t = context[:, t]
                 action = policy(current, ctx_t, t)
-                result = self.forward(current, action, ctx_t)
+                goal_t = None if goal is None else goal[:, t]
+                result = self.forward(current, action, ctx_t, goal=goal_t)
                 current = result["next_state"]
                 states.append(current)
                 actions.append(action)
@@ -418,9 +640,33 @@ class StateSpaceWorldModel(nn.Module):
                 parameter.requires_grad_(flag)
 
 
+class WAMCritic(nn.Sequential):
+    """Value network used by the WAM trainer.
+
+    Keeping this small backbone as a module makes the critic Hydra-configurable
+    like the rest of GR00T while preserving the original three-layer MLP state
+    layout used by existing WAM checkpoints.
+    """
+
+    def __init__(self, input_dim: int, hidden: tuple[int, ...] = (256, 128)):
+        if input_dim < 1:
+            raise ValueError("input_dim must be positive")
+        layers: list[nn.Module] = []
+        dim = int(input_dim)
+        for width in hidden:
+            layers.extend((nn.Linear(dim, int(width)), nn.SiLU()))
+            dim = int(width)
+        layers.append(nn.Linear(dim, 1))
+        super().__init__(*layers)
+
+
 # Backward-compatible name for experiments that imported the initial flat-state
 # prototype.  The canonical FSQ-aware implementation lives in
 # ``gear_sonic.trl.world_model``.
 DifferentiableWorldModel = StateSpaceWorldModel
 
-__all__ = ["StateSpaceWorldModel", "DifferentiableWorldModel", "RunningNorm", "WAMConfig"]
+__all__ = [
+    "StateSpaceWorldModel", "DifferentiableWorldModel", "RunningNorm", "WAMConfig", "WAMCritic",
+    "PHYSICAL_STATE_DIM", "PHYSICAL_DELTA_DIM", "physical_state_parts",
+    "physical_state_invariant_features", "physical_state_transition_error",
+]

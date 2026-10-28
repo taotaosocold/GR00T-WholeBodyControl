@@ -1,0 +1,9 @@
+# SuperMimic physical context ξ: friction, joint calibration offsets, and
+# torso center-of-mass offset.  It is consumed only by the WAM.
+
+defaults:
+  - ../terms/wam_context@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.WAMContextCfg
+enable_corruption: false
+concatenate_terms: true
