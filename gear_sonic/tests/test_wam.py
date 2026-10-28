@@ -105,7 +105,9 @@ def test_lazy_imagination_updates_actor_without_world_model_gradients():
 
 
 def test_default_critic_matches_world_model_device_and_dtype():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Spell out cuda:0 so equality with a parameter's concrete device does not
+    # depend on PyTorch's ``cuda`` versus ``cuda:0`` device representation.
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = WAM(obs_dim=4, action_dim=1, latent_dim=6, hidden_dim=12).to(
         device=device, dtype=torch.float64
     )
