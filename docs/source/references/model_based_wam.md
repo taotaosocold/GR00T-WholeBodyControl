@@ -23,11 +23,12 @@ python gear_sonic/train_agent_trl.py \
   ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=sample_data/smpl_filtered
 ```
 
-The WAM path has three separate observation groups. `wam_state` is the
+The WAM path has four separate observation groups. `wam_state` is the
 SuperMimic physical state `p(3), quat(wxyz)(4), v(3), w(3), q(29), qd(29)`;
 `wam` is the single-step Sonic proprioceptive frame used to reconstruct the
-actor input; and `wam_reference` is the corresponding reference physical
-state. Settings live in `gear_sonic/config/trainer/wam.yaml`; the dynamics
+actor input; `wam_reference` is the corresponding reference physical
+state; and `wam_context` contains the 33 physical context values. Settings live
+in `gear_sonic/config/trainer/wam.yaml`; the dynamics
 architecture lives in `gear_sonic/config/world_model/wam_dynamics.yaml` and
 the critic architecture in `gear_sonic/config/world_model/wam_critic.yaml`.
 This path supports single-GPU
@@ -53,7 +54,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m accelerate.commands.launch \
 ```
 
 `num_envs`, replay capacity, and `trainer.settings.batch_size` are **per rank**:
-64 environments on eight ranks mean 512 simulator environments in total. Each
+64 environments on eight ranks mean 512 simulator environments in total.
+`trainer.settings.policy_batch_size` is also per rank. To match SuperMimic's
+global batches on eight ranks, use world-model batch 256 per rank (2048 total)
+and policy batch 512 per rank (4096 total). Each
 rank collects its own trajectories and samples its own replay. Actor, dynamics,
 and critic gradients are averaged after each backward pass; initial weights and
 world-model normalization statistics are synchronized. Rank-specific unused
@@ -61,9 +65,14 @@ modality encoders participate safely. A non-finite loss/gradient on any rank
 rejects the update on all ranks. Adaptive motion sampling remains local.
 
 For a five-iteration smoke test that includes actor updates, override
-`trainer.settings.world_updates=2` and
-`trainer.settings.warmup_world_updates=4`. With the defaults, five iterations
-produce only 50 world updates, below the 100-update actor warmup threshold.
+`trainer.settings.utd=0`, `trainer.settings.collect_steps=32`,
+`trainer.settings.wm_only_iters=0`, `trainer.settings.warmup_steps=32`,
+`trainer.settings.world_updates=2`, `trainer.settings.warmup_world_updates=4`,
+and both `trainer.settings.batch_size=32` and `trainer.settings.policy_batch_size=32`.
+The default UTD schedule takes precedence over `collect_steps`; the default
+500 world-model-only iterations also prevent a five-iteration test from
+reaching actor/critic updates. Check for finite `actor/loss` and `critic/loss`
+alongside `world/loss`, rather than treating checkpoint creation as coverage.
 
 The extra WAM observation groups are passive when PPO is selected; PPO's policy,
 reward, termination, and optimizer configuration is unchanged. Omitting
@@ -113,6 +122,10 @@ modality label is used by the dynamics model. The old combined
 observation format remains accepted for compatibility with earlier tests and
 checkpoints.
 
+Trainer observation keys refer to the dictionary returned by `ManagerEnvWrapper`.
+In particular, Isaac Lab's `critic` group is exposed as `critic_obs`, so the WAM
+setting is `critic_observation_keys: [critic_obs]`.
+
 `SequenceReplayBuffer` stores actual noisy, clipped actions. Samples stay in
 one environment and in chronological order across ring wraparound. Reward and
 termination supervision include the final transition. Dynamics supervision
@@ -134,6 +147,12 @@ the WAM actor frame follows SuperMimic's table. IsaacLab remains the simulator.
 Non-finite losses or gradients reject the update. Real simulator reward and
 imagined reward are logged separately. Validation must compare open-loop model
 errors and real tracking returns, not just an increasing imagined return.
+
+These configuration values do not imply exact SuperMimic behavior. Currently,
+`warmup_steps` gates actor updates only; WAM fitting starts once replay contains
+`window` steps. SuperMimic collects 64 steps before any optimization. The
+`reset_sampling: return` setting is not yet consumed by the reset sampler;
+GR00T's existing adaptive sampler remains active.
 
 ## Reading the training diagnostics
 

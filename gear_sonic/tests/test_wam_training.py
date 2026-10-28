@@ -197,6 +197,94 @@ class TrainingTests(unittest.TestCase):
             metrics = trainer.improve_policy()
             self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in metrics.values()))
 
+    def test_default_auxiliary_keys_use_wrapped_critic_observations(self):
+        class WrappedEnv(VectorEnv):
+            def _obs(self):
+                obs = super()._obs()
+                obs.update(
+                    wam_state=self.x.clone(),
+                    wam=self.x.clone(),
+                    wam_reference=self.goals[:, :3].clone(),
+                    wam_context=torch.arange(33).float().expand(self.num_envs, -1) / 100,
+                    critic_obs=torch.cat((self.x, self.goals[:, :2]), dim=-1),
+                )
+                return obs
+
+        config_path = Path(__file__).resolve().parents[1] / "config/trainer/wam.yaml"
+        settings = OmegaConf.to_container(OmegaConf.load(config_path).settings, resolve=True)
+        settings.update(
+            window=3, horizon=3, batch_size=4, policy_batch_size=4,
+            world_updates=1, critic_epochs=1, critic_minibatches=2, replay_steps=8,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = WAMTrainer(
+                args=SimpleNamespace(num_total_batches=1),
+                config=Config(gamma=0.99, lam=0.95), env=WrappedEnv(), model=FSQPolicy(),
+                log_dir=directory, settings=settings,
+                # Tiny flat dynamics isolate the default observation schema
+                # from the simulator-specific physical state adapter.
+                world_model_config={
+                    "_target_": "gear_sonic.trl.modules.wam.StateSpaceWorldModel",
+                    "cfg": {"hidden": [8, 8], "term_hidden": [4], "reward_hidden": [4]},
+                },
+            )
+            self.assertNotIn("critic", trainer.obs)
+            self.assertEqual(trainer.critic_keys, ["critic_obs"])
+            self.assertEqual(trainer.context_dim, 33)
+            expected_critic = trainer.obs["critic_obs"][trainer.replay_env_ids].clone()
+            trainer.collect(4)
+            storage = trainer.replay.state_dict()["storage"]
+            torch.testing.assert_close(storage["critic_state"][0], expected_critic)
+            batch = trainer.replay.sample(4, 3)
+            self.assertEqual(batch["critic_states"].shape, (4, 4, 6))
+            critic_input = trainer._critic_input_with_aux(
+                batch["states"][:, 0], batch["references"][:, 0],
+                batch["critic_states"][:, 0], batch["contexts"][:, 0],
+            )
+            start = trainer.layout.state_dim + trainer.reference_dim
+            torch.testing.assert_close(
+                critic_input[:, start:start + trainer.critic_feature_dim],
+                batch["critic_states"][:, 0],
+            )
+            metrics = trainer.fit_world_model() | trainer.improve_policy()
+            self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in metrics.values()))
+
+    def test_physical_state_keeps_named_proprioceptive_history_blocks(self):
+        # Physical state and proprioception have distinct dimensions. Policy
+        # history is term-major, and its term order can differ from WAM's.
+        trainer = WAMTrainer.__new__(WAMTrainer)
+        trainer.physical_wam = True
+        trainer.layout = SimpleNamespace(state_dim=71)
+        trainer.env = SimpleNamespace(env=SimpleNamespace(observation_manager=SimpleNamespace(
+            _group_obs_term_names={
+                "policy": ["actions", "joint_pos"],
+                "wam": ["joint_pos", "actions"],
+            },
+            _group_obs_term_dim={
+                "policy": [(3, 2), (2, 3)],
+                "wam": [(3,), (2,)],
+            },
+        )))
+        actor_obs = torch.tensor([[10, 11, 20, 21, 30, 31, 40, 41, 42, 50, 51, 52]]).float()
+        wam_obs = torch.tensor([[60, 61, 62, 70, 71]]).float()
+        trainer.obs = {"actor_obs": actor_obs, "wam": wam_obs, "wam_state": torch.zeros(1, 71)}
+        for policy_dims in ([(3, 2), (2, 3)], [(6,), (6,)]):
+            with self.subTest(policy_dims=policy_dims):
+                # Isaac Lab versions can report either [history, feature]
+                # dimensions or a single flattened history dimension.
+                trainer.env.env.observation_manager._group_obs_term_dim["policy"] = policy_dims
+                trainer._actor_history_specs, trainer._wam_term_specs = trainer._resolve_history_specs()
+                self.assertIsNotNone(trainer._actor_history_specs)
+                self.assertIsNotNone(trainer._wam_term_specs)
+                torch.testing.assert_close(
+                    trainer._advance_actor_history(actor_obs, wam_obs),
+                    torch.tensor([[20, 21, 30, 31, 70, 71, 50, 51, 52, 60, 61, 62]]).float(),
+                )
+                torch.testing.assert_close(
+                    trainer._seed_actor_history(actor_obs, wam_obs),
+                    torch.tensor([[70, 71, 70, 71, 70, 71, 60, 61, 62, 60, 61, 62]]).float(),
+                )
+
     def test_collection_fit_imagination_and_checkpoint(self):
         torch.manual_seed(13)
         with tempfile.TemporaryDirectory() as directory:

@@ -92,6 +92,8 @@ GLOO_SOCKET_IFNAME=lo "$PY" \
 ## 6. 8 卡 WAM 冒烟测试
 
 `num_envs` 是每个进程的环境数。下面的 `64` 表示 8 卡共 512 个环境。
+此命令关闭 UTD 调度以固定每轮采集 32 步，并缩短 actor 预热，
+用于在 5 轮内覆盖 WAM、actor BPTT 和 critic 更新。
 
 ```bash
 RUN_DIR=/data/ouqin/runs_supermimic/wam_smoke_sonic_$(date +%Y%m%d_%H%M%S)
@@ -119,12 +121,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$PY" \
   experiment_dir="$RUN_DIR" \
   num_envs=64 \
   ++algo.config.num_learning_iterations=5 \
+  ++trainer.settings.utd=0 \
   ++trainer.settings.collect_steps=32 \
+  ++trainer.settings.wm_only_iters=0 \
+  ++trainer.settings.warmup_steps=32 \
   ++trainer.settings.replay_steps=64 \
   ++trainer.settings.replay_envs=64 \
   ++trainer.settings.window=8 \
   ++trainer.settings.horizon=8 \
   ++trainer.settings.batch_size=32 \
+  ++trainer.settings.policy_batch_size=32 \
   ++trainer.settings.world_updates=2 \
   ++trainer.settings.warmup_world_updates=4 \
   ++trainer.settings.actor_updates=1 \
@@ -142,11 +148,17 @@ echo $! > "$RUN_DIR/launcher.pid"
 tail -f "$RUN_DIR/train.log"
 ```
 
-看到 `WAM iteration=...` 并生成 `last.pt` 后，再开始正式训练。
+确认日志包含 `world/loss`、`actor/loss`、`critic/loss` 且数值有限，
+并生成 `last.pt`，才说明这次冒烟覆盖了三类更新。
 
 ## 7. 正式训练
 
-如果目标是 8 卡总共 4096 个环境，应设置每卡 `512` 个环境：
+下面按 SuperMimic 单进程默认的全局采样规模分配到 8 卡：
+每卡 512 个环境，每环境 replay 1000 步；WAM batch 每卡 256（全局 2048），
+actor batch 每卡 512（全局 4096）。`utd=0.4` 每轮交替采集 2、3 步，
+此时 `collect_steps` 不参与调度。这是采样规模对齐，不代表完整算法已严格复现：
+当前 WAM 在 replay 达到 8 步就开始拟合，`warmup_steps` 仅约束 actor；
+`reset_sampling: return` 尚未接到 reset 采样逻辑，仍使用 GR00T 的自适应采样。
 
 ```bash
 RUN_DIR=/data/ouqin/runs_supermimic/wam_4096_total_$(date +%Y%m%d_%H%M%S)
@@ -173,14 +185,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$PY" \
   headless=True \
   experiment_dir="$RUN_DIR" \
   num_envs=512 \
-  ++algo.config.num_learning_iterations=50000 \
-  ++trainer.settings.collect_steps=32 \
+  ++algo.config.num_learning_iterations=320000 \
+  ++trainer.settings.utd=0.4 \
   ++trainer.settings.motion_resample_frequency=250 \
-  ++trainer.settings.replay_steps=256 \
-  ++trainer.settings.replay_envs=64 \
+  ++trainer.settings.replay_steps=1000 \
+  ++trainer.settings.replay_envs=512 \
   ++trainer.settings.window=8 \
   ++trainer.settings.horizon=32 \
-  ++trainer.settings.batch_size=32 \
+  ++trainer.settings.batch_size=256 \
+  ++trainer.settings.policy_batch_size=512 \
   ++trainer.settings.world_updates=10 \
   ++trainer.settings.warmup_world_updates=100 \
   ++trainer.settings.actor_updates=1 \

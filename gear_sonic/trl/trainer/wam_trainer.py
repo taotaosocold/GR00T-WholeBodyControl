@@ -385,6 +385,15 @@ class WAMTrainer:
             return None, None
         policy_names, policy_dims = names["policy"], dims["policy"]
         wam_names, wam_dims = names["wam"], dims["wam"]
+        wam_specs = []
+        wam_offset = 0
+        for name, shape in zip(wam_names, wam_dims):
+            flat = 1
+            for value in shape:
+                flat *= int(value)
+            wam_specs.append((name, wam_offset, wam_offset + flat))
+            wam_offset += flat
+        frame_dims = {name: end - start for name, start, end in wam_specs}
         actor_specs = []
         offset = 0
         for name, shape in zip(policy_names, policy_dims):
@@ -392,22 +401,21 @@ class WAMTrainer:
             flat = 1
             for value in shape:
                 flat *= int(value)
-            if len(shape) < 2:
+            if name in frame_dims:
+                # Isaac Lab may flatten [history, term_dim] into one axis
+                # (e.g. joint_pos: (290,)). Recover the history from the
+                # matching single-frame term, not from the physical state.
+                term_dim = frame_dims[name]
+                if term_dim < 1 or flat % term_dim:
+                    raise ValueError(f"actor history for {name!r} does not match its WAM frame")
+                history = flat // term_dim
+            elif len(shape) < 2:
                 history, term_dim = 1, flat
             else:
                 history, term_dim = int(shape[-2]), int(shape[-1])
             actor_specs.append((name, offset, offset + flat, history, term_dim))
             offset += flat
-        wam_specs = []
-        wam_offset = 0
-        for name, shape in zip(wam_names, wam_dims):
-            shape = tuple(shape)
-            flat = 1
-            for value in shape:
-                flat *= int(value)
-            wam_specs.append((name, wam_offset, wam_offset + flat))
-            wam_offset += flat
-        if offset != self.obs["actor_obs"].shape[-1] or wam_offset != self.layout.state_dim:
+        if offset != self.obs["actor_obs"].shape[-1] or wam_offset != self.obs["wam"].shape[-1]:
             return None, None
         return actor_specs, wam_specs
 

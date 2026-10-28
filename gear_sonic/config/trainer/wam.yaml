@@ -16,7 +16,8 @@ settings:
   # It is replayed per timestep and is consumed by WAM, never by FSQ.
   context_observation_keys: [wam_context]
   reference_observation_keys: [wam_reference]
-  critic_observation_keys: [critic]
+  # ManagerEnvWrapper exposes the Isaac Lab critic group as critic_obs.
+  critic_observation_keys: [critic_obs]
   collect_steps: 1
   motion_resample_frequency: 250
   replay_steps: 1000
