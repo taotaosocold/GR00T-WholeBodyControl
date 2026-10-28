@@ -931,6 +931,19 @@ def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor
         xi = xi.to(device=asset.device)
         env._wam_xi = xi
 
+    # Material randomization is a class-based Isaac Lab event in newer
+    # releases. Refresh the effective friction here as a fallback for backends
+    # whose material view is only readable after startup events run.
+    try:
+        view = getattr(asset, "root_physx_view", None)
+        if view is None:
+            view = getattr(asset, "root_view", None)
+        properties = view.get_material_properties()
+        friction = properties[..., 0].reshape(properties.shape[0], -1).mean(-1)
+        xi[:, 0] = friction.to(device=xi.device, dtype=xi.dtype)
+    except (AttributeError, RuntimeError, TypeError, IndexError):
+        pass
+
     indices = joint_utils.get_body_joint_indices(asset)
     current = asset.data.default_joint_pos[:, indices]
     nominal = getattr(asset.data, "default_joint_pos_nominal", None)

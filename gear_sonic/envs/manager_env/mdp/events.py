@@ -5,10 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 from isaaclab.assets import Articulation
-from isaaclab.envs.mdp.events import (
-    _randomize_prop_by_op,
-    randomize_rigid_body_material as _randomize_rigid_body_material,
-)
+from isaaclab.envs.mdp import randomize_rigid_body_material as _randomize_rigid_body_material
+from isaaclab.envs.mdp.events import _randomize_prop_by_op
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 import isaaclab.utils.math as math_utils
@@ -52,43 +50,83 @@ def _wam_xi_buffer(env: ManagerBasedEnv) -> torch.Tensor:
     return xi
 
 
-def randomize_rigid_body_material(
+def _record_material_context(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor | None,
+    env_ids: torch.Tensor | slice | None,
     asset_cfg: SceneEntityCfg,
-    static_friction_range: tuple[float, float],
-    dynamic_friction_range: tuple[float, float],
-    restitution_range: tuple[float, float],
-    num_buckets: int,
-):
-    """Apply Isaac Lab material randomization and expose its friction as ξ."""
-    _randomize_rigid_body_material(
-        env,
-        env_ids,
-        static_friction_range=static_friction_range,
-        dynamic_friction_range=dynamic_friction_range,
-        restitution_range=restitution_range,
-        num_buckets=num_buckets,
-        asset_cfg=asset_cfg,
-    )
+) -> None:
+    """Copy the effective static friction into the per-environment ξ buffer."""
     xi = _wam_xi_buffer(env)
     asset = env.scene[asset_cfg.name]
-    # Isaac Lab exposes material properties through the PhysX view. Keep this
-    # optional so older Isaac Lab releases still fall back to the nominal
-    # friction value instead of breaking environment construction.
     try:
-        properties = asset.root_physx_view.get_material_properties()
+        view = getattr(asset, "root_physx_view", None)
+        if view is None:
+            view = getattr(asset, "root_view", None)
+        properties = view.get_material_properties()
         friction = properties[..., 0].reshape(properties.shape[0], -1).mean(-1)
-        ids = (
-            torch.arange(env.scene.num_envs, device=xi.device)
-            if env_ids is None
-            else torch.as_tensor(env_ids, device=xi.device)
-        )
+        if env_ids is None:
+            ids = torch.arange(env.scene.num_envs, device=xi.device)
+        elif isinstance(env_ids, slice):
+            ids = torch.arange(env.scene.num_envs, device=xi.device)[env_ids]
+        else:
+            ids = torch.as_tensor(env_ids, device=xi.device)
         xi[ids, 0] = friction[ids].to(device=xi.device, dtype=xi.dtype)
     except (AttributeError, RuntimeError, TypeError, IndexError):
         # The exact material getter is version-dependent. The simulator has
         # still been randomized; leave ξ at its nominal value when unavailable.
         pass
+
+
+if isinstance(_randomize_rigid_body_material, type):
+
+    class randomize_rigid_body_material(_randomize_rigid_body_material):
+        """Isaac Lab class term that also records its friction in ξ."""
+
+        def __call__(
+            self,
+            env: ManagerBasedEnv,
+            env_ids: torch.Tensor | slice | None,
+            static_friction_range: tuple[float, float],
+            dynamic_friction_range: tuple[float, float],
+            restitution_range: tuple[float, float],
+            num_buckets: int,
+            asset_cfg: SceneEntityCfg,
+            make_consistent: bool = False,
+        ) -> None:
+            super().__call__(
+                env,
+                env_ids,
+                static_friction_range,
+                dynamic_friction_range,
+                restitution_range,
+                num_buckets,
+                asset_cfg,
+                make_consistent,
+            )
+            _record_material_context(env, env_ids, asset_cfg)
+
+else:
+
+    def randomize_rigid_body_material(
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor | slice | None,
+        asset_cfg: SceneEntityCfg,
+        static_friction_range: tuple[float, float],
+        dynamic_friction_range: tuple[float, float],
+        restitution_range: tuple[float, float],
+        num_buckets: int,
+    ) -> None:
+        """Compatibility wrapper for Isaac Lab releases using a function term."""
+        _randomize_rigid_body_material(
+            env,
+            env_ids,
+            static_friction_range=static_friction_range,
+            dynamic_friction_range=dynamic_friction_range,
+            restitution_range=restitution_range,
+            num_buckets=num_buckets,
+            asset_cfg=asset_cfg,
+        )
+        _record_material_context(env, env_ids, asset_cfg)
 
 
 def randomize_joint_default_pos(
