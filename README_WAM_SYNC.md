@@ -39,7 +39,7 @@ git bundle create \
 git bundle verify /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle
 
 scp /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle \
-  hjq@RTX4090-gpu-014:/data/ouqin/
+  gpu14:/data/ouqin/
 ```
 
 ## 3. 在 GPU14 同步仓库

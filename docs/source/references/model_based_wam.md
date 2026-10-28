@@ -100,10 +100,10 @@ therefore receives only `(physical_state, action, ξ)` and shares one robot
 dynamics model across all three target representations. FSQ tokens are never
 passed to WAM. The physical WAM uses SuperMimic's frame-local invariant input
 and predicts local `dp, dtheta, dv, dw, dq, dqd` increments before integrating
-them back into the 71-dimensional state.
-If the environment exposes physical randomization observations, list them as
-`context_observation_keys`; they become the optional `ξ` input to WAM and the
-shared critic.
+them back into the 71-dimensional state. The default `wam_context` observation
+is SuperMimic's 33-dimensional `ξ = [friction, joint-default offsets (29),
+torso CoM offset (3)]`; it is replayed at every transition and fed to WAM and
+the critic at the corresponding imagined timestep.
 
 Replay stores the current and next physical state, reference state, full critic
 tracking/reference features, actor observations, and raw goals needed to re-run

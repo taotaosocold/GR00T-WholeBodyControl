@@ -52,6 +52,23 @@ class SequenceReplayTests(unittest.TestCase):
         self.assertFalse(batch["dynamics_mask"].any())
         self.assertFalse(batch["terminated"].any())
 
+    def test_context_is_replayed_per_transition(self):
+        replay = SequenceReplayBuffer(capacity_steps=4)
+        for t in range(4):
+            state = torch.tensor([[float(t)]])
+            replay.add(
+                state,
+                state,
+                state[:, 0],
+                state + 1,
+                torch.zeros(1, dtype=torch.bool),
+                context=torch.tensor([[10.0 + t, 20.0 + t]]),
+            )
+        batch = replay.sample(1, 4)
+        torch.testing.assert_close(
+            batch["contexts"], torch.tensor([[[10.0, 20.0], [11.0, 21.0], [12.0, 22.0], [13.0, 23.0]]])
+        )
+
     def test_snapshot_restores_cursor_and_continues_inserting(self):
         original = SequenceReplayBuffer(capacity_steps=3)
         for t in range(5):
