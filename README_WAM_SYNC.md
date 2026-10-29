@@ -164,7 +164,7 @@ actor batch 每卡 512（全局 4096）。`utd=0.4` 每轮交替采集 2、3 步
 RUN_DIR=/data/ouqin/runs_supermimic/wam_4096_total_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$RUN_DIR"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$PY" \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 nohup "$PY" -u \
   -m accelerate.commands.launch \
   --multi_gpu \
   --num_machines=1 \
@@ -207,7 +207,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$PY" \
   ++manager_env.commands.motion.encoder_sample_probs.g1=1.0 \
   ++manager_env.commands.motion.encoder_sample_probs.smpl=1.0 \
   ++manager_env.commands.motion.encoder_sample_probs.teleop=0.0 \
-  > "$RUN_DIR/train.log" 2>&1 &
+  < /dev/null > "$RUN_DIR/train.log" 2>&1 &
+
 
 echo $! > "$RUN_DIR/launcher.pid"
 ```
