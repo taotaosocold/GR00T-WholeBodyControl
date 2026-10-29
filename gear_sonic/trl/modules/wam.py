@@ -217,11 +217,14 @@ class RunningNorm(nn.Module):
     ``float64`` and copied back to the module dtype for stable long runs.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-4, max_count: float = 2e8):
+    def __init__(self, dim: int, eps: float = 1e-4, max_count: float = 2e8, min_std: float = 1e-2):
         super().__init__()
         if dim < 1:
             raise ValueError(f"dim must be positive, got {dim}")
         self.eps = float(eps)
+        self.min_std = float(min_std)
+        if self.eps <= 0 or self.min_std < 0:
+            raise ValueError("normalizer eps must be positive and min_std nonnegative")
         self.max_count = float(max_count)
         self.register_buffer("mean", torch.zeros(dim))
         self.register_buffer("var", torch.ones(dim))
@@ -256,7 +259,7 @@ class RunningNorm(nn.Module):
     def std(self) -> torch.Tensor:
         # Static routing bits and short warmup batches can have zero variance.
         # A finite scale keeps their Jacobians bounded during imagination.
-        return torch.sqrt(self.var + self.eps**2).clamp_min(1e-2)
+        return torch.sqrt(self.var + self.eps**2).clamp_min(self.min_std)
 
 
 @dataclass
@@ -286,6 +289,10 @@ class WAMConfig:
     state_type: str = "flat"
     reward_mode: str = "learned"
     termination_mode: str = "learned"
+    # Physical output scaling and rollout-error weighting are independent.
+    # The six floors correspond to dp, dtheta, dv, dw, dq and dqd.
+    delta_norm_eps: float = 1e-4
+    state_error_floor: tuple[float, ...] = (0.003, 0.005, 0.02, 0.05, 0.003, 0.05)
 
 
 class StateSpaceWorldModel(nn.Module):
@@ -345,7 +352,20 @@ class StateSpaceWorldModel(nn.Module):
         self.goal_norm = RunningNorm(self.goal_dim) if self.goal_dim else None
         self.context_norm = RunningNorm(self.context_dim) if self.context_dim else None
         self.delta_dim = dynamics_out
-        self.delta_norm = RunningNorm(self.delta_dim)
+        if self.state_type == "physical":
+            self.delta_norm = RunningNorm(
+                self.delta_dim, eps=float(getattr(cfg, "delta_norm_eps", 1e-4)), min_std=0.0,
+            )
+            floors = torch.as_tensor(getattr(
+                cfg, "state_error_floor", (0.003, 0.005, 0.02, 0.05, 0.003, 0.05),
+            ), dtype=torch.float32)
+            if floors.shape != (6,) or not torch.isfinite(floors).all() or (floors <= 0).any():
+                raise ValueError("physical state_error_floor requires six finite positive values")
+            self.register_buffer("state_error_floor", torch.repeat_interleave(
+                floors, torch.tensor((3, 3, 3, 3, NUM_G1_JOINTS, NUM_G1_JOINTS)),
+            ))
+        else:
+            self.delta_norm = RunningNorm(self.delta_dim)
         learn_term = bool(getattr(cfg, "learn_termination", True)) and self.termination_mode == "learned"
         self.termination_head = (
             _mlp(self.state_dim + self.goal_dim, term_hidden, 1) if learn_term else None
@@ -580,7 +600,8 @@ class StateSpaceWorldModel(nn.Module):
             error_target = states[:, t + 1]
             if self.state_type == "physical":
                 transition = physical_state_transition_error(current, error_target)
-                state_errors.append((transition / self.delta_norm.std()).square().mean(-1))
+                error_std = torch.maximum(self.delta_norm.std(), self.state_error_floor)
+                state_errors.append((transition / error_std).square().mean(-1))
             else:
                 state_errors.append(
                     ((current - error_target) / self.state_norm.std()).square().mean(-1)

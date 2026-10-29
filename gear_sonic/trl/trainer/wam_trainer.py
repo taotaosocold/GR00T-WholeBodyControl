@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import contextmanager
+from copy import deepcopy
 from numbers import Real
 from pathlib import Path
 import time
@@ -19,7 +20,6 @@ import time
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.nn import functional as F
 
 from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.trl.modules.wam import (
@@ -29,13 +29,17 @@ from gear_sonic.trl.modules.wam import (
     StateSpaceWorldModel,
     WAMConfig,
     physical_state_parts,
-    physical_state_invariant_features,
 )
 from gear_sonic.trl.world_model.distributed import DistributedContext
 from gear_sonic.trl.world_model.sequence_replay import SequenceReplayBuffer
 from gear_sonic.trl.utils.common import custom_instantiate
+from gear_sonic.utils.wam_critic import WAMCriticFeatures, future_reference_states
+from gear_sonic.utils.wam_context import get_push_versions
 from gear_sonic.utils.wam_kinematics import G1_MUJOCO_JOINT_NAMES
 from gear_sonic.utils.wam_observations import WAMGoalObservations
+from gear_sonic.utils.wam_optimization import policy_gradient_metrics
+from gear_sonic.utils.wam_reference import WAMReferenceBank
+from gear_sonic.utils.wam_noise import wam_observation_noise
 from gear_sonic.utils.wam_reward import WAMTrackingReward, reference_state
 from gear_sonic.utils.wam_termination import (
     enable_terminal_capture, get_terminal_state, soft_tracking_termination,
@@ -49,9 +53,9 @@ _G1_MUJOCO_ORDER = G1_MUJOCO_JOINT_NAMES
 _G1_ISAAC_ORDER = tuple(joint_utils.G1_ISAACLab_ORDER)
 _MUJOCO_TO_ISAAC = tuple(_G1_MUJOCO_ORDER.index(name) for name in _G1_ISAAC_ORDER)
 _ISAAC_TO_MUJOCO = tuple(_G1_ISAAC_ORDER.index(name) for name in _G1_MUJOCO_ORDER)
-# v2 uses link-origin root velocity, world-frame replayed goal rotations,
-# and a physical critic that never consumes logged robot observations.
-PHYSICAL_SCHEMA_VERSION = 2
+# v3 adds canonical future references and FK tracking features to the shared
+# physical critic. Old actor weights remain compatible with policy-only load.
+PHYSICAL_SCHEMA_VERSION = 4
 
 
 @contextmanager
@@ -192,14 +196,20 @@ class WAMTrainer:
         if accelerator is not None and accelerator.num_processes != self.distributed.world_size:
             raise ValueError("Accelerator and initialized torch.distributed world sizes disagree")
         self.settings = dict(settings or {})
+        self.actor_return_reduction = str(self.settings.get(
+            "actor_return_reduction",
+            "sum" if dict((world_model_config or {}).get("cfg", {})).get("state_type") == "physical" else "mean",
+        ))
+        if self.actor_return_reduction not in {"sum", "mean"}:
+            raise ValueError("actor_return_reduction must be 'sum' or 'mean'")
+        if int(self.settings.get("gradient_diagnostics_interval", 0)) < 0:
+            raise ValueError("gradient_diagnostics_interval must be nonnegative")
         for name in ["window", "horizon", "batch_size", "world_updates", "critic_epochs",
                      "replay_steps", "replay_envs", "collect_steps", "actor_updates"]:
             if int(self.settings.get(name, 1)) < 1:
                 raise ValueError(f"WAM setting {name} must be positive")
         if int(self.settings.get("replay_steps", 256)) < int(self.settings.get("window", 8)):
             raise ValueError("replay_steps must be at least the fitting window")
-        if int(self.settings.get("replay_steps", 256)) < int(self.settings.get("horizon", 32)):
-            raise ValueError("replay_steps must be at least the imagination horizon")
         # The default Hydra timestamp can be evaluated in different seconds on
         # different ranks. All rank sidecars must use rank zero's actual path.
         shared_path = [str(log_dir or "logs_rl/wam")]
@@ -237,10 +247,18 @@ class WAMTrainer:
         self.context_keys = list(self.settings.get("context_observation_keys", []))
         self.reference_keys = list(self.settings.get("reference_observation_keys", []))
         self.physical_wam = dict((world_model_config or {}).get("cfg", {})).get("state_type", "flat") == "physical"
+        self.independent_imagination = self.physical_wam and bool(
+            self.settings.get("independent_imagination", True)
+        )
+        if not self.independent_imagination and int(self.settings.get("replay_steps", 256)) < int(
+            self.settings.get("horizon", 32)
+        ):
+            raise ValueError("replay_steps must be at least the imagination horizon")
+        self.reference_bank = WAMReferenceBank(self.layout.tokenizer_specs) if self.independent_imagination else None
         # Sonic's privileged observations contain the *real* robot trajectory.
         # They cannot describe an independently imagined robot. Physical mode
-        # builds the critic input exclusively from its predicted physical state,
-        # matching reference state, and replayed physical context instead.
+        # builds tracking features from its predicted state and conditions on
+        # canonical current/future robot references plus physical context.
         self.critic_keys = [] if self.physical_wam else list(self.settings.get("critic_observation_keys", []))
         tokenizer_offset = next((start for key, start, _ in self.layout.goal_specs if key == "tokenizer"), None)
         self.goal_observations = WAMGoalObservations(
@@ -289,6 +307,19 @@ class WAMTrainer:
         self.world_model = StateSpaceWorldModel(WAMConfig(**cfg)).to(self.device)
         self.reward_model = None
         simulator = getattr(env, "env", env)
+        self.context_schema = deepcopy(getattr(simulator, "_wam_context_schema", None))
+        if self.physical_wam and self.settings.get("complete_context", False):
+            if self.context_schema is None or self.context_schema.get("dim") != self.context_dim:
+                raise ValueError("Complete WAM context requires matching simulator context metadata")
+        self.distributed.check_consistent(self.context_schema, "WAM physical context schema")
+        self.numerical_spec = {
+            "delta_norm_eps": self.world_model.delta_norm.eps,
+            "state_error_floor": self.world_model.state_error_floor.cpu().tolist(),
+            "observation_noise": wam_observation_noise(self.settings),
+            "actor_return_reduction": self.actor_return_reduction,
+            "aux_loss_scale": float(self.settings.get("aux_loss_scale", 1.0)),
+        } if self.physical_wam else None
+        self.distributed.check_consistent(self.numerical_spec, "WAM numerical settings")
         self.control_dt = float(getattr(simulator, "step_dt", self.settings.get("control_dt", 0.02)))
         if self.physical_wam and self.settings.get("align_real_reward", False):
             reward_cfg = dict(reward_config or {})
@@ -305,15 +336,43 @@ class WAMTrainer:
         self.world_step = self.world_model.forward
         if self.settings.get("compile", False):
             self.world_step = torch.compile(self.world_model.forward, dynamic=False)
+        self.critic_features = None
+        self.critic_future_frames = int(self.settings.get("critic_future_frames", 10))
+        self.critic_future_dt = float(self.settings.get("critic_future_dt", self.control_dt))
+        if self.physical_wam:
+            if self.reference_dim != PHYSICAL_STATE_DIM:
+                raise ValueError("Physical WAM critic requires a 71-D robot reference")
+            if self.critic_future_frames < 1 or self.critic_future_dt <= 0:
+                raise ValueError("WAM critic future frame count and interval must be positive")
+            steps = self.critic_future_dt / self.control_dt
+            self.critic_future_stride = round(steps)
+            if self.critic_future_stride < 1 or abs(steps - self.critic_future_stride) > 1e-6:
+                raise ValueError("WAM critic future interval must be a positive multiple of control dt")
+            self.critic_features = WAMCriticFeatures(
+                kinematics=self.reward_model.kinematics if self.reward_model is not None else None,
+                future_frames=self.critic_future_frames, context_dim=self.context_dim,
+            ).to(self.device)
+            self.critic_input_dim = self.critic_features.input_dim
+        else:
+            self.critic_input_dim = (
+                self.layout.state_dim + self.reference_dim + self.critic_feature_dim + self.context_dim
+            )
+        self.critic_spec = {
+            "input_dim": self.critic_input_dim,
+            "future_frames": self.critic_future_frames if self.physical_wam else 0,
+            "future_dt": self.critic_future_dt if self.physical_wam else 0.0,
+            "independent_imagination": self.independent_imagination,
+        }
+        self.distributed.check_consistent(self.critic_spec, "WAM critic reference settings")
         critic_cfg = dict(critic_config or {})
         if critic_cfg:
-            critic_cfg["input_dim"] = self.layout.state_dim + self.reference_dim + self.critic_feature_dim + self.context_dim
+            critic_cfg["input_dim"] = self.critic_input_dim
             self.critic = custom_instantiate(critic_cfg, _resolve=False).to(self.device)
         else:
             # Preserve direct construction for small downstream integrations
             # that instantiate WAMTrainer without a Hydra critic config.
             self.critic = nn.Sequential(
-                nn.Linear(self.layout.state_dim + self.reference_dim + self.critic_feature_dim + self.context_dim, 256), nn.SiLU(),
+                nn.Linear(self.critic_input_dim, 256), nn.SiLU(),
                 nn.Linear(256, 128), nn.SiLU(), nn.Linear(128, 1),
             ).to(self.device)
         lr = float(self.settings.get("learning_rate", 2e-4))
@@ -321,9 +380,7 @@ class WAMTrainer:
         trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
         self.actor_optimizer = torch.optim.Adam(trainable, lr=lr, betas=(0.9, 0.95))
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
-        self.critic_norm = RunningNorm(
-            self.layout.state_dim + self.reference_dim + self.critic_feature_dim + self.context_dim
-        ).to(self.device)
+        self.critic_norm = RunningNorm(self.critic_input_dim).to(self.device)
         self.replay = SequenceReplayBuffer(int(self.settings.get("replay_steps", 1000)))
         tracked = min(env.num_envs, int(self.settings.get("replay_envs", env.num_envs)))
         self.replay_env_ids = torch.randperm(env.num_envs, device=self.device)[:tracked]
@@ -397,6 +454,21 @@ class WAMTrainer:
         simulator = getattr(self.env, "env", self.env)
         command = simulator.command_manager.get_term("motion")
         return reference_state(command)
+
+    def _physical_future_reference(self, *, next_step=False):
+        """Snapshot one robot-reference window before the simulator can reset.
+
+        This privileged critic condition comes from the canonical motion
+        library, independently of which actor encoder is selected. Saving it
+        in replay keeps old samples valid across motion-library reloads.
+        """
+        simulator = getattr(self.env, "env", self.env)
+        command = simulator.command_manager.get_term("motion")
+        future = future_reference_states(
+            command, num_frames=self.critic_future_frames,
+            frame_stride=self.critic_future_stride, next_step=next_step,
+        )
+        return future.flatten(start_dim=1)
 
     def _imagination_references(self, batch):
         references = batch.get("references")
@@ -529,6 +601,20 @@ class WAMTrainer:
             reference = self._pack_keys(self.obs, self.reference_keys)
             critic_state = self._pack_keys(self.obs, self.critic_keys)
             context = self._pack_context(self.obs)
+            reference_index = None
+            if self.independent_imagination:
+                simulator = getattr(self.env, "env", self.env)
+                reference_index = self.reference_bank.capture(
+                    simulator.command_manager.get_term("motion"), simulator.observation_manager,
+                )
+            future_reference = (
+                self._physical_future_reference()
+                if self.physical_wam and not self.independent_imagination else None
+            )
+            next_future_reference = (
+                self._physical_future_reference(next_step=True)
+                if self.physical_wam and not self.independent_imagination else None
+            )
             transition_reference = (
                 self._next_physical_reference()
                 if self.physical_wam and (
@@ -548,6 +634,8 @@ class WAMTrainer:
             limit = self.env.config.get("action_clip_value", None)
             if limit is not None and limit > 0:
                 executed = executed.clamp(-limit, limit)
+            simulator = getattr(self.env, "env", self.env)
+            push_before = get_push_versions(simulator, self.env.num_envs) if self.physical_wam else None
             next_obs, rewards, dones, infos = self.env.step({"actions": executed})
             next_state = self.layout.pack(next_obs)
             next_goal = self.layout.pack_goal(next_obs)
@@ -567,6 +655,10 @@ class WAMTrainer:
                         raise ValueError("Captured terminal state does not match physical WAM observations")
                     next_state = torch.where(dones[:, None].bool(), terminal_state, next_state)
                     next_state_valid = torch.ones_like(dones, dtype=torch.bool)
+                # Random external impulses are not deterministic robot dynamics.
+                # Their resulting states can still seed subsequent imagination.
+                pushed = get_push_versions(simulator, self.env.num_envs) != push_before
+                next_state_valid &= ~pushed.to(device=next_state_valid.device)
             next_wam = next_obs.get("wam")
             next_actor_obs = (
                 self._advance_actor_history(actor_obs, next_wam)
@@ -634,6 +726,9 @@ class WAMTrainer:
                     next_critic_state=next_critic_state[indices] if self.critic_keys else None,
                     previous_action=previous_world_action[indices],
                     next_state_valid=next_state_valid[indices],
+                    future_reference=future_reference[indices] if future_reference is not None else None,
+                    next_future_reference=next_future_reference[indices] if next_future_reference is not None else None,
+                    reference_index=reference_index[indices] if reference_index is not None else None,
                 )
             else:
                 self.replay.add(
@@ -646,6 +741,9 @@ class WAMTrainer:
                     next_critic_state=next_critic_state[indices] if self.critic_keys else None,
                     previous_action=previous_world_action[indices],
                     next_state_valid=next_state_valid[indices],
+                    future_reference=future_reference[indices] if future_reference is not None else None,
+                    next_future_reference=next_future_reference[indices] if next_future_reference is not None else None,
+                    reference_index=reference_index[indices] if reference_index is not None else None,
                 )
             valid = next_state_valid[indices]
             if valid.any():
@@ -682,7 +780,10 @@ class WAMTrainer:
         batch_size = int(self.settings.get("batch_size", 256))
         metrics = {}
         for _ in range(int(self.settings.get("world_updates", 10))):
-            batch = self.replay.sample(batch_size, window, device=self.device)
+            fields = ["states", "actions", "terminated", "mask", "dynamics_mask", "rewards"]
+            if self.context_dim:
+                fields.append("contexts")
+            batch = self.replay.sample(batch_size, window, device=self.device, fields=fields)
             loss_kwargs = {
                 "dones": batch["terminated"],
                 "mask": batch["mask"],
@@ -721,11 +822,26 @@ class WAMTrainer:
     def _critic_input(self, state, context=None):
         return self._critic_input_with_aux(state, None, None, context)
 
-    def _critic_input_with_aux(self, state, reference=None, critic_state=None, context=None):
-        # Unlike the dynamics, the tracking value depends on absolute root
-        # position and heading relative to the target. Retain them here;
-        # critic_norm normalizes the full input once, using valid imagined data.
-        state_features = state if self.physical_wam else self.world_model.state_norm(state)
+    def _critic_input_with_aux(
+        self, state, reference=None, critic_state=None, context=None, *, future_reference=None,
+    ):
+        if self.physical_wam:
+            if reference is None or future_reference is None:
+                raise ValueError("Physical WAM critic requires current and future robot references")
+            if future_reference.ndim == state.ndim:
+                if future_reference.shape[-1] != self.critic_future_frames * PHYSICAL_STATE_DIM:
+                    raise ValueError("Physical WAM critic future reference has the wrong flattened size")
+                future_reference = future_reference.reshape(
+                    *future_reference.shape[:-1], self.critic_future_frames, PHYSICAL_STATE_DIM,
+                )
+            if self.context_dim:
+                if context is None:
+                    raise ValueError("WAM context is required by the critic")
+                context = self.world_model.context_norm(context)
+            else:
+                context = state.new_zeros(*state.shape[:-1], 0)
+            return self.critic_features(state, reference, context, future_reference)
+        state_features = self.world_model.state_norm(state)
         features = [state_features]
         if self.reference_dim:
             if reference is None:
@@ -774,15 +890,15 @@ class WAMTrainer:
         nominal = getattr(robot.data, "default_joint_pos_nominal", None)
         if nominal is None:
             nominal = robot.data.default_joint_pos[0].detach().clone()
-            if self.context_dim == 33:
+            if self.context_dim >= 33:
                 live_context = self._pack_context(self.obs)
                 nominal[body_indices] -= live_context[0, 1:30][index]
         elif nominal.ndim == 2:
             nominal = nominal[0]
         default_position = nominal[body_indices].to(device=state.device, dtype=state.dtype)
         if context is not None:
-            if context.shape[-1] != 33:
-                raise ValueError("Physical actor calibration requires the 33-D WAM ξ layout")
+            if context.shape[-1] < 33:
+                raise ValueError("Physical actor calibration requires the WAM ξ calibration prefix")
             default_position = default_position + context[..., 1:30][..., index]
         elif self.context_dim:
             raise ValueError("Physical actor projection requires replayed ξ")
@@ -802,15 +918,7 @@ class WAMTrainer:
         frame = torch.cat(
             [values[name] for name, _, _ in self._wam_term_specs], dim=-1
         )
-        # SuperMimic Table A.1 noise: gravity/actions are noiseless, angular
-        # velocity is ±0.05, joint position ±0.01, and joint velocity ±0.5.
-        noise_half_width = {
-            "gravity_dir": 0.0,
-            "base_ang_vel": 0.05,
-            "joint_pos": 0.01,
-            "joint_vel": 0.5,
-            "actions": 0.0,
-        }
+        noise_half_width = wam_observation_noise(self.settings)
         noise = frame.new_zeros(frame.shape)
         for name, start, end in self._wam_term_specs:
             width = noise_half_width.get(name, 0.0)
@@ -892,12 +1000,31 @@ class WAMTrainer:
             )
         return torch.cat((actor_obs[..., wam_obs.shape[-1] :], wam_obs), dim=-1)
 
+    def _sample_policy_batch(self, horizon):
+        size = int(self.settings.get("policy_batch_size", self.settings.get("batch_size", 256)))
+        if not self.independent_imagination:
+            return self.replay.sample(size, horizon, device=self.device)
+        seed = self.replay.sample_starts(
+            size, device=self.device, eligible=self.reference_bank.valid_starts,
+        )
+        batch = self.reference_bank.trajectory(
+            seed["reference_index"], seed["goal"], horizon,
+            self.critic_future_frames, self.critic_future_stride, self.device,
+        )
+        # These are seed metadata, not a logged trajectory. The reference
+        # advances independently and ξ remains the seed episode's physics.
+        batch["states"] = seed["state"][:, None].expand(-1, horizon + 1, -1)
+        batch["actor_states"] = seed["actor_state"][:, None].expand(-1, horizon + 1, -1)
+        batch["actions"] = seed["action"][:, None].expand(-1, horizon, -1)
+        batch["previous_actions"] = seed["previous_action"][:, None].expand(-1, horizon, -1)
+        batch["dones"] = torch.zeros(size, horizon, dtype=torch.bool, device=self.device)
+        if self.context_dim:
+            batch["contexts"] = seed["context"][:, None].expand(-1, horizon, -1)
+        return batch
+
     def improve_policy(self):
         horizon = int(self.settings.get("horizon", 32))
-        batch = self.replay.sample(
-            int(self.settings.get("policy_batch_size", self.settings.get("batch_size", 256))),
-            horizon, device=self.device
-        )
+        batch = self._sample_policy_batch(horizon)
         seed = batch["states"][:, 0].detach()
         actor_obs = (
             batch["states"][:, 0].detach()
@@ -912,6 +1039,13 @@ class WAMTrainer:
         context = self._imagination_contexts(batch) if self.context_dim else None
         references = self._imagination_references(batch)
         lengths = batch["mask"].sum(-1)
+        future_references = None
+        if self.physical_wam:
+            if "future_references" not in batch:
+                raise ValueError("Physical WAM replay is missing the critic's future robot references")
+            future_references = self._hold_sequence_at_end(
+                batch["future_references"], lengths, terminal_state=True,
+            )
         # Legacy non-physical integrations may still have auxiliary critic
         # observations. Never let their reset-episode rows reach a bootstrap.
         critic_states = None
@@ -934,6 +1068,7 @@ class WAMTrainer:
         survival = torch.ones(seed.shape[0], device=self.device)
         objective = torch.zeros_like(survival)
         auxiliary_loss = seed.new_zeros(())
+        gradient_metrics = {}
         with frozen(self.world_model), frozen(self.critic):
             for step in range(horizon):
                 states.append(state)
@@ -941,6 +1076,8 @@ class WAMTrainer:
                 goal = goals[:, step] if self.layout.goal_dim else None
                 if self.physical_wam and goal is not None:
                     goal = self.goal_observations.to_robot(goal, state)
+                    if self.independent_imagination:
+                        goal = self.reference_bank.process_goals(goal)
                 if self.layout.goal_dim:
                     action = self._action(
                         state, goal, actor_obs=actor_obs, auxiliary=(step == 0)
@@ -987,14 +1124,24 @@ class WAMTrainer:
             critic_state = critic_states[:, horizon] if self.critic_feature_dim else None
             bootstrap_context = context[:, -1] if context is not None else None
             bootstrap_input = self._critic_input_with_aux(
-                state, reference, critic_state, bootstrap_context
+                state, reference, critic_state, bootstrap_context,
+                **({"future_reference": future_references[:, horizon]} if self.physical_wam else {}),
             )
             bootstrap = self.critic(
                 self.critic_norm(bootstrap_input)
             ).squeeze(-1)
             objective = objective + gamma**lengths * survival * bootstrap
-            loss = -objective.mean() / horizon
-            loss = loss + float(self.settings.get("aux_loss_scale", 1.0)) * auxiliary_loss
+            return_loss = -objective.mean()
+            if self.actor_return_reduction == "mean":
+                return_loss = return_loss / horizon
+            weighted_auxiliary_loss = float(self.settings.get("aux_loss_scale", 1.0)) * auxiliary_loss
+            loss = return_loss + weighted_auxiliary_loss
+            interval = int(self.settings.get("gradient_diagnostics_interval", 0))
+            if interval and self.iteration % interval == 0:
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                gradient_metrics = policy_gradient_metrics(
+                    return_loss, weighted_auxiliary_loss, self.policy.named_parameters(),
+                )
             grad = self.optimizer_step(
                 loss, self.actor_optimizer, self.policy.parameters(), clip_value=0.1,
                 distributed=self.distributed,
@@ -1014,7 +1161,10 @@ class WAMTrainer:
                 # is held in SuperMimic.
                 critic_context = torch.cat((context, context[:, -1:]), dim=1).detach()
             references = references[:, :horizon + 1] if self.reference_dim else None
-            inputs = self._critic_input_with_aux(states, references, critic_states, critic_context)
+            inputs = self._critic_input_with_aux(
+                states, references, critic_states, critic_context,
+                **({"future_reference": future_references} if self.physical_wam else {}),
+            )
             # A valid trajectory has L transitions and L+1 states. Exclude
             # frozen padding (and reset episode metadata) from normalization.
             valid_states = torch.arange(horizon + 1, device=self.device)[None, :] <= lengths[:, None]
@@ -1048,11 +1198,13 @@ class WAMTrainer:
                 )
         return {
             "actor/loss": float(loss.detach()), "actor/grad_norm": float(grad),
+            "actor/return_loss": float(return_loss.detach()),
             "actor/imagined_return": float(objective.detach().mean()),
             "actor/survival": float(survival.detach().mean()),
             "actor/effective_horizon": float(batch["mask"].sum(-1).float().mean()),
             "actor/aux_loss": float(auxiliary_loss.detach()),
             "critic/loss": float(critic_loss.detach()),
+            **gradient_metrics,
         }
 
     def train(self):
@@ -1095,7 +1247,7 @@ class WAMTrainer:
                 self.world_updates >= int(self.settings.get("warmup_world_updates", 100))
                 and iteration >= int(self.settings.get("wm_only_iters", 0))
                 and collected_steps >= int(self.settings.get("warmup_steps", 0))
-                and len(self.replay) >= int(self.settings.get("horizon", 32))
+                and len(self.replay) >= (1 if self.independent_imagination else int(self.settings.get("horizon", 32)))
             )
             if self.distributed.all_finite(can_imagine):
                 for _ in range(int(self.settings.get("actor_updates", 1))):
@@ -1139,6 +1291,8 @@ class WAMTrainer:
         if not hasattr(self.env, "resample_motion"):
             return False
         self.replay.mark_discontinuity()
+        if self.reference_bank is not None:
+            self.reference_bank.begin_generation(self.replay.reference_indices())
         self.env.resample_motion()
         self.obs = self.env.reset_all()
         self.actor_obs = self._seed_actor_history(self.obs["actor_obs"], self.obs.get("wam"))
@@ -1159,6 +1313,8 @@ class WAMTrainer:
         if self.settings.get("save_replay", False):
             runtime["wam_replay"] = self.replay.state_dict()
             runtime["wam_replay_env_ids"] = self.replay_env_ids.cpu()
+            if self.reference_bank is not None:
+                runtime["wam_reference_bank"] = self.reference_bank.state_dict()
 
         # Shared weights/optimizers have one writer. Replay and RNG are local
         # to each rank and stored in generation-specific sidecars, so a failed
@@ -1230,6 +1386,9 @@ class WAMTrainer:
             "wam_settings": self.settings,
             "wam_tokenizer_specs": self.layout.tokenizer_specs,
             "wam_physical_schema_version": PHYSICAL_SCHEMA_VERSION if self.physical_wam else None,
+            "wam_critic_spec": self.critic_spec if self.physical_wam else None,
+            "wam_context_schema": self.context_schema if self.physical_wam else None,
+            "wam_numerical_spec": self.numerical_spec,
         }
         return payload
 
@@ -1256,9 +1415,15 @@ class WAMTrainer:
         if resume:
             if self.physical_wam and checkpoint.get("wam_physical_schema_version") != PHYSICAL_SCHEMA_VERSION:
                 raise ValueError(
-                    "Physical WAM state/critic/replay schema changed (link-origin velocity and "
-                    "world-frame goals); use resume=false to load policy only and refit WAM/critic"
+                    "Physical WAM state/critic/replay schema changed (independent imagination and context); "
+                    "use resume=false to load policy only and refit WAM/critic"
                 )
+            if self.physical_wam and checkpoint.get("wam_critic_spec") != self.critic_spec:
+                raise ValueError("Cannot resume WAM with different critic future reference settings")
+            if self.physical_wam and checkpoint.get("wam_context_schema") != self.context_schema:
+                raise ValueError("Cannot resume WAM with a different physical context schema")
+            if self.physical_wam and checkpoint.get("wam_numerical_spec") != self.numerical_spec:
+                raise ValueError("Cannot resume WAM with different normalization, noise or actor objective settings")
             if checkpoint.get("wam_world_size", 1) != self.distributed.world_size:
                 raise ValueError(
                     "WAM resume requires the saved process count; use resume=false to load policy only"
@@ -1299,6 +1464,10 @@ class WAMTrainer:
                 self._last_checkpoint_path = Path(path).resolve()
             if "wam_replay" in runtime:
                 self.replay.load_state_dict(runtime["wam_replay"])
+                if self.reference_bank is not None:
+                    if "wam_reference_bank" not in runtime:
+                        raise ValueError("WAM replay checkpoint is missing its immutable motion references")
+                    self.reference_bank.load_state_dict(runtime["wam_reference_bank"])
                 self.replay.mark_discontinuity()
                 ids = runtime["wam_replay_env_ids"].to(self.device)
                 if ids.max() >= self.env.num_envs:

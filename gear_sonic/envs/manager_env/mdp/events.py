@@ -6,11 +6,15 @@ from typing import TYPE_CHECKING, Literal
 
 from isaaclab.assets import Articulation
 from isaaclab.envs.mdp import randomize_rigid_body_material as _randomize_rigid_body_material
+from isaaclab.envs.mdp import randomize_rigid_body_mass as _randomize_rigid_body_mass
+from isaaclab.envs.mdp import push_by_setting_velocity as _push_by_setting_velocity
 from isaaclab.envs.mdp.events import _randomize_prop_by_op
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 import isaaclab.utils.math as math_utils
 import torch
+
+from gear_sonic.utils.wam_context import invalidate_physical_context, record_push
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -58,6 +62,7 @@ def _record_material_context(
     """Copy the effective static friction into the per-environment ξ buffer."""
     xi = _wam_xi_buffer(env)
     asset = env.scene[asset_cfg.name]
+    invalidate_physical_context(asset)
     try:
         view = getattr(asset, "root_physx_view", None)
         if view is None:
@@ -127,6 +132,43 @@ else:
             asset_cfg=asset_cfg,
         )
         _record_material_context(env, env_ids, asset_cfg)
+
+
+if isinstance(_randomize_rigid_body_mass, type):
+
+    class randomize_rigid_body_mass(_randomize_rigid_body_mass):
+        """Preserve IsaacLab mass/inertia randomization and refresh WAM context."""
+
+        def __call__(
+            self, env, env_ids, asset_cfg, mass_distribution_params, operation,
+            distribution="uniform", recompute_inertia=True,
+        ):
+            super().__call__(
+                env, env_ids, asset_cfg, mass_distribution_params, operation,
+                distribution=distribution, recompute_inertia=recompute_inertia,
+            )
+            invalidate_physical_context(env.scene[asset_cfg.name])
+
+else:
+
+    def randomize_rigid_body_mass(
+        env, env_ids, asset_cfg, mass_distribution_params, operation,
+        distribution="uniform", recompute_inertia=True,
+    ):
+        """Compatibility wrapper for IsaacLab releases with a function term."""
+        _randomize_rigid_body_mass(
+            env, env_ids, asset_cfg, mass_distribution_params, operation,
+            distribution=distribution, recompute_inertia=recompute_inertia,
+        )
+        invalidate_physical_context(env.scene[asset_cfg.name])
+
+
+def push_by_setting_velocity(
+    env, env_ids, velocity_range, asset_cfg=SceneEntityCfg("robot"),
+):
+    """Apply the original impulse and mark its transition as externally disturbed."""
+    _push_by_setting_velocity(env, env_ids, velocity_range, asset_cfg=asset_cfg)
+    record_push(env, env_ids)
 
 
 def randomize_joint_default_pos(
@@ -237,9 +279,12 @@ def randomize_rigid_body_com(
 
     # get the current com of the bodies (num_assets, num_bodies)
     coms = asset.root_physx_view.get_coms().clone()
+    if getattr(asset, "_wam_nominal_coms", None) is None:
+        asset._wam_nominal_coms = coms.clone()
 
     # Randomize the com in range
     coms[:, body_ids, :3] += rand_samples
 
     # Set the new coms
     asset.root_physx_view.set_coms(coms, env_ids)
+    invalidate_physical_context(asset)

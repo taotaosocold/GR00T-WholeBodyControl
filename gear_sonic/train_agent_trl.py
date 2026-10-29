@@ -65,6 +65,8 @@ from gear_sonic.trl.utils.common import (
 )
 from gear_sonic.utils.common import seeding
 from gear_sonic.utils.config_utils import (
+    configure_wam_context,
+    configure_wam_observations,
     configure_wam_rewards,
     configure_wam_terminations,
     register_rl_resolvers,
@@ -108,6 +110,8 @@ def create_manager_env(config, device, args_cli):
 
     from gear_sonic.envs.wrapper.manager_env_wrapper import ManagerEnvWrapper
 
+    configure_wam_context(config)
+    configure_wam_observations(config)
     configure_wam_terminations(config)
     configure_wam_rewards(config)
     env_instance_cfg = custom_instantiate(config.manager_env)
@@ -162,6 +166,8 @@ def create_manager_env(config, device, args_cli):
 def main(config: OmegaConf):
     # Resolve WAM-specific real termination before logging/saving config.yaml.
     # create_manager_env applies the same selection for checkpoint evaluation.
+    configure_wam_context(config)
+    configure_wam_observations(config)
     configure_wam_terminations(config)
     configure_wam_rewards(config)
     simulator_type = "IsaacSim"

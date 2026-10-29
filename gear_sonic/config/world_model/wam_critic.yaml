@@ -1,5 +1,5 @@
-# Shared robot-state value function for the model-based WAM trainer.
+# Shared tracking value function conditioned on the canonical robot future.
 _target_: gear_sonic.trl.modules.wam.WAMCritic
 _recursive_: false
-input_dim: 1  # resolved from WAM state/context dimensions by the trainer
+input_dim: 1  # resolved from tracking features, context and future frames
 hidden: [256, 128]

@@ -7,7 +7,12 @@ Dyna loop: collect simulator transitions, fit differentiable dynamics on
 and fit a critic with GAE/lambda returns and a terminal bootstrap. World-model
 and critic weights are frozen during actor backpropagation; gradients still
 flow through their inputs. Existing reconstruction and modality-alignment
-losses are applied at the imagined rollout seed.
+losses are applied at the imagined rollout seed. The summed discounted return
+and weighted auxiliary losses jointly update the encoders and shared decoder.
+`actor_return_reduction: sum` follows SuperMimic; `mean` explicitly divides the
+return by the configured horizon. Every `gradient_diagnostics_interval`
+iterations, logs report return and auxiliary gradient norms for the actor,
+encoders and decoders separately. Diagnostics do not update WAM or critic.
 
 ## Run
 
@@ -27,7 +32,8 @@ The WAM path has four separate observation groups. `wam_state` is the
 SuperMimic physical state `p(3), quat(wxyz)(4), v(3), w(3), q(29), qd(29)`;
 `wam` is the single-step Sonic proprioceptive frame used to reconstruct the
 actor input; `wam_reference` is the corresponding reference physical
-state; and `wam_context` contains the 33 physical context values. Settings live
+state; and `wam_context` contains calibration and detailed simulator properties.
+Settings live
 in `gear_sonic/config/trainer/wam.yaml`; the dynamics
 architecture lives in `gear_sonic/config/world_model/wam_dynamics.yaml` and
 the critic architecture in `gear_sonic/config/world_model/wam_critic.yaml`.
@@ -150,11 +156,13 @@ for a full resume. A full resume requires the same process count. To change
 GPU count, use `resume=false` to load the policy and start fresh dynamics/replay.
 Resume preserves rank-local replay boundaries but does not restore simulator
 physics or promise bitwise continuation. Logs report averages across ranks.
-The physical schema is now version 2: link-origin velocity, world-frame goal
-orientations in replay, and a critic built from imagined physical state,
-reference and ξ. Full resume from older physical schemas is rejected; use
+The physical schema is now version 4: policy imagination uses immutable clip
+references independently of real episode boundaries, and complete context
+includes detailed simulator properties. Full resume from older physical schemas is rejected; use
 `+resume=false checkpoint=/path/to/old/last.pt` to load only its FSQ policy and
-refit the world model and critic.
+refit the world model and critic. Full resume also checks the critic future
+frame count and interval, physical-context layout and numerical settings;
+matching network dimensions alone are insufficient.
 
 ## Observations, references, and replay
 
@@ -162,23 +170,31 @@ The WAM state is the canonical 71-dimensional physical state. The actor's
 single-step proprioceptive frame is reconstructed from predicted physical
 states, so it does not need to equal the WAM state. The `tokenizer` group
 remains outside the dynamics model: G1 retargeted,
-teleoperation, and SMPL references follow their logged timeline. Robot-relative
+teleoperation, and SMPL references follow the same clip's reference timeline. Robot-relative
 G1/teleop/SMPL orientations are stored in world coordinates and transformed
 back using the predicted robot rotation before entering Sonic's original
 encoder -> FSQ -> decoder at each imagined step. Reference-local VR points and
-other exogenous features are retained unchanged. This linear conversion also
-preserves the observation noise stored during collection. WAM
+other exogenous features are retained unchanged. Immutable reference banks
+store clean observations; tokenizer noise, clipping and scaling are applied
+in the simulator's order after converting to the imagined robot frame. WAM
 therefore receives only `(physical_state, action, ξ)` and shares one robot
 dynamics model across all three target representations. FSQ tokens are never
 passed to WAM. The physical WAM uses SuperMimic's frame-local invariant input
 and predicts local `dp, dtheta, dv, dw, dq, dqd` increments before integrating
-them back into the 71-dimensional state. The default `wam_context` observation
-is SuperMimic's 33-dimensional `ξ = [friction, joint-default offsets (29),
-torso CoM offset (3)]`; it is replayed at every transition and fed to WAM and
-the critic at the corresponding imagined timestep.
+them back into the 71-dimensional state. With `complete_context: true`, ξ keeps
+SuperMimic's 33-dimensional prefix `[mean static friction, joint-default
+offsets (29), torso CoM offset (3)]` and appends every collision shape's static
+friction, dynamic friction and restitution; every body's mass, 3x3 inertia and
+local CoM pose; and every joint's default-position offset. Its size is
+`33 + 3*S + 17*B + J` for S collision shapes, B bodies and J joints. Ordered
+body/joint names, shape ordering and tensor conventions are saved and checked
+on full resume. Properties are read from PhysX and cached until a material,
+mass or CoM event invalidates the snapshot; calibration offsets are read fresh.
+The complete vector conditions WAM and critic, never FSQ. Within independent
+policy imagination ξ stays fixed to the sampled seed episode.
 
 Replay stores the current and next physical state, reference state,
-actor observations, and goals needed to re-run
+actor observations, goals and immutable reference indices needed to re-run
 the Sonic actor, together with the previous executed body action for the
 SuperMimic action-rate term. Those goal tensors are not WAM inputs and no
 modality label is used by the dynamics model. The old combined
@@ -188,10 +204,34 @@ checkpoints.
 Trainer observation keys refer to the dictionary returned by `ManagerEnvWrapper`.
 Physical WAM sets `critic_observation_keys: []`: Sonic's `critic_obs` contains
 the logged real robot trajectory and is not used for imagined states. The
-physical critic uses the complete predicted state (including XY and heading),
-reference state and ξ, with its own synchronized normalizer. Actor joint
+physical critic receives state invariants, joint/body/root tracking errors,
+relative root orientation, ξ, and raw robot future-reference features, with its
+own synchronized normalizer. Tracking errors are recomputed through FK using
+the imagined robot; they retain gradients to its XY, heading and joint state.
+The critic never consumes actor encoder outputs or FSQ tokens. Actor joint
 calibration is reconstructed from nominal positions and the sampled ξ offsets,
 never from the current simulator environment rows.
+
+With 14 tracked bodies and ten future frames, the shared critic has
+`881 + context_dim` inputs (914 in legacy 33-D context mode). It combines
+`151 + context_dim` state/tracking/context values with 730 reference-only future
+features. Each future frame contains displacement and orientation in
+the current reference's heading frame, future local root velocities, joint
+positions and scaled joint velocities. All actor modalities use this same
+canonical robot representation. The default `critic_future_frames` and
+`critic_future_dt` follow the G1 command's frame count and interval (ten frames
+at 0.1 seconds in `sonic_release`, starting at the current frame). Set
+`++trainer.settings.critic_future_dt=0.02` to use a 20-ms critic grid instead.
+The interval must be a positive multiple of the control timestep.
+
+Independent imagination reconstructs critic windows from immutable raw 71-D
+clip frames, clamped within that clip. Each clip's physical and multimodal
+references are stored once on CPU and survive motion-library subset reloads;
+replay stores two integer indices per transition. Old generations are retained
+while replay still refers to them. This avoids storing two duplicate critic
+windows per replay transition. Complete context does increase replay storage;
+its dimension depends on the actual loaded robot. Sampled policy trajectories
+and fitting windows are transferred to GPU.
 
 `SequenceReplayBuffer` stores actual noisy, clipped actions. Samples stay in
 one environment and in chronological order across ring wraparound. Reward and
@@ -199,11 +239,17 @@ termination supervision include the final transition. Dynamics supervision
 uses a pre-reset physical state cached by the aligned termination callbacks for
 the final transition. When no current-step cache is available, the terminal
 target remains masked rather than learning the reset jump. Later steps are
-masked. Truncations are
-not learned as physical termination. Imagined rollouts advance the replayed
-goal sequence independently of WAM and bootstrap at each sample's valid end.
-References and ξ hold their last valid values across reset boundaries, and
-critic statistics include only valid states and their one bootstrap state. The
+masked. External velocity-push events are recorded separately; the pushed
+transition and the remainder of its autoregressive fitting window do not
+supervise deterministic dynamics. Real pushes and their recovery states remain
+available to collection and policy-start sampling. Truncations are not learned
+as physical termination. Real bool done only controls resets and fitting-window
+continuity. With `independent_imagination: true`, actor starts are sampled
+independently of subsequent real done values. Their clip references advance for
+H steps, limited only by the actual clip end, and analytic soft termination
+determines survival weights and their gradients. A behaviour-policy fall does
+not stop a new imagined trajectory. Critic statistics include valid imagined
+states and their bootstrap state. The
 actor history is advanced from the predicted single-step proprioceptive
 observation.
 Optional replay checkpoints seal episode boundaries before collecting from a
@@ -213,9 +259,17 @@ The WAM defaults follow SuperMimic's training scale: 1000 replay steps per
 environment, world-model batch size 2048 (policy imagination batch 4096), action noise 0.1, learning rate
 2e-4 with cosine decay to 3% over 250k iterations, five critic epochs with
 four minibatches, UTD 0.4, 64-step warmup, and 500 world-model-only
-iterations. Reward and termination are analytic functions of predicted and
+iterations. Physical WAM output deltas use an independent normalizer with
+epsilon 1e-4. Rollout errors use `max(delta_std, state_error_floor)` with floors
+`[.003, .005, .02, .05, .003, .05]` for position, rotation, linear velocity,
+angular velocity, joint position and joint velocity. Input and critic
+normalizers retain their separate scales. Reward and termination are analytic functions of predicted and
 reference physical states; they are not learned heads. Observation noise on
-the WAM actor frame follows SuperMimic's table. IsaacLab remains the simulator.
+the WAM actor frame uses uniform half-widths gravity .05, angular velocity .2,
+joint position .01, joint velocity .5 and action 0. The same shared definition
+configures real training, imagined frames and default checkpoint evaluation;
+override `trainer.settings.observation_noise` to change all three together.
+IsaacLab remains the simulator.
 Non-finite losses or gradients reject the update. Real simulator reward and
 imagined reward are logged separately. Validation must compare open-loop model
 errors and real tracking returns, not just an increasing imagined return.

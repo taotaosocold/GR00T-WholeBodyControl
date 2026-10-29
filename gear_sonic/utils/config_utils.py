@@ -4,6 +4,57 @@ from pathlib import Path
 from loguru import logger
 from omegaconf import OmegaConf, open_dict
 
+from gear_sonic.utils.wam_noise import wam_observation_noise
+
+
+def configure_wam_context(config):
+    """Enable detailed simulator context only for the physical WAM branch."""
+    target = str(OmegaConf.select(config, "trainer._target_", default=""))
+    if target.rsplit(".", 1)[-1] != "WAMTrainer":
+        return False
+    if OmegaConf.select(config, "world_model.cfg.state_type", default="flat") != "physical":
+        return False
+    enabled = bool(OmegaConf.select(config, "trainer.settings.complete_context", default=False))
+    term = OmegaConf.select(config, "manager_env.observations.wam_context.xi")
+    if term is None:
+        raise ValueError("Complete physical WAM context requires the wam_context.xi observation")
+    with open_dict(term):
+        if term.get("params") is None:
+            term.params = {}
+        with open_dict(term.params):
+            term.params.complete = enabled
+    return True
+
+
+def configure_wam_observations(config):
+    """Use the same WAM sensor noise for policy evaluation and imagined frames.
+
+    Collection builds the actor history from the single-frame ``wam`` group;
+    evaluation uses the native ``policy`` history. Both groups therefore need
+    identical per-term corruption. This helper is inactive for PPO/flat WAM.
+    """
+    target = str(OmegaConf.select(config, "trainer._target_", default=""))
+    if target.rsplit(".", 1)[-1] != "WAMTrainer":
+        return False
+    if OmegaConf.select(config, "world_model.cfg.state_type", default="flat") != "physical":
+        return False
+    widths = wam_observation_noise(OmegaConf.select(config, "trainer.settings", default={}))
+    for name in ("policy", "wam"):
+        group = OmegaConf.select(config, f"manager_env.observations.{name}")
+        if group is None:
+            raise ValueError(f"Physical WAM requires the {name!r} observation group")
+        with open_dict(group):
+            group.enable_corruption = any(width > 0 for width in widths.values())
+            for term_name, width in widths.items():
+                if term_name in group and group[term_name] is not None:
+                    with open_dict(group[term_name]):
+                        group[term_name].noise = {
+                            "_target_": "isaaclab.utils.noise.AdditiveUniformNoiseCfg",
+                            "n_min": -width,
+                            "n_max": width,
+                        }
+    return True
+
 
 def configure_wam_terminations(config):
     """Select matching hard/soft failure rules for new physical WAM runs.

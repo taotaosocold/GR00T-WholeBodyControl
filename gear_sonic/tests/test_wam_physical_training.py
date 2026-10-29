@@ -16,6 +16,7 @@ from gear_sonic.trl.modules.wam import physical_state_parts
 from gear_sonic.trl.trainer.wam_trainer import WAMTrainer
 from gear_sonic.utils.wam_kinematics import G1_MUJOCO_JOINT_NAMES
 from gear_sonic.utils.wam_observations import WAMGoalObservations
+from gear_sonic.utils.wam_reference import WAMReferenceBank
 
 
 class Config(dict):
@@ -112,6 +113,13 @@ class PhysicalVectorEnv:
         reference[:, 6] = (self.reference_yaw / 2).sin()
         return reference
 
+    def future_reference(self, num_frames, *, frame_stride=1, next_step=False):
+        reference = self.reference()[:, None].expand(-1, num_frames, -1).clone()
+        steps = torch.arange(num_frames) * frame_stride + int(next_step)
+        reference[..., 0] += steps[None] * 0.002
+        reference[..., 7] = 0.1
+        return reference.flatten(1)
+
     def goal(self):
         relative = yaw_matrix(self.reference_yaw - self.yaw)[..., :2].flatten(-2)
         routing = torch.eye(3)[torch.arange(self.num_envs) % 3]
@@ -176,9 +184,11 @@ class PhysicalTrainingTests(unittest.TestCase):
                 "reference_observation_keys": ["wam_reference"],
                 "critic_observation_keys": ["critic_obs"],
                 "align_real_termination": True, "align_real_reward": True,
+                "independent_imagination": False,
                 "window": 2, "horizon": 2, "replay_steps": 8, "replay_envs": 4,
                 "batch_size": 3, "policy_batch_size": 3, "world_updates": 1,
                 "critic_epochs": 1, "critic_minibatches": 1, "action_noise": 0.0,
+                "critic_future_frames": 3,
                 **settings,
             },
             world_model_config={
@@ -193,7 +203,44 @@ class PhysicalTrainingTests(unittest.TestCase):
         # The small scene has no motion library. Preserve the production
         # trainer's pre-step capture point while supplying this scene's target.
         trainer._next_physical_reference = lambda: env.reference().clone()
+        trainer._physical_future_reference = lambda *, next_step=False: env.future_reference(
+            trainer.critic_future_frames,
+            frame_stride=trainer.critic_future_stride,
+            next_step=next_step,
+        )
         return trainer
+
+    def test_independent_imagination_continues_past_behaviour_done_with_seed_physics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory, horizon=4, policy_batch_size=2, terminate_first=True)
+            trainer.collect(4)
+            seed = trainer.replay.sample_starts(2)
+            # A behaviour policy failure is irrelevant to the new rollout.
+            seed["done"].fill_(True)
+            seed["terminated"].fill_(True)
+            bank = WAMReferenceBank(TOKENIZER_SPECS)
+            reference = trainer.obs["wam_reference"][:1].expand(10, -1).clone()
+            reference[:, 0] = torch.arange(10) * 0.01
+            goal = trainer.goal_observations.to_world(
+                trainer.obs["tokenizer"][:1], trainer.obs["wam_state"][:1],
+            ).expand(10, -1).clone()
+            # All three input modalities advance on the original reference.
+            goal[:, 33] = torch.arange(10).float()
+            key = bank.register(reference, goal)
+            seed["reference_index"] = torch.tensor([[key, 0], [key, 1]])
+            trainer.reference_bank = bank
+            trainer.independent_imagination = True
+            with patch.object(trainer.replay, "sample_starts", return_value=seed):
+                batch = trainer._sample_policy_batch(4)
+                self.assertTrue(batch["mask"].all())
+                torch.testing.assert_close(batch["goals"][0, :, 33], torch.arange(5).float())
+                torch.testing.assert_close(batch["contexts"], seed["context"][:, None].expand(-1, 4, -1))
+                # The soft analytical head remains responsible for survival.
+                with patch.object(trainer, "_analytic_termination", side_effect=lambda state, ref: state[:, 2] * 0):
+                    metrics = trainer.improve_policy()
+            self.assertEqual(metrics["actor/effective_horizon"], 4)
+            self.assertAlmostEqual(metrics["actor/survival"], 1)
+            self.assertTrue(all(math.isfinite(value) for value in metrics.values()))
 
     def test_collection_saves_world_goals_and_imagination_uses_predicted_robot_frame(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -216,6 +263,9 @@ class PhysicalTrainingTests(unittest.TestCase):
             torch.testing.assert_close(saved["goal"][0], expected[trainer.replay_env_ids])
             self.assertFalse(torch.allclose(saved["goal"][0, :, 3:15], initial_goal[trainer.replay_env_ids, 3:15]))
             self.assertNotIn("critic_state", saved)
+            self.assertEqual(saved["future_reference"].shape[-1], 3 * 71)
+            self.assertEqual(trainer.world_model.goal_dim, 0)
+            self.assertEqual(trainer.layout.goal_dim, 42)
             batch = trainer.replay.sample(3, 2)
             seen = []
             original = trainer._action
@@ -248,9 +298,10 @@ class PhysicalTrainingTests(unittest.TestCase):
             reference = trainer.obs["wam_reference"][:1]
             context = trainer.obs["wam_context"][:1]
             features = trainer._critic_input_with_aux(
-                state, reference, torch.full((1, 7), float("nan")), context
+                state, reference, torch.full((1, 7), float("nan")), context,
+                future_reference=trainer._physical_future_reference()[:1],
             )
-            self.assertEqual(features.shape[-1], 71 + 71 + 33)
+            self.assertEqual(features.shape[-1], 71 + 29 + 42 + 3 + 6 + 33 + 3 * 73)
             self.assertTrue(torch.isfinite(features).all())
             # A fixed value head isolates input observability from random
             # initialization of the trainable critic network.
@@ -259,6 +310,46 @@ class PhysicalTrainingTests(unittest.TestCase):
             xy_grad, yaw_grad = torch.autograd.grad(value, (xy, yaw))
             self.assertTrue((xy_grad.abs() > 1e-7).all())
             self.assertGreater(yaw_grad.abs().item(), 1e-7)
+
+    def test_critic_distinguishes_future_motion_with_identical_current_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory)
+            state = trainer.obs["wam_state"][:1]
+            reference = trainer.obs["wam_reference"][:1]
+            context = trainer.obs["wam_context"][:1]
+            future = trainer._physical_future_reference()[:1].reshape(1, 3, 71)
+            different_future = future.clone()
+            different_future[:, 1:, 13] += 0.3
+            first = trainer._critic_input_with_aux(
+                state, reference, context=context, future_reference=future,
+            )
+            second = trainer._critic_input_with_aux(
+                state, reference, context=context, future_reference=different_future,
+            )
+            torch.testing.assert_close(first[:, :-3 * 73], second[:, :-3 * 73])
+            self.assertFalse(torch.allclose(first[:, -3 * 73:], second[:, -3 * 73:]))
+            # Reference information is a critic condition. It does not become
+            # an extra FSQ modality or a learned dynamics input.
+            self.assertEqual(trainer.world_model.goal_dim, 0)
+            self.assertEqual(trainer.world_model.context_dim, 33)
+            self.assertEqual(trainer.layout.goal_dim, 42)
+
+    def test_tracking_features_are_recomputed_from_differentiable_imagined_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory)
+            state = trainer.obs["wam_state"][:1].clone()
+            state[:, 16] += 0.2  # Left knee differs from the current target.
+            state.requires_grad_(True)
+            features = trainer._critic_input_with_aux(
+                state, trainer.obs["wam_reference"][:1],
+                context=trainer.obs["wam_context"][:1],
+                future_reference=trainer._physical_future_reference()[:1],
+            )
+            # Invariant state71, joint error29, then14 body-position errors.
+            body_error = features[:, 100:142]
+            gradient = torch.autograd.grad(body_error.square().sum(), state)[0]
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertGreater(gradient[:, 16].abs().item(), 1e-7)
 
     def test_imagined_proprioception_uses_each_replay_samples_calibration(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -278,12 +369,17 @@ class PhysicalTrainingTests(unittest.TestCase):
     def test_terminal_pre_reset_state_is_replayed_and_supervises_world_model(self):
         with tempfile.TemporaryDirectory() as directory:
             trainer = self.make_trainer(directory, terminate_first=True, window=1, horizon=1)
+            expected_future = trainer._physical_future_reference(next_step=True).clone()
             trainer.collect(1)
             saved = trainer.replay.state_dict()["storage"]
             slot = int((trainer.replay_env_ids == 0).nonzero()[0])
             self.assertTrue(saved["done"][0, slot])
             self.assertTrue(saved["next_state_valid"][0, slot])
             torch.testing.assert_close(saved["next_state"][0, slot], trainer.env.last_terminal[0])
+            torch.testing.assert_close(
+                saved["next_future_reference"][0], expected_future[trainer.replay_env_ids],
+            )
+            self.assertLess(saved["next_future_reference"][0, slot, 0].item(), 1.0)
             self.assertEqual(trainer.obs["wam_state"][0, 0].item(), 100.0)
             batch = trainer.replay.sample(64, 1)
             self.assertTrue(batch["dones"].any())
@@ -333,8 +429,11 @@ class PhysicalTrainingTests(unittest.TestCase):
             for row, length in enumerate(lengths.tolist()):
                 batch["contexts"][row, length:] = 1000.0 * (row + 1)
                 batch["references"][row, length + 1:, :3] = 10000.0 * (row + 1)
+                future = batch["future_references"].reshape(2, 5, 3, 71)
+                future[row, length + 1:, :, :3] = 20000.0 * (row + 1)
             expected_context = batch["contexts"][torch.arange(2), lengths - 1].clone()
             expected_reference = batch["references"][torch.arange(2), lengths].clone()
+            expected_future = batch["future_references"][torch.arange(2), lengths].clone()
             old_count = trainer.critic_norm.count.item()
             old_mean = trainer.critic_norm.mean.clone()
             old_std = trainer.critic_norm.std().clone()
@@ -350,9 +449,12 @@ class PhysicalTrainingTests(unittest.TestCase):
             bootstrap_state, bootstrap_reference, _, bootstrap_context = feature_call.call_args_list[0].args
             torch.testing.assert_close(bootstrap_context, expected_context)
             torch.testing.assert_close(bootstrap_reference, expected_reference)
-            expected_bootstrap = torch.cat((
-                bootstrap_state, expected_reference, trainer.world_model.context_norm(expected_context)
-            ), -1)
+            bootstrap_future = feature_call.call_args_list[0].kwargs["future_reference"]
+            torch.testing.assert_close(bootstrap_future.flatten(1), expected_future)
+            expected_bootstrap = trainer._critic_input_with_aux(
+                bootstrap_state, expected_reference, context=expected_context,
+                future_reference=expected_future,
+            )
             torch.testing.assert_close(
                 critic_call.call_args_list[0].args[0], (expected_bootstrap - old_mean) / old_std
             )
@@ -360,7 +462,8 @@ class PhysicalTrainingTests(unittest.TestCase):
             sequence_state, reference, critic_state, context = feature_call.call_args_list[1].args
             valid_states = torch.arange(5)[None] <= lengths[:, None]
             expected_valid = trainer._critic_input_with_aux(
-                sequence_state, reference, critic_state, context
+                sequence_state, reference, critic_state, context,
+                future_reference=feature_call.call_args_list[1].kwargs["future_reference"],
             )[valid_states]
             update_values = normalization_call.call_args.args[0]
             torch.testing.assert_close(update_values, expected_valid)
@@ -369,7 +472,7 @@ class PhysicalTrainingTests(unittest.TestCase):
             torch.testing.assert_close(trainer.critic_norm.mean, expected_valid.mean(0))
             self.assertTrue(all(math.isfinite(value) for value in metrics.values()))
 
-    def test_physical_v2_checkpoint_restores_training_and_replay_schema(self):
+    def test_physical_checkpoint_restores_training_and_replay_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             trainer = self.make_trainer(directory, save_replay=True)
             trainer.collect(4)
@@ -380,10 +483,12 @@ class PhysicalTrainingTests(unittest.TestCase):
             checkpoint = Path(directory) / "physical.pt"
             trainer.save_checkpoint(checkpoint)
             payload = torch.load(checkpoint, weights_only=False)
-            self.assertEqual(payload["wam_physical_schema_version"], 2)
+            self.assertEqual(payload["wam_physical_schema_version"], 4)
             self.assertEqual(payload["wam_layout"]["critic"], [])
-            self.assertEqual(payload["wam_critic_norm"]["mean"].numel(), 71 + 71 + 33)
-            self.assertEqual(next(iter(payload["wam_critic_state_dict"].values())).shape[-1], 71 + 71 + 33)
+            self.assertEqual(payload["wam_critic_spec"], trainer.critic_spec)
+            dimension = 71 + 29 + 42 + 3 + 6 + 33 + 3 * 73
+            self.assertEqual(payload["wam_critic_norm"]["mean"].numel(), dimension)
+            self.assertEqual(next(iter(payload["wam_critic_state_dict"].values())).shape[-1], dimension)
             restored = self.make_trainer(Path(directory) / "restored", save_replay=True)
             restored.load_checkpoint(checkpoint, resume=True)
             for before, after in (
@@ -402,7 +507,24 @@ class PhysicalTrainingTests(unittest.TestCase):
             torch.testing.assert_close(restored.replay_env_ids, trainer.replay_env_ids)
             replay = restored.replay.state_dict()["storage"]
             torch.testing.assert_close(replay["goal"], payload["wam_replay"]["storage"]["goal"])
+            torch.testing.assert_close(
+                replay["future_reference"], payload["wam_replay"]["storage"]["future_reference"],
+            )
             self.assertTrue(replay["done"][-1].all())  # Resumed physics starts a new segment.
+
+    def test_resume_rejects_changed_future_spacing_with_same_critic_dimension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self.make_trainer(directory)
+            checkpoint = Path(directory) / "physical.pt"
+            trainer.save_checkpoint(checkpoint)
+            restored = self.make_trainer(Path(directory) / "changed", critic_future_dt=0.04)
+            self.assertEqual(trainer.critic_input_dim, restored.critic_input_dim)
+            with self.assertRaisesRegex(ValueError, "critic"):
+                restored.load_checkpoint(checkpoint, resume=True)
+            # A spacing change does not affect the deployment policy schema.
+            restored.load_checkpoint(checkpoint, resume=False)
+            for name, value in trainer.policy.state_dict().items():
+                torch.testing.assert_close(restored.policy.state_dict()[name], value)
 
     def test_old_physical_checkpoint_requires_policy_only_loading(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -411,7 +533,7 @@ class PhysicalTrainingTests(unittest.TestCase):
                 for parameter in source.policy.parameters():
                     parameter.add_(0.25)
             payload = source._checkpoint_payload()
-            payload.pop("wam_physical_schema_version")
+            payload["wam_physical_schema_version"] = 2
             payload["wam_layout"]["critic"] = ["critic_obs"]
             # Simulate incompatible old learned state so accidental full
             # loading also fails instead of silently passing this regression.

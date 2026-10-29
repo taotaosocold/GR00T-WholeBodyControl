@@ -213,6 +213,7 @@ class TrainingTests(unittest.TestCase):
                 settings={
                     "state_observation_keys": ["wam_state"], "goal_observation_keys": ["tokenizer"],
                     "reference_observation_keys": ["wam_reference"], "align_real_termination": True,
+                    "independent_imagination": False,
                     "window": 1, "horizon": 1, "replay_steps": 2, "replay_envs": 6,
                 },
                 world_model_config={
@@ -224,9 +225,13 @@ class TrainingTests(unittest.TestCase):
                 },
             )
             expected = trainer._next_physical_reference().clone()
+            expected_future = trainer._physical_future_reference(next_step=True).clone()
             trainer.collect(1)
             saved = trainer.replay.state_dict()["storage"]
             torch.testing.assert_close(saved["next_reference"][0], expected[trainer.replay_env_ids])
+            torch.testing.assert_close(
+                saved["next_future_reference"][0], expected_future[trainer.replay_env_ids],
+            )
             self.assertGreater(trainer.obs["wam_reference"][0, 2].item(), 100)
             self.assertAlmostEqual(expected[0, 2].item(), 1.1, places=6)
             self.assertTrue(saved["terminated"].any())
@@ -314,7 +319,13 @@ class TrainingTests(unittest.TestCase):
                 return obs
 
         config_path = Path(__file__).resolve().parents[1] / "config/trainer/wam.yaml"
-        settings = OmegaConf.to_container(OmegaConf.load(config_path).settings, resolve=True)
+        config = OmegaConf.merge(
+            {"manager_env": {"commands": {"motion": {
+                "num_future_frames": 10, "dt_future_ref_frames": 0.1,
+            }}}},
+            OmegaConf.load(config_path),
+        )
+        settings = OmegaConf.to_container(config.settings, resolve=True)
         self.assertEqual(settings["critic_observation_keys"], [])
         settings.update(
             window=3, horizon=3, batch_size=4, policy_batch_size=4,

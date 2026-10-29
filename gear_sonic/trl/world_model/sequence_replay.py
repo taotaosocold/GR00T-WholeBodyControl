@@ -28,9 +28,11 @@ class SequenceReplayBuffer:
     _ACTOR_FIELDS = ("actor_state", "next_actor_state")
     _CONTEXT_FIELDS = ("context",)
     _REFERENCE_FIELDS = ("reference", "next_reference")
+    _FUTURE_REFERENCE_FIELDS = ("future_reference", "next_future_reference")
     _CRITIC_FIELDS = ("critic_state", "next_critic_state")
     _PREVIOUS_ACTION_FIELDS = ("previous_action",)
     _NEXT_STATE_FIELDS = ("next_state_valid",)
+    _REFERENCE_INDEX_FIELDS = ("reference_index",)
     # Preserve the old introspection hook for callers that only use the base
     # observation replay format.
     _FIELDS = _BASE_FIELDS
@@ -70,6 +72,9 @@ class SequenceReplayBuffer:
         next_critic_state: Tensor | None = None,
         previous_action: Tensor | None = None,
         next_state_valid: Tensor | None = None,
+        future_reference: Tensor | None = None,
+        next_future_reference: Tensor | None = None,
+        reference_index: Tensor | None = None,
     ) -> None:
         """Store one vectorized step, including actual executed actions.
 
@@ -79,6 +84,9 @@ class SequenceReplayBuffer:
         done transition unless ``next_state_valid`` confirms that a pre-reset
         terminal state was captured. That state supervises the last transition,
         while the episode mask still excludes subsequent reset observations.
+        Optional future-reference tensors contain the flattened raw robot
+        reference window at each corresponding state, independently of the
+        actor's multimodal goal representation.
         """
         if state.ndim != 2 or action.ndim != 2:
             raise ValueError("state and action must have shapes [N,D] and [N,A]")
@@ -117,6 +125,17 @@ class SequenceReplayBuffer:
                 raise ValueError("reference tensors must have shapes [N,D]")
             if reference.shape != next_reference.shape or reference.shape[0] != n:
                 raise ValueError("reference batches must match")
+        if (future_reference is None) != (next_future_reference is None):
+            raise ValueError("future_reference and next_future_reference must be provided together")
+        if future_reference is not None:
+            if future_reference.ndim != 2 or next_future_reference.ndim != 2:
+                raise ValueError("future reference tensors must have shapes [N,D]")
+            if (
+                future_reference.shape != next_future_reference.shape
+                or future_reference.shape[0] != n
+                or future_reference.shape[1] < 1
+            ):
+                raise ValueError("future reference batches must match [N,D] with positive D")
         if (critic_state is None) != (next_critic_state is None):
             raise ValueError("critic_state and next_critic_state must be provided together")
         if critic_state is not None:
@@ -140,6 +159,10 @@ class SequenceReplayBuffer:
         if next_state_valid.numel() != n:
             raise ValueError("next_state_valid must contain one value per environment")
         values["next_state_valid"] = next_state_valid.detach().reshape(n).to(device="cpu", dtype=torch.bool)
+        if reference_index is not None:
+            if reference_index.shape != (n, 2) or reference_index.dtype != torch.long:
+                raise ValueError("reference_index must contain integer [clip key, frame] pairs")
+            values["reference_index"] = reference_index.detach().cpu().clone()
         if goal is not None:
             values["goal"] = goal.detach().to(device="cpu", dtype=torch.float32)
             values["next_goal"] = next_goal.detach().to(device="cpu", dtype=torch.float32)
@@ -151,6 +174,9 @@ class SequenceReplayBuffer:
         if reference is not None:
             values["reference"] = reference.detach().to(device="cpu", dtype=torch.float32)
             values["next_reference"] = next_reference.detach().to(device="cpu", dtype=torch.float32)
+        if future_reference is not None:
+            values["future_reference"] = future_reference.detach().to(device="cpu", dtype=torch.float32)
+            values["next_future_reference"] = next_future_reference.detach().to(device="cpu", dtype=torch.float32)
         if critic_state is not None:
             values["critic_state"] = critic_state.detach().to(device="cpu", dtype=torch.float32)
             values["next_critic_state"] = next_critic_state.detach().to(device="cpu", dtype=torch.float32)
@@ -180,6 +206,7 @@ class SequenceReplayBuffer:
         device: torch.device | str | None = None,
         *,
         generator: torch.Generator | None = None,
+        fields=None,
     ) -> dict[str, Tensor]:
         """Sample ``[B,K,...]`` windows without crossing the ring's newest end.
 
@@ -216,7 +243,9 @@ class SequenceReplayBuffer:
             "dones": done,
             "terminated": windows["terminated"],
             "mask": mask,
-            "dynamics_mask": mask & windows["next_state_valid"],
+            # An unobserved impulse breaks every later autoregressive target
+            # from this seed, even when it does not reset the simulator.
+            "dynamics_mask": mask & windows["next_state_valid"].cumprod(1).bool(),
         }
         if "goal" in windows:
             output["goals"] = torch.cat([windows["goal"][:, :1], windows["next_goal"]], dim=1)
@@ -230,15 +259,48 @@ class SequenceReplayBuffer:
             output["references"] = torch.cat(
                 [windows["reference"][:, :1], windows["next_reference"]], dim=1
             )
+        if "future_reference" in windows:
+            output["future_references"] = torch.cat(
+                [windows["future_reference"][:, :1], windows["next_future_reference"]], dim=1
+            )
         if "critic_state" in windows:
             output["critic_states"] = torch.cat(
                 [windows["critic_state"][:, :1], windows["next_critic_state"]], dim=1
             )
         if "previous_action" in windows:
             output["previous_actions"] = windows["previous_action"]
+        if fields is not None:
+            missing = set(fields) - set(output)
+            if missing:
+                raise ValueError(f"Replay sample is missing requested fields: {sorted(missing)}")
+            output = {key: output[key] for key in fields}
         if device is not None:
             output = {key: value.to(device=device) for key, value in output.items()}
         return output
+
+    def sample_starts(self, batch_size, device=None, *, eligible=None):
+        """Sample individual real states without consulting subsequent done.
+
+        ``eligible`` may reject reference clips that have no next frame. The
+        real episode after a sampled start never limits imagined survival.
+        """
+        if batch_size < 1 or not self._size:
+            raise ValueError("policy starts require a nonempty replay and positive batch")
+        keep = torch.ones(self._size, self.num_envs, dtype=torch.bool)
+        if eligible is not None:
+            keep &= eligible(self._storage["reference_index"][:self._size])
+        candidates = keep.flatten().nonzero(as_tuple=False).flatten()
+        if not candidates.numel():
+            raise ValueError("Replay has no motion reference with a valid next frame")
+        selected = candidates[torch.randint(len(candidates), (batch_size,))]
+        times, envs = selected // self.num_envs, selected % self.num_envs
+        result = {key: value[times, envs] for key, value in self._storage.items()}
+        return {key: value.to(device) for key, value in result.items()} if device is not None else result
+
+    def reference_indices(self):
+        """Keys retained by the ring, for pruning unloaded reference generations."""
+        value = self._storage.get("reference_index")
+        return None if value is None else value[:self._size]
 
     def state_dict(self) -> dict[str, Any]:
         """Return filled storage in chronological order, independent of cursor."""
@@ -274,9 +336,11 @@ class SequenceReplayBuffer:
             | set(self._ACTOR_FIELDS)
             | set(self._CONTEXT_FIELDS)
             | set(self._REFERENCE_FIELDS)
+            | set(self._FUTURE_REFERENCE_FIELDS)
             | set(self._CRITIC_FIELDS)
             | set(self._PREVIOUS_ACTION_FIELDS)
             | set(self._NEXT_STATE_FIELDS)
+            | set(self._REFERENCE_INDEX_FIELDS)
         ):
             raise ValueError("replay snapshot contains unknown transition tensors")
         if size and not set(self._BASE_FIELDS).issubset(fields):
@@ -287,6 +351,19 @@ class SequenceReplayBuffer:
             raise ValueError("replay snapshot must contain both actor state tensors")
         if fields.intersection(self._REFERENCE_FIELDS) and not set(self._REFERENCE_FIELDS).issubset(fields):
             raise ValueError("replay snapshot must contain both reference tensors")
+        if fields.intersection(self._FUTURE_REFERENCE_FIELDS):
+            if not set(self._FUTURE_REFERENCE_FIELDS).issubset(fields):
+                raise ValueError("replay snapshot must contain both future reference tensors")
+            future = storage["future_reference"]
+            next_future = storage["next_future_reference"]
+            if (
+                not isinstance(future, Tensor) or not isinstance(next_future, Tensor)
+                or future.ndim != 3 or next_future.shape != future.shape
+                or future.shape[-1] < 1
+                or "state" not in storage or not isinstance(storage["state"], Tensor)
+                or storage["state"].ndim < 2 or future.shape[:2] != storage["state"].shape[:2]
+            ):
+                raise ValueError("invalid replay future reference tensor shape")
         if fields.intersection(self._CRITIC_FIELDS) and not set(self._CRITIC_FIELDS).issubset(fields):
             raise ValueError("replay snapshot must contain both critic tensors")
         restored = {}

@@ -913,14 +913,17 @@ def wam_joint_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tens
     return values[:, order]
 
 
-def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Return SuperMimic's 33-dimensional physical context ξ.
+def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg, complete: bool = False) -> torch.Tensor:
+    """Return physical context ξ, optionally including all randomized properties.
 
     The first value is the effective friction, the next 29 values are the
     randomized default-joint offsets in MuJoCo order, and the last three are
     the torso CoM offset.  Event terms maintain the friction/CoM entries when
     the Isaac Lab version exposes those randomized properties; joint offsets
     are read directly from the current articulation defaults every step.
+    Complete mode appends per-shape static/dynamic friction and restitution,
+    and per-body mass, inertia and CoM pose. It is enabled only for WAM; the
+    default preserves the passive observation used by existing PPO configs.
     """
     asset = env.scene[asset_cfg.name]
     num_envs = int(env.scene.num_envs)
@@ -932,6 +935,13 @@ def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor
     elif xi.device != asset.device:
         xi = xi.to(device=asset.device)
         env._wam_xi = xi
+
+    if complete:
+        from gear_sonic.utils.wam_context import physical_context, physical_context_schema
+
+        result = physical_context(asset, xi)
+        env._wam_context_schema = physical_context_schema(asset)
+        return result
 
     # Material randomization is a class-based Isaac Lab event in newer
     # releases. Refresh the effective friction here as a fallback for backends

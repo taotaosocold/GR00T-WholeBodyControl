@@ -9,7 +9,7 @@ cfg:
   action_dim: 29
   # WAM is goal-free. Goal observations stay on the Sonic actor/FSQ path.
   goal_dim: 0
-  context_dim: 33
+  context_dim: 0  # inferred from the simulator's complete physical context
   hidden: [2048, 2048, 2048]
   term_hidden: [128, 128]
   reward_hidden: [128, 128]
@@ -17,6 +17,9 @@ cfg:
   learn_reward: false
   reward_loss_coef: 0.0
   residual_scale: 1.0
+  # Output deltas and rollout-error weights have separate physical scales.
+  delta_norm_eps: 0.0001
+  state_error_floor: [0.003, 0.005, 0.02, 0.05, 0.003, 0.05]
   state_type: physical
   reward_mode: analytic
   termination_mode: analytic

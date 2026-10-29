@@ -124,6 +124,8 @@ def main(override_config: omegaconf.OmegaConf):
     else:
         config = override_config
 
+    config_utils.configure_wam_context(config)
+    config_utils.configure_wam_observations(config)
     meta_path = Path(config.experiment_dir) / "meta.yaml"
     if meta_path.exists():
         meta = yaml.safe_load(open(meta_path))  # noqa: SIM115

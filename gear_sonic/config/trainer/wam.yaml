@@ -13,13 +13,17 @@ settings:
   # Actor-only goal stream. It is replayed for encoder/FSQ BPTT and never
   # passed to the WAM dynamics.
   goal_observation_keys: [tokenizer]
-  # SuperMimic ξ = friction, joint-default offsets, and torso CoM offset.
-  # It is replayed per timestep and is consumed by WAM, never by FSQ.
+  # Preserve SuperMimic's 33 calibration values, then append complete material,
+  # mass, inertia and CoM properties in a versioned simulator layout.
+  # ξ is consumed by WAM/critic and never by FSQ.
+  complete_context: true
   context_observation_keys: [wam_context]
   reference_observation_keys: [wam_reference]
-  # Physical critic uses predicted state + reference + ξ. Logged Sonic
-  # critic_obs describe the real robot, not the imagined trajectory.
+  # Shared physical critic uses FK tracking features + raw robot future + ξ.
+  # Match the G1 goal time grid while all actor modalities share this critic.
   critic_observation_keys: []
+  critic_future_frames: ${manager_env.commands.motion.num_future_frames}
+  critic_future_dt: ${manager_env.commands.motion.dt_future_ref_frames}
   # Real collection and imagination share SuperMimic's failure criteria.
   # Clip ends / the environment's episode limit remain normal truncations.
   align_real_termination: true
@@ -35,6 +39,9 @@ settings:
   replay_envs: 4096
   window: 8
   horizon: 32
+  # Real done masks supervise dynamics; actor imagination follows its own
+  # soft termination and the immutable reference clip's actual end.
+  independent_imagination: true
   batch_size: 2048
   policy_batch_size: 4096
   world_updates: 10
@@ -50,7 +57,10 @@ settings:
   wm_only_iters: 500
   reset_sampling: return
   action_noise: 0.1
+  # Jointly optimize encoder/FSQ/decoder with SuperMimic's summed return.
+  actor_return_reduction: sum
   aux_loss_scale: 1.0
+  gradient_diagnostics_interval: 100
   save_interval: 500
   save_replay: false
   compile: false
