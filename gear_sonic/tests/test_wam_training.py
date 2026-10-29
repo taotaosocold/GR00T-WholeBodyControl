@@ -144,6 +144,109 @@ def make_original_fsq_actor():
 
 
 class TrainingTests(unittest.TestCase):
+    def test_physical_reference_survives_auto_reset_during_collection(self):
+        class Library:
+            def get_time_step_total(self, ids):
+                return torch.full_like(ids, 8)
+
+            def get_body_pos_w(self, ids, frames):
+                pose = torch.zeros(len(ids), 1, 3)
+                pose[:, 0, 2] = 1 + ids * 100 + frames * 0.1
+                return pose
+
+            def get_body_quat_w(self, ids, frames):
+                pose = torch.zeros(len(ids), 1, 4)
+                pose[..., 0] = 1
+                return pose
+
+            def get_body_lin_vel_w(self, ids, frames):
+                return torch.zeros(len(ids), 1, 3)
+
+            get_body_ang_vel_w = get_body_lin_vel_w
+
+            def get_dof_pos(self, ids, frames):
+                return frames[:, None].float().expand(-1, 29)
+
+            get_dof_vel = get_dof_pos
+
+        class ResetEnv(VectorEnv):
+            def __init__(self):
+                super().__init__()
+                self.config.robot.actions_dim = 29
+                self.command = SimpleNamespace(
+                    motion_lib=Library(), motion_ids=torch.zeros(self.num_envs, dtype=torch.long),
+                    motion_start_time_steps=torch.zeros(self.num_envs, dtype=torch.long),
+                    time_steps=torch.zeros(self.num_envs, dtype=torch.long), motion_anchor_body_index=0,
+                )
+                self.command_manager = SimpleNamespace(get_term=lambda name: self.command)
+
+            def _obs(self):
+                obs = super()._obs()
+                command, library = self.command, self.command.motion_lib
+                frame = command.motion_start_time_steps + command.time_steps
+                reference = torch.cat((
+                    library.get_body_pos_w(command.motion_ids, frame)[:, 0],
+                    library.get_body_quat_w(command.motion_ids, frame)[:, 0],
+                    torch.zeros(self.num_envs, 6),
+                    library.get_dof_pos(command.motion_ids, frame),
+                    library.get_dof_vel(command.motion_ids, frame),
+                ), dim=-1)
+                state = torch.zeros(self.num_envs, 71)
+                state[:, 2:4] = 1  # root height and identity quaternion
+                obs.update(wam_state=state, wam_reference=reference)
+                return obs
+
+            def step(self, payload):
+                self.command.time_steps += 1
+                self.command.motion_ids[0] = 1
+                self.command.time_steps[0] = 0  # Auto-reset to a completely different clip.
+                done = torch.zeros(self.num_envs, dtype=torch.bool)
+                done[0] = True
+                return self._obs(), torch.ones(self.num_envs), done, {"terminated": done}
+
+        with tempfile.TemporaryDirectory() as directory:
+            policy = FSQPolicy()
+            policy.decoder = nn.Linear(6, 29)
+            trainer = WAMTrainer(
+                args=SimpleNamespace(num_total_batches=1), config=Config(gamma=0.99, lam=0.95),
+                env=ResetEnv(), model=policy, log_dir=directory,
+                settings={
+                    "state_observation_keys": ["wam_state"], "goal_observation_keys": ["tokenizer"],
+                    "reference_observation_keys": ["wam_reference"], "align_real_termination": True,
+                    "window": 1, "horizon": 1, "replay_steps": 2, "replay_envs": 6,
+                },
+                world_model_config={
+                    "_target_": "gear_sonic.trl.modules.wam.StateSpaceWorldModel",
+                    "cfg": {
+                        "state_type": "physical", "hidden": [8],
+                        "reward_mode": "analytic", "termination_mode": "analytic",
+                    },
+                },
+            )
+            expected = trainer._next_physical_reference().clone()
+            trainer.collect(1)
+            saved = trainer.replay.state_dict()["storage"]
+            torch.testing.assert_close(saved["next_reference"][0], expected[trainer.replay_env_ids])
+            self.assertGreater(trainer.obs["wam_reference"][0, 2].item(), 100)
+            self.assertAlmostEqual(expected[0, 2].item(), 1.1, places=6)
+            self.assertTrue(saved["terminated"].any())
+            batch = trainer.replay.sample(64, 1, generator=torch.Generator().manual_seed(7))
+            self.assertTrue(batch["terminated"].any())
+            self.assertFalse(batch["dynamics_mask"][batch["terminated"]].any())
+
+    def test_imagined_reference_holds_terminal_frame_after_replay_boundary(self):
+        trainer = WAMTrainer.__new__(WAMTrainer)
+        trainer.physical_wam = True
+        trainer.device = torch.device("cpu")
+        batch = {
+            "references": torch.tensor([[[1.], [2.], [100.], [200.]], [[3.], [4.], [5.], [6.]]]),
+            "mask": torch.tensor([[True, False, False], [True, True, True]]),
+        }
+        torch.testing.assert_close(
+            trainer._imagination_references(batch),
+            torch.tensor([[[1.], [2.], [2.], [2.]], [[3.], [4.], [5.], [6.]]]),
+        )
+
     def make_trainer(self, directory, policy=None, checkpoint=None, resume=False):
         return WAMTrainer(
             args=SimpleNamespace(num_total_batches=1), config=Config(gamma=0.99, lam=0.95),
@@ -197,7 +300,7 @@ class TrainingTests(unittest.TestCase):
             metrics = trainer.improve_policy()
             self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in metrics.values()))
 
-    def test_default_auxiliary_keys_use_wrapped_critic_observations(self):
+    def test_flat_mode_can_explicitly_use_wrapped_critic_observations(self):
         class WrappedEnv(VectorEnv):
             def _obs(self):
                 obs = super()._obs()
@@ -212,9 +315,11 @@ class TrainingTests(unittest.TestCase):
 
         config_path = Path(__file__).resolve().parents[1] / "config/trainer/wam.yaml"
         settings = OmegaConf.to_container(OmegaConf.load(config_path).settings, resolve=True)
+        self.assertEqual(settings["critic_observation_keys"], [])
         settings.update(
             window=3, horizon=3, batch_size=4, policy_batch_size=4,
             world_updates=1, critic_epochs=1, critic_minibatches=2, replay_steps=8,
+            critic_observation_keys=["critic_obs"],
         )
         with tempfile.TemporaryDirectory() as directory:
             trainer = WAMTrainer(

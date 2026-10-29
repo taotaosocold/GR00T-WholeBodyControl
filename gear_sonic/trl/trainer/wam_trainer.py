@@ -34,24 +34,24 @@ from gear_sonic.trl.modules.wam import (
 from gear_sonic.trl.world_model.distributed import DistributedContext
 from gear_sonic.trl.world_model.sequence_replay import SequenceReplayBuffer
 from gear_sonic.trl.utils.common import custom_instantiate
+from gear_sonic.utils.wam_kinematics import G1_MUJOCO_JOINT_NAMES
+from gear_sonic.utils.wam_observations import WAMGoalObservations
+from gear_sonic.utils.wam_reward import WAMTrackingReward, reference_state
+from gear_sonic.utils.wam_termination import (
+    enable_terminal_capture, get_terminal_state, soft_tracking_termination,
+)
 
 
 # Keep the trainer importable in CPU-only analysis environments that do not
 # install IsaacLab. This is the same G1 MuJoCo/IsaacLab ordering used by the
 # WAM observation terms.
-_G1_MUJOCO_ORDER = (
-    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint",
-    "left_ankle_pitch_joint", "left_ankle_roll_joint", "right_hip_pitch_joint",
-    "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint",
-    "right_ankle_roll_joint", "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
-    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
-    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
-    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
-)
+_G1_MUJOCO_ORDER = G1_MUJOCO_JOINT_NAMES
 _G1_ISAAC_ORDER = tuple(joint_utils.G1_ISAACLab_ORDER)
 _MUJOCO_TO_ISAAC = tuple(_G1_MUJOCO_ORDER.index(name) for name in _G1_ISAAC_ORDER)
 _ISAAC_TO_MUJOCO = tuple(_G1_ISAAC_ORDER.index(name) for name in _G1_MUJOCO_ORDER)
+# v2 uses link-origin root velocity, world-frame replayed goal rotations,
+# and a physical critic that never consumes logged robot observations.
+PHYSICAL_SCHEMA_VERSION = 2
 
 
 @contextmanager
@@ -176,7 +176,7 @@ class WAMTrainer:
     def __init__(
         self, args, config, env, model, *, accelerator=None, log_dir=None,
         checkpoint=None, resume=False, world_model_config=None, settings=None,
-        critic_config=None, **kwargs,
+        critic_config=None, reward_config=None, **kwargs,
     ):
         del kwargs
         if getattr(env, "action_transform_module", None) is not None:
@@ -236,7 +236,17 @@ class WAMTrainer:
         )
         self.context_keys = list(self.settings.get("context_observation_keys", []))
         self.reference_keys = list(self.settings.get("reference_observation_keys", []))
-        self.critic_keys = list(self.settings.get("critic_observation_keys", []))
+        self.physical_wam = dict((world_model_config or {}).get("cfg", {})).get("state_type", "flat") == "physical"
+        # Sonic's privileged observations contain the *real* robot trajectory.
+        # They cannot describe an independently imagined robot. Physical mode
+        # builds the critic input exclusively from its predicted physical state,
+        # matching reference state, and replayed physical context instead.
+        self.critic_keys = [] if self.physical_wam else list(self.settings.get("critic_observation_keys", []))
+        tokenizer_offset = next((start for key, start, _ in self.layout.goal_specs if key == "tokenizer"), None)
+        self.goal_observations = WAMGoalObservations(
+            self.layout.tokenizer_specs if tokenizer_offset is not None else (),
+            tokenizer_offset=tokenizer_offset or 0,
+        ) if self.physical_wam else None
         for key in self.context_keys:
             if key not in self.obs:
                 raise ValueError(f"WAM context observation group {key!r} is missing")
@@ -277,9 +287,21 @@ class WAMTrainer:
         self.distributed.check_consistent(cfg, "WAM dynamics settings")
         self.wam_action_dim = int(cfg["action_dim"])
         self.world_model = StateSpaceWorldModel(WAMConfig(**cfg)).to(self.device)
+        self.reward_model = None
+        simulator = getattr(env, "env", env)
+        self.control_dt = float(getattr(simulator, "step_dt", self.settings.get("control_dt", 0.02)))
+        if self.physical_wam and self.settings.get("align_real_reward", False):
+            reward_cfg = dict(reward_config or {})
+            self.distributed.check_consistent((reward_cfg, self.control_dt), "WAM reward settings")
+            if reward_cfg:
+                self.reward_model = custom_instantiate(reward_cfg, _resolve=False).to(self.device)
+            else:
+                self.reward_model = WAMTrackingReward().to(self.device)
         self.previous_world_action = torch.zeros(
             env.num_envs, self.wam_action_dim, device=self.device
         )
+        if self.physical_wam:
+            enable_terminal_capture(simulator)
         self.world_step = self.world_model.forward
         if self.settings.get("compile", False):
             self.world_step = torch.compile(self.world_model.forward, dynamic=False)
@@ -328,7 +350,7 @@ class WAMTrainer:
         return [module for module in (
             self.world_model.state_norm, self.world_model.action_norm,
             self.world_model.goal_norm, self.world_model.context_norm, self.world_model.delta_norm,
-        ) if module is not None] + [self.critic_norm]
+        ) if module is not None]
 
     def _action(self, state, goal=None, *, actor_obs=None, auxiliary=False):
         if actor_obs is None:
@@ -367,6 +389,41 @@ class WAMTrainer:
             first = next(iter(obs.values()))
             return first.new_zeros(first.shape[0], 0)
         return torch.cat([obs[key].flatten(start_dim=1) for key in keys], dim=-1)
+
+    def _next_physical_reference(self):
+        """Capture the old clip's next reference before an auto-reset changes it."""
+        if self.reference_dim != PHYSICAL_STATE_DIM:
+            raise ValueError("Aligned physical termination requires a 71-D WAM reference")
+        simulator = getattr(self.env, "env", self.env)
+        command = simulator.command_manager.get_term("motion")
+        return reference_state(command)
+
+    def _imagination_references(self, batch):
+        references = batch.get("references")
+        if references is None or not self.physical_wam:
+            return references
+        # Keep the final pre-reset target for the terminal state and bootstrap;
+        # later replay entries belong to another episode and are masked out.
+        lengths = batch["mask"].sum(-1)
+        indices = torch.minimum(
+            torch.arange(batch["mask"].shape[1] + 1, device=self.device)[None, :],
+            lengths[:, None],
+        )
+        return references.gather(
+            1, indices[..., None].expand(-1, -1, references.shape[-1]),
+        )
+
+    @staticmethod
+    def _hold_sequence_at_end(sequence, lengths, *, terminal_state=False):
+        """Keep the last valid transition's auxiliary data after an episode ends."""
+        indices = torch.minimum(
+            torch.arange(sequence.shape[1], device=sequence.device)[None, :],
+            (lengths - (0 if terminal_state else 1)).clamp_min(0)[:, None],
+        )
+        return sequence.gather(1, indices[..., None].expand(-1, -1, sequence.shape[-1]))
+
+    def _imagination_contexts(self, batch):
+        return self._hold_sequence_at_end(batch["contexts"], batch["mask"].sum(-1))
 
     def _resolve_history_specs(self):
         """Resolve term-major actor history layout from Isaac Lab metadata.
@@ -471,6 +528,15 @@ class WAMTrainer:
             actor_obs = self.actor_obs
             reference = self._pack_keys(self.obs, self.reference_keys)
             critic_state = self._pack_keys(self.obs, self.critic_keys)
+            context = self._pack_context(self.obs)
+            transition_reference = (
+                self._next_physical_reference()
+                if self.physical_wam and (
+                    self.settings.get("align_real_termination", False)
+                    or self.settings.get("align_real_reward", False)
+                )
+                else None
+            )
             if self.layout.goal_dim:
                 action = self._action(state, goal, actor_obs=actor_obs)
             elif self.layout.legacy_combined:
@@ -485,6 +551,22 @@ class WAMTrainer:
             next_obs, rewards, dones, infos = self.env.step({"actions": executed})
             next_state = self.layout.pack(next_obs)
             next_goal = self.layout.pack_goal(next_obs)
+            # Goals are still in the returned observation's robot frame. Do
+            # this conversion before substituting terminal states: done rows
+            # of next_obs already describe the newly reset robot.
+            replay_goal, replay_next_goal = goal, next_goal
+            if self.physical_wam and self.layout.goal_dim:
+                replay_goal = self.goal_observations.to_world(goal, state)
+                replay_next_goal = self.goal_observations.to_world(next_goal, next_state)
+            next_state_valid = ~dones.bool()
+            if self.physical_wam:
+                simulator = getattr(self.env, "env", self.env)
+                terminal_state = get_terminal_state(simulator)
+                if terminal_state is not None:
+                    if terminal_state.shape != next_state.shape:
+                        raise ValueError("Captured terminal state does not match physical WAM observations")
+                    next_state = torch.where(dones[:, None].bool(), terminal_state, next_state)
+                    next_state_valid = torch.ones_like(dones, dtype=torch.bool)
             next_wam = next_obs.get("wam")
             next_actor_obs = (
                 self._advance_actor_history(actor_obs, next_wam)
@@ -493,9 +575,11 @@ class WAMTrainer:
             if next_wam is not None and dones.any():
                 reset_history = self._seed_actor_history(next_obs["actor_obs"], next_wam)
                 next_actor_obs = torch.where(dones[:, None].bool(), reset_history, next_actor_obs)
-            next_reference = self._pack_keys(next_obs, self.reference_keys)
+            next_reference = (
+                transition_reference if transition_reference is not None
+                else self._pack_keys(next_obs, self.reference_keys)
+            )
             next_critic_state = self._pack_keys(next_obs, self.critic_keys)
-            context = self._pack_context(self.obs)
             world_action = self._to_wam_action(executed)
             previous_world_action = self.previous_world_action
             reward = rewards.reshape(state.shape[0], -1).sum(-1)
@@ -541,7 +625,7 @@ class WAMTrainer:
             if self.layout.goal_dim:
                 self.replay.add(
                     *replay_args,
-                    goal[indices], next_goal[indices],
+                    replay_goal[indices], replay_next_goal[indices],
                     actor_obs[indices], next_actor_obs[indices],
                     context=context[indices] if context is not None else None,
                     reference=reference[indices] if self.reference_keys else None,
@@ -549,6 +633,7 @@ class WAMTrainer:
                     critic_state=critic_state[indices] if self.critic_keys else None,
                     next_critic_state=next_critic_state[indices] if self.critic_keys else None,
                     previous_action=previous_world_action[indices],
+                    next_state_valid=next_state_valid[indices],
                 )
             else:
                 self.replay.add(
@@ -560,8 +645,9 @@ class WAMTrainer:
                     critic_state=critic_state[indices] if self.critic_keys else None,
                     next_critic_state=next_critic_state[indices] if self.critic_keys else None,
                     previous_action=previous_world_action[indices],
+                    next_state_valid=next_state_valid[indices],
                 )
-            valid = ~dones[indices].bool()
+            valid = next_state_valid[indices]
             if valid.any():
                 self.world_model.update_normalizers(
                     state[indices][valid], world_action[indices][valid], next_state[indices][valid],
@@ -636,10 +722,10 @@ class WAMTrainer:
         return self._critic_input_with_aux(state, None, None, context)
 
     def _critic_input_with_aux(self, state, reference=None, critic_state=None, context=None):
-        state_features = self.world_model.state_norm(
-            physical_state_invariant_features(state)
-            if self.physical_wam else state
-        )
+        # Unlike the dynamics, the tracking value depends on absolute root
+        # position and heading relative to the target. Retain them here;
+        # critic_norm normalizes the full input once, using valid imagined data.
+        state_features = state if self.physical_wam else self.world_model.state_norm(state)
         features = [state_features]
         if self.reference_dim:
             if reference is None:
@@ -670,7 +756,7 @@ class WAMTrainer:
         order = torch.as_tensor(_ISAAC_TO_MUJOCO, device=action.device)
         return body_action[..., order]
 
-    def _physical_actor_frame(self, state, action):
+    def _physical_actor_frame(self, state, action, context=None):
         """Convert a physical WAM state into one Sonic proprioceptive frame."""
         position, rotation, _, angular_velocity, joint_position, joint_velocity = physical_state_parts(state)
         del position
@@ -682,9 +768,24 @@ class WAMTrainer:
         if robot is None:
             raise ValueError("physical WAM actor projection needs the IsaacLab robot asset")
         body_indices = joint_utils.get_body_joint_indices(robot)
-        default_position = robot.data.default_joint_pos[..., body_indices]
-        if default_position.ndim == 2 and default_position.shape[0] != state.shape[0]:
-            default_position = default_position[:1].expand(state.shape[0], -1)
+        # Replay samples shuffle environments and may come from older episodes.
+        # A live environment row is never a sample's joint calibration. ξ stores
+        # its 29 offsets in canonical order; add them to immutable nominals.
+        nominal = getattr(robot.data, "default_joint_pos_nominal", None)
+        if nominal is None:
+            nominal = robot.data.default_joint_pos[0].detach().clone()
+            if self.context_dim == 33:
+                live_context = self._pack_context(self.obs)
+                nominal[body_indices] -= live_context[0, 1:30][index]
+        elif nominal.ndim == 2:
+            nominal = nominal[0]
+        default_position = nominal[body_indices].to(device=state.device, dtype=state.dtype)
+        if context is not None:
+            if context.shape[-1] != 33:
+                raise ValueError("Physical actor calibration requires the 33-D WAM ξ layout")
+            default_position = default_position + context[..., 1:30][..., index]
+        elif self.context_dim:
+            raise ValueError("Physical actor projection requires replayed ξ")
         if default_position.shape[-1] != joint_position.shape[-1]:
             raise ValueError("physical WAM and actor joint layouts do not match")
         gravity = -rotation[..., 2, :]
@@ -726,6 +827,8 @@ class WAMTrainer:
     def _analytic_reward(self, state, reference, action, action_prev):
         if not self.physical_wam:
             raise RuntimeError("analytic WAM reward requires physical state mode")
+        if getattr(self, "reward_model", None) is not None:
+            return self.reward_model(state, reference, action, action_prev, dt=self.control_dt)
         position, rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = physical_state_parts(state)
         target_position, target_rotation, target_linear_velocity, target_angular_velocity, target_joint_position, target_joint_velocity = physical_state_parts(reference)
         e_pos = (position - target_position).square().sum(-1)
@@ -748,23 +851,18 @@ class WAMTrainer:
         return (track - 0.1 * action_rate - 2.0 * joint_limit) * dt
 
     def _analytic_termination(self, state, reference):
-        position, rotation, *_ = physical_state_parts(state)
-        target_position, target_rotation, *_ = physical_state_parts(reference)
-        height_error = (target_position[..., 2] - position[..., 2]).abs()
-        tilt_error = (target_rotation[..., 2, 2] - rotation[..., 2, 2]).abs()
-        height = float(self.settings.get("termination_height", 0.25))
-        tilt = float(self.settings.get("termination_tilt", 0.8))
-        height_width = float(self.settings.get("termination_height_width", 0.02))
-        tilt_width = float(self.settings.get("termination_tilt_width", 0.04))
-        alive = (1 - torch.sigmoid((height_error - height) / height_width)) * (
-            1 - torch.sigmoid((tilt_error - tilt) / tilt_width)
+        return soft_tracking_termination(
+            state[..., :3], state[..., 3:7], reference[..., :3], reference[..., 3:7],
+            height_threshold=float(self.settings.get("termination_height", 0.25)),
+            tilt_threshold=float(self.settings.get("termination_tilt", 0.8)),
+            height_width=float(self.settings.get("termination_height_width", 0.02)),
+            tilt_width=float(self.settings.get("termination_tilt_width", 0.04)),
         )
-        return 1 - alive
 
-    def _advance_actor_history(self, actor_obs, wam_obs, action=None, *, physical_state=False):
+    def _advance_actor_history(self, actor_obs, wam_obs, action=None, *, physical_state=False, context=None):
         """Append one single-step WAM observation to Sonic's actor history."""
         if self.physical_wam and physical_state:
-            wam_obs = self._physical_actor_frame(wam_obs, action)
+            wam_obs = self._physical_actor_frame(wam_obs, action, context=context)
         if actor_obs.shape[-1] == wam_obs.shape[-1]:
             return wam_obs
         if self._actor_history_specs is not None and self._wam_term_specs is not None:
@@ -811,7 +909,20 @@ class WAMTrainer:
         # ξ is an environment parameter attached to every logged transition.
         # Keep the whole sequence so imagined step t uses ξ_t, matching the
         # SuperMimic replay and WAM training paths.
-        context = batch["contexts"] if self.context_dim else None
+        context = self._imagination_contexts(batch) if self.context_dim else None
+        references = self._imagination_references(batch)
+        lengths = batch["mask"].sum(-1)
+        # Legacy non-physical integrations may still have auxiliary critic
+        # observations. Never let their reset-episode rows reach a bootstrap.
+        critic_states = None
+        if self.critic_feature_dim:
+            ends_in_reset = batch["dones"].gather(1, (lengths - 1)[:, None]).squeeze(1)
+            critic_states = self._hold_sequence_at_end(
+                batch["critic_states"], lengths - ends_in_reset.long(), terminal_state=True,
+            )
+        goals = batch.get("goals")
+        if self.physical_wam and goals is not None:
+            goals = self._hold_sequence_at_end(goals, lengths)
         previous_action = (
             batch["previous_actions"][:, 0]
             if self.physical_wam and "previous_actions" in batch
@@ -827,7 +938,9 @@ class WAMTrainer:
             for step in range(horizon):
                 states.append(state)
                 valid = batch["mask"][:, step]
-                goal = batch["goals"][:, step] if self.layout.goal_dim else None
+                goal = goals[:, step] if self.layout.goal_dim else None
+                if self.physical_wam and goal is not None:
+                    goal = self.goal_observations.to_robot(goal, state)
                 if self.layout.goal_dim:
                     action = self._action(
                         state, goal, actor_obs=actor_obs, auxiliary=(step == 0)
@@ -851,7 +964,7 @@ class WAMTrainer:
                 context_t = context[:, step] if context is not None else None
                 prediction = self.world_step(state, world_action, context=context_t, **kwargs)
                 if self.physical_wam:
-                    reference = batch["references"][:, step + 1]
+                    reference = references[:, step + 1]
                     reward = self._analytic_reward(
                         prediction["next_state"], reference, world_action, previous_action
                     )
@@ -863,15 +976,15 @@ class WAMTrainer:
                 survival = torch.where(valid, survival * (1.0 - done), survival)
                 state = torch.where(valid[:, None], prediction["next_state"], state)
                 next_actor_obs = self._advance_actor_history(
-                    actor_obs, prediction["next_state"], action, physical_state=True
+                    actor_obs, prediction["next_state"], action, physical_state=True,
+                    context=context_t,
                 )
                 actor_obs = torch.where(valid[:, None], next_actor_obs, actor_obs)
                 previous_action = world_action
                 rewards.append(reward)
                 dones.append(done)
-            lengths = batch["mask"].sum(-1)
-            reference = batch["references"][:, horizon] if self.reference_dim else None
-            critic_state = batch["critic_states"][:, horizon] if self.critic_feature_dim else None
+            reference = references[:, horizon] if self.reference_dim else None
+            critic_state = critic_states[:, horizon] if self.critic_feature_dim else None
             bootstrap_context = context[:, -1] if context is not None else None
             bootstrap_input = self._critic_input_with_aux(
                 state, reference, critic_state, bootstrap_context
@@ -900,13 +1013,17 @@ class WAMTrainer:
                 # bootstrap state, exactly as the terminal physical context
                 # is held in SuperMimic.
                 critic_context = torch.cat((context, context[:, -1:]), dim=1).detach()
-            references = batch["references"][:, :horizon + 1] if self.reference_dim else None
-            critic_states = batch["critic_states"][:, :horizon + 1] if self.critic_feature_dim else None
+            references = references[:, :horizon + 1] if self.reference_dim else None
             inputs = self._critic_input_with_aux(states, references, critic_states, critic_context)
-            self.critic_norm.update(inputs)
+            # A valid trajectory has L transitions and L+1 states. Exclude
+            # frozen padding (and reset episode metadata) from normalization.
+            valid_states = torch.arange(horizon + 1, device=self.device)[None, :] <= lengths[:, None]
+            before = self.distributed.snapshot_running_norms([self.critic_norm])
+            self.critic_norm.update(inputs[valid_states])
+            self.distributed.sync_running_norms([self.critic_norm], before)
             inputs = self.critic_norm(inputs)
             values = self.critic(inputs).squeeze(-1)
-            target = values[:, -1]
+            target = values.gather(1, lengths[:, None]).squeeze(1)
             targets = []
             for step in range(horizon - 1, -1, -1):
                 next_target = rewards[:, step] + gamma * (1 - dones[:, step]) * (
@@ -1112,6 +1229,7 @@ class WAMTrainer:
             "wam_goal_specs": self.layout.goal_specs,
             "wam_settings": self.settings,
             "wam_tokenizer_specs": self.layout.tokenizer_specs,
+            "wam_physical_schema_version": PHYSICAL_SCHEMA_VERSION if self.physical_wam else None,
         }
         return payload
 
@@ -1136,6 +1254,11 @@ class WAMTrainer:
             raise ValueError("Checkpoint contains no compatible FSQ policy weights")
         self.policy.load_state_dict(policy_state, strict=True)
         if resume:
+            if self.physical_wam and checkpoint.get("wam_physical_schema_version") != PHYSICAL_SCHEMA_VERSION:
+                raise ValueError(
+                    "Physical WAM state/critic/replay schema changed (link-origin velocity and "
+                    "world-frame goals); use resume=false to load policy only and refit WAM/critic"
+                )
             if checkpoint.get("wam_world_size", 1) != self.distributed.world_size:
                 raise ValueError(
                     "WAM resume requires the saved process count; use resume=false to load policy only"

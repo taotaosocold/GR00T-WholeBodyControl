@@ -224,3 +224,38 @@ nvidia-smi
 ```bash
 kill -TERM "$(cat "$RUN_DIR/launcher.pid")"
 ```
+## 8. 录制屏幕
+```bash
+cd /data/ouqin/GR00T-WholeBodyControl
+PY=/data/ouqin/envs/sonic/bin/python
+
+RUN_DIR=/data/ouqin/runs_supermimic/wam_4096_total_20261028_144841
+MOTION_KEY=walk_ff_loop_180_R_002__A047
+MOTION_FILE="/data/ouqin/datasets/g1/train/robot/221010/${MOTION_KEY}.pkl"
+VIDEO_DIR="$RUN_DIR/videos_${MOTION_KEY}_$(date +%Y%m%d_%H%M%S)"
+
+CUDA_VISIBLE_DEVICES=0 "$PY" gear_sonic/eval_agent_trl.py \
+  checkpoint="$RUN_DIR/last.pt" \
+  ++headless=true \
+  ++num_envs=1 \
+  '++eval_callbacks=[]' \
+  ++run_eval_loop=true \
+  ++run_once=false \
+  ++max_render_steps=1500 \
+  ++use_encoder=g1 \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file="$MOTION_FILE" \
+  ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=/data/ouqin/datasets/g1/train/smpl \
+  ++manager_env.commands.motion.motion_lib_cfg.paired_frame_alignment.mode=strict \
+  "++manager_env.commands.motion.filter_motion_keys=[\"$MOTION_KEY\"]" \
+  ++manager_env.commands.motion.start_from_first_frame=true \
+  ++manager_env.commands.motion.cat_upper_body_poses=false \
+  ++manager_env.commands.motion.freeze_frame_aug=false \
+  ++manager_env.observations.policy.enable_corruption=false \
+  ++manager_env.events.physics_material=null \
+  ++manager_env.events.add_joint_default_pos=null \
+  ++manager_env.events.base_com=null \
+  ++manager_env.events.randomize_rigid_body_mass=null \
+  ++manager_env.config.render_results=true \
+  ++manager_env.config.save_rendering_dir="$VIDEO_DIR" \
+  manager_env/recorders=render
+```

@@ -85,6 +85,10 @@ def _exercise_training(directory, rank):
     _assert_equal_on_ranks(trainer.policy)
     _assert_equal_on_ranks(trainer.world_model)
     _assert_equal_on_ranks(trainer.critic)
+    _assert_equal_on_ranks(trainer.critic_norm)
+    # Another collection must not hide a previous imagination-time divergence.
+    trainer.collect(1)
+    _assert_equal_on_ranks(trainer.critic_norm)
 
     # Independent replay stays different while the learned models agree.
     local_replay = trainer.replay.state_dict()["storage"]["state"].clone()
@@ -128,6 +132,7 @@ def _exercise_training(directory, rank):
     _assert_equal_on_ranks(restored.policy)
     _assert_equal_on_ranks(restored.world_model)
     _assert_equal_on_ranks(restored.critic)
+    _assert_equal_on_ranks(restored.critic_norm)
     # Also cover the orchestration path: readiness consensus, reduced metrics,
     # rank-zero logging, and the final checkpoint invoked by train().
     restored.train()

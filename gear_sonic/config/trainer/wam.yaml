@@ -1,5 +1,6 @@
 defaults:
   - /world_model/wam_critic@critic_config
+  - /world_model/wam_reward@reward_config
   - _self_
 
 _target_: gear_sonic.trl.trainer.wam_trainer.WAMTrainer
@@ -16,8 +17,18 @@ settings:
   # It is replayed per timestep and is consumed by WAM, never by FSQ.
   context_observation_keys: [wam_context]
   reference_observation_keys: [wam_reference]
-  # ManagerEnvWrapper exposes the Isaac Lab critic group as critic_obs.
-  critic_observation_keys: [critic_obs]
+  # Physical critic uses predicted state + reference + ξ. Logged Sonic
+  # critic_obs describe the real robot, not the imagined trajectory.
+  critic_observation_keys: []
+  # Real collection and imagination share SuperMimic's failure criteria.
+  # Clip ends / the environment's episode limit remain normal truncations.
+  align_real_termination: true
+  termination_height: 0.25
+  termination_tilt: 0.8
+  termination_height_width: 0.02
+  termination_tilt_width: 0.04
+  # Share the same eight FK-based terms with the real RewardManager.
+  align_real_reward: true
   collect_steps: 1
   motion_resample_frequency: 250
   replay_steps: 1000

@@ -880,8 +880,10 @@ def wam_root_quat_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
 
 
 def wam_root_lin_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    from gear_sonic.utils.wam_state import link_origin_linear_velocity
+
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-    return command.robot_anchor_lin_vel_w
+    return link_origin_linear_velocity(command.robot.data, command.robot_anchor_body_index)
 
 
 def wam_root_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

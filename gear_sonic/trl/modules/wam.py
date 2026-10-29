@@ -44,13 +44,73 @@ def _quat_to_mat(quaternion: torch.Tensor) -> torch.Tensor:
 
 
 def _mat_to_quat(matrix: torch.Tensor) -> torch.Tensor:
-    """Stable matrix-to-wxyz conversion used for differentiable integration."""
-    trace = matrix.diagonal(dim1=-2, dim2=-1).sum(-1)
-    qw = torch.sqrt((1 + trace).clamp_min(1e-8)) * 0.5
-    qx = (matrix[..., 2, 1] - matrix[..., 1, 2]) / (4 * qw.clamp_min(1e-4))
-    qy = (matrix[..., 0, 2] - matrix[..., 2, 0]) / (4 * qw.clamp_min(1e-4))
-    qz = (matrix[..., 1, 0] - matrix[..., 0, 1]) / (4 * qw.clamp_min(1e-4))
-    return F.normalize(torch.stack((qw, qx, qy, qz), dim=-1), dim=-1)
+    """Convert rotation matrices using their largest quaternion component.
+
+    The trace-only formula divides by the scalar quaternion component, which
+    vanishes at half-turns. Selecting the largest of four equivalent formulas
+    avoids that singularity. Clamp inactive square-root branches as well so
+    their derivatives cannot produce NaNs during autograd.
+    """
+    m00, m01, m02 = matrix[..., 0, :].unbind(-1)
+    m10, m11, m12 = matrix[..., 1, :].unbind(-1)
+    m20, m21, m22 = matrix[..., 2, :].unbind(-1)
+    diagonal = torch.stack((
+        1 + m00 + m11 + m22,
+        1 + m00 - m11 - m22,
+        1 - m00 + m11 - m22,
+        1 - m00 - m11 + m22,
+    ), dim=-1)
+    magnitudes = torch.sqrt(diagonal.clamp_min(torch.finfo(matrix.dtype).eps))
+    candidates = torch.stack((
+        torch.stack((diagonal[..., 0], m21 - m12, m02 - m20, m10 - m01), -1),
+        torch.stack((m21 - m12, diagonal[..., 1], m01 + m10, m02 + m20), -1),
+        torch.stack((m02 - m20, m01 + m10, diagonal[..., 2], m12 + m21), -1),
+        torch.stack((m10 - m01, m02 + m20, m12 + m21, diagonal[..., 3]), -1),
+    ), dim=-2) / (2 * magnitudes[..., :, None])
+    largest = diagonal.argmax(-1)
+    quaternion = candidates.gather(
+        -2, largest[..., None, None].expand(largest.shape + (1, 4)),
+    ).squeeze(-2)
+    quaternion = F.normalize(quaternion, dim=-1)
+    return torch.where(quaternion[..., :1] < 0, -quaternion, quaternion)
+
+
+def _quat_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of wxyz quaternions, retaining leading dimensions."""
+    left_w, left_v = left[..., :1], left[..., 1:]
+    right_w, right_v = right[..., :1], right[..., 1:]
+    return torch.cat((
+        left_w * right_w - (left_v * right_v).sum(-1, keepdim=True),
+        left_w * right_v + right_w * left_v + torch.cross(left_v, right_v, dim=-1),
+    ), dim=-1)
+
+
+def _rotvec_to_quat(vector: torch.Tensor) -> torch.Tensor:
+    """Quaternion exponential with the analytic sinc limit at zero angle."""
+    half_angle = 0.5 * torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+    scale = 0.5 * torch.sinc(half_angle / torch.pi)
+    return torch.cat((half_angle.cos(), scale * vector), dim=-1)
+
+
+def _quat_to_rotvec(quaternion: torch.Tensor) -> torch.Tensor:
+    """Shortest rotation vector, stable at zero and finite at half-turns.
+
+    The shortest-axis convention necessarily changes branch at exactly pi.
+    Both one-sided derivatives remain finite; no zero skew axis is divided by
+    its norm at a half-turn, and the small-angle limit retains its derivative.
+    """
+    quaternion = F.normalize(quaternion, dim=-1)
+    quaternion = torch.where(quaternion[..., :1] < 0, -quaternion, quaternion)
+    vector = quaternion[..., 1:]
+    sine = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+    angle = 2 * torch.atan2(sine, quaternion[..., :1])
+    sine_squared = sine.square()
+    scale = torch.where(
+        sine < 1e-4,
+        2 + sine_squared / 3 + 3 * sine_squared.square() / 20,
+        angle / sine.clamp_min(1e-4),
+    )
+    return vector * scale
 
 
 def _skew(vector: torch.Tensor) -> torch.Tensor:
@@ -122,16 +182,10 @@ def physical_state_transition_error(predicted: torch.Tensor, target: torch.Tenso
     target_position, target_rotation, target_linear_velocity, target_angular_velocity, target_joint_position, target_joint_velocity = physical_state_parts(target)
     heading = _yaw_mat(rotation)
     rotation_t = rotation.transpose(-1, -2)
-    relative_rotation = rotation_t @ target_rotation
-    cosine = ((relative_rotation.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2).clamp(-1 + 1e-6, 1 - 1e-6)
-    angle = torch.acos(cosine).unsqueeze(-1)
-    axis = torch.stack(
-        (relative_rotation[..., 2, 1] - relative_rotation[..., 1, 2],
-         relative_rotation[..., 0, 2] - relative_rotation[..., 2, 0],
-         relative_rotation[..., 1, 0] - relative_rotation[..., 0, 1]), dim=-1
-    )
-    axis = F.normalize(axis, dim=-1)
-    dtheta = axis * angle
+    quaternion = F.normalize(predicted[..., 3:7], dim=-1)
+    target_quaternion = F.normalize(target[..., 3:7], dim=-1)
+    inverse = torch.cat((quaternion[..., :1], -quaternion[..., 1:]), dim=-1)
+    dtheta = _quat_to_rotvec(_quat_multiply(inverse, target_quaternion))
     return torch.cat(
         (
             (heading.transpose(-1, -2) @ (target_position - position).unsqueeze(-1)).squeeze(-1),
@@ -374,13 +428,18 @@ class StateSpaceWorldModel(nn.Module):
             dp, dtheta, dv, dw, dq, dqd = delta.split((3, 3, 3, 3, NUM_G1_JOINTS, NUM_G1_JOINTS), -1)
             heading = _yaw_mat(rotation)
             next_position = position + (heading @ dp.unsqueeze(-1)).squeeze(-1)
-            next_rotation = rotation @ _so3_exp(dtheta)
+            # Integrate on unit quaternions directly. Matrix-to-quaternion
+            # conversion is unnecessary here and would introduce chart
+            # switches as the robot passes through a 180-degree heading.
+            next_quaternion = F.normalize(_quat_multiply(
+                F.normalize(state[..., 3:7], dim=-1), _rotvec_to_quat(dtheta),
+            ), dim=-1)
             next_linear_velocity = linear_velocity + (rotation @ dv.unsqueeze(-1)).squeeze(-1)
             next_angular_velocity = angular_velocity + (rotation @ dw.unsqueeze(-1)).squeeze(-1)
             next_state = torch.cat(
                 (
                     next_position,
-                    _mat_to_quat(next_rotation),
+                    next_quaternion,
                     next_linear_velocity,
                     next_angular_velocity,
                     joint_position + dq,

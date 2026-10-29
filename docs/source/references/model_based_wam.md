@@ -59,8 +59,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m accelerate.commands.launch \
 global batches on eight ranks, use world-model batch 256 per rank (2048 total)
 and policy batch 512 per rank (4096 total). Each
 rank collects its own trajectories and samples its own replay. Actor, dynamics,
-and critic gradients are averaged after each backward pass; initial weights and
-world-model normalization statistics are synchronized. Rank-specific unused
+and critic gradients are averaged after each backward pass; initial weights,
+world-model statistics, and valid-state critic normalization statistics are
+synchronized. Rank-specific unused
 modality encoders participate safely. A non-finite loss/gradient on any rank
 rejects the update on all ranks. Adaptive motion sampling remains local.
 
@@ -77,6 +78,59 @@ alongside `world/loss`, rather than treating checkpoint creation as coverage.
 The extra WAM observation groups are passive when PPO is selected; PPO's policy,
 reward, termination, and optimizer configuration is unchanged. Omitting
 `trainer=wam world_model=wam_dynamics` keeps the existing PPO update path.
+
+New physical WAM runs default to `trainer.settings.align_real_termination=true`.
+Before saving `config.yaml` and constructing the environment, the launcher
+replaces the Sonic termination group with `terminations/tracking/wam.yaml`.
+Real failures use the same height and tilt errors as the imagined soft rule:
+`abs(z_ref - z) > 0.25` or `abs(R_ref[2,2] - R[2,2]) > 0.8`. The imagined
+version applies sigmoid widths 0.02 and 0.04 at those same thresholds. Change
+`trainer.settings.termination_height` / `termination_tilt` to update both forms.
+Strict foot, hand, full-orientation, and adaptive-height conditions are absent
+from this WAM-specific group. Clip completion and the configured episode time
+limit (10 seconds by default) are truncations, kept separate from failures.
+
+Isaac Lab checks failure before advancing the command, so the real rule reads
+the next reference frame explicitly, clamping at the clip end. Collection also
+captures that reference before an auto-reset can replace it with a new clip;
+imagination holds the final valid reference beyond replay episode boundaries.
+Checkpoint evaluation reuses this selection without changing the evaluator.
+Old saved configs without `align_real_termination` retain their original rules;
+to opt an old WAM evaluation into the new rules, pass
+`++trainer.settings.align_real_termination=true`. This changes its evaluation
+failure criterion relative to the historical run.
+
+Physical WAM runs also default to `trainer.settings.align_real_reward=true`.
+The launcher replaces the whole reward group with `rewards/tracking/wam.yaml`.
+The real RewardManager and imagined BPTT share
+`gear_sonic.utils.wam_reward.WAMTrackingReward`, with parameters from
+`trainer.reward_config` (`world_model/wam_reward.yaml`). The terms are four
+body tracking kernels (position, orientation, linear and angular velocity),
+two root tracking kernels, summed action-rate penalty, and summed per-joint
+soft-limit penalty. Body targets are re-anchored to the robot's XY and yaw;
+root targets and velocity comparisons remain in their specified world frame.
+The 14 tracked bodies and 0.9 soft joint limits come from the repository's G1
+MJCF. No learned reward head or external SuperMimic checkout is needed.
+
+Real reward functions return unweighted rates, because Isaac Lab applies the
+term weights and control dt. Imagination applies the same weights and actual
+environment `step_dt` once. The real path caches the FK results for all eight
+terms in each physics step. Both paths use the next reference frame, and
+reference snapshots are captured before reset. Adjust weights and kernel
+widths through `trainer.reward_config.weights` and `.stds` so they stay shared.
+PPO retains the Sonic reward group. Old checkpoint configs without
+`align_real_reward` preserve their historical behavior; explicitly enabling
+`++trainer.settings.align_real_reward=true` changes the reward definition.
+
+Physical state velocity now refers to the pelvis link origin, matching the
+reference motion and FK. The adapter prefers `body_link_lin_vel_w`; on older
+backends it converts CoM velocity using angular velocity and the rotated CoM
+offset. Missing conversion metadata raises an error. Rotation integration uses
+quaternion multiplication, and the model's rotation error has finite small-angle
+and half-turn branches. Reward scales also
+change relative to historical Sonic-reward runs, so compare new runs under a
+fixed validation criterion.
+
 `checkpoint=/path/to/last.pt` loads a compatible
 FSQ policy; adding `+resume=true` restores WAM, critic, optimizers, and counters
 from a WAM checkpoint. Policy weights remain under `policy_state_dict`, so the
@@ -96,6 +150,11 @@ for a full resume. A full resume requires the same process count. To change
 GPU count, use `resume=false` to load the policy and start fresh dynamics/replay.
 Resume preserves rank-local replay boundaries but does not restore simulator
 physics or promise bitwise continuation. Logs report averages across ranks.
+The physical schema is now version 2: link-origin velocity, world-frame goal
+orientations in replay, and a critic built from imagined physical state,
+reference and ξ. Full resume from older physical schemas is rejected; use
+`+resume=false checkpoint=/path/to/old/last.pt` to load only its FSQ policy and
+refit the world model and critic.
 
 ## Observations, references, and replay
 
@@ -103,8 +162,12 @@ The WAM state is the canonical 71-dimensional physical state. The actor's
 single-step proprioceptive frame is reconstructed from predicted physical
 states, so it does not need to equal the WAM state. The `tokenizer` group
 remains outside the dynamics model: G1 retargeted,
-teleoperation, and SMPL observations follow their logged timeline and enter
-Sonic's original encoder -> FSQ -> decoder path at every imagined step. WAM
+teleoperation, and SMPL references follow their logged timeline. Robot-relative
+G1/teleop/SMPL orientations are stored in world coordinates and transformed
+back using the predicted robot rotation before entering Sonic's original
+encoder -> FSQ -> decoder at each imagined step. Reference-local VR points and
+other exogenous features are retained unchanged. This linear conversion also
+preserves the observation noise stored during collection. WAM
 therefore receives only `(physical_state, action, ξ)` and shares one robot
 dynamics model across all three target representations. FSQ tokens are never
 passed to WAM. The physical WAM uses SuperMimic's frame-local invariant input
@@ -114,8 +177,8 @@ is SuperMimic's 33-dimensional `ξ = [friction, joint-default offsets (29),
 torso CoM offset (3)]`; it is replayed at every transition and fed to WAM and
 the critic at the corresponding imagined timestep.
 
-Replay stores the current and next physical state, reference state, full critic
-tracking/reference features, actor observations, and raw goals needed to re-run
+Replay stores the current and next physical state, reference state,
+actor observations, and goals needed to re-run
 the Sonic actor, together with the previous executed body action for the
 SuperMimic action-rate term. Those goal tensors are not WAM inputs and no
 modality label is used by the dynamics model. The old combined
@@ -123,15 +186,24 @@ observation format remains accepted for compatibility with earlier tests and
 checkpoints.
 
 Trainer observation keys refer to the dictionary returned by `ManagerEnvWrapper`.
-In particular, Isaac Lab's `critic` group is exposed as `critic_obs`, so the WAM
-setting is `critic_observation_keys: [critic_obs]`.
+Physical WAM sets `critic_observation_keys: []`: Sonic's `critic_obs` contains
+the logged real robot trajectory and is not used for imagined states. The
+physical critic uses the complete predicted state (including XY and heading),
+reference state and ξ, with its own synchronized normalizer. Actor joint
+calibration is reconstructed from nominal positions and the sampled ξ offsets,
+never from the current simulator environment rows.
 
 `SequenceReplayBuffer` stores actual noisy, clipped actions. Samples stay in
 one environment and in chronological order across ring wraparound. Reward and
 termination supervision include the final transition. Dynamics supervision
-excludes auto-reset next observations; later steps are masked. Truncations are
+uses a pre-reset physical state cached by the aligned termination callbacks for
+the final transition. When no current-step cache is available, the terminal
+target remains masked rather than learning the reset jump. Later steps are
+masked. Truncations are
 not learned as physical termination. Imagined rollouts advance the replayed
-goal sequence independently of WAM and bootstrap at the sampled horizon. The
+goal sequence independently of WAM and bootstrap at each sample's valid end.
+References and ξ hold their last valid values across reset boundaries, and
+critic statistics include only valid states and their one bootstrap state. The
 actor history is advanced from the predicted single-step proprioceptive
 observation.
 Optional replay checkpoints seal episode boundaries before collecting from a
@@ -268,6 +340,10 @@ The paper's acceleration ratios do not transfer automatically to this baseline.
 With PyTorch, Hydra, TensorDict, and vector-quantize-pytorch installed:
 
 ```bash
+python -m unittest gear_sonic.tests.test_wam_termination -v
+python -m unittest gear_sonic.tests.test_wam_reward -v
+python -m unittest gear_sonic.tests.test_wam_rotations gear_sonic.tests.test_wam_observations -v
+python -m unittest gear_sonic.tests.test_wam_state gear_sonic.tests.test_wam_terminal_capture gear_sonic.tests.test_wam_physical_training -v
 python -m unittest gear_sonic.tests.test_sequence_replay gear_sonic.tests.test_wam_training -v
 python -m gear_sonic.tests.test_wam
 GLOO_SOCKET_IFNAME=lo python -m unittest gear_sonic.tests.test_wam_distributed -v

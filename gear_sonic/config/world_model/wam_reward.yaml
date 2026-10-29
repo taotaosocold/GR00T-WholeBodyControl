@@ -1,0 +1,35 @@
+# Shared by real RewardManager terms and the imagined physical reward.
+_target_: gear_sonic.utils.wam_reward.WAMTrackingReward
+mjcf_path: gear_sonic/data/assets/robot_description/mjcf/g1_29dof_rev_1_0.xml
+tracked_bodies:
+  - pelvis
+  - left_hip_roll_link
+  - left_knee_link
+  - left_ankle_roll_link
+  - right_hip_roll_link
+  - right_knee_link
+  - right_ankle_roll_link
+  - torso_link
+  - left_shoulder_roll_link
+  - left_elbow_link
+  - left_wrist_yaw_link
+  - right_shoulder_roll_link
+  - right_elbow_link
+  - right_wrist_yaw_link
+stds:
+  body_pos: 0.3
+  body_ori: 0.4
+  body_linvel: 1.0
+  body_angvel: 3.14
+  root_pos: 0.3
+  root_ori: 0.4
+weights:
+  tracking_relative_body_pos: 1.0
+  tracking_relative_body_ori: 1.0
+  tracking_body_linvel: 1.0
+  tracking_body_angvel: 1.0
+  tracking_anchor_pos: 0.5
+  tracking_anchor_ori: 0.5
+  action_rate_l2: -0.1
+  joint_limit: -2.0
+soft_limit_factor: 0.9

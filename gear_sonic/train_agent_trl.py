@@ -64,7 +64,11 @@ from gear_sonic.trl.utils.common import (
     wandb_run_exists,
 )
 from gear_sonic.utils.common import seeding
-from gear_sonic.utils.config_utils import register_rl_resolvers
+from gear_sonic.utils.config_utils import (
+    configure_wam_rewards,
+    configure_wam_terminations,
+    register_rl_resolvers,
+)
 from gear_sonic.utils.obs_utils import get_group_term_obs_shape
 
 register_rl_resolvers()
@@ -104,6 +108,8 @@ def create_manager_env(config, device, args_cli):
 
     from gear_sonic.envs.wrapper.manager_env_wrapper import ManagerEnvWrapper
 
+    configure_wam_terminations(config)
+    configure_wam_rewards(config)
     env_instance_cfg = custom_instantiate(config.manager_env)
 
     # Iteratively check the difference in attribute of env_instance_cfg1 and env_instance_cfg, print out the difference
@@ -154,6 +160,10 @@ def create_manager_env(config, device, args_cli):
 
 @hydra.main(config_path="config", config_name="base", version_base="1.1")
 def main(config: OmegaConf):
+    # Resolve WAM-specific real termination before logging/saving config.yaml.
+    # create_manager_env applies the same selection for checkpoint evaluation.
+    configure_wam_terminations(config)
+    configure_wam_rewards(config)
     simulator_type = "IsaacSim"
     env_config = config.manager_env
     from transformers import HfArgumentParser

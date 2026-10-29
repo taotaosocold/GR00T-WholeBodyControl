@@ -32,6 +32,7 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = None
+    wam_failure = None
     anchor_pos = None
     anchor_ori = None
     anchor_ori_full = None

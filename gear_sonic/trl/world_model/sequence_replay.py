@@ -30,6 +30,7 @@ class SequenceReplayBuffer:
     _REFERENCE_FIELDS = ("reference", "next_reference")
     _CRITIC_FIELDS = ("critic_state", "next_critic_state")
     _PREVIOUS_ACTION_FIELDS = ("previous_action",)
+    _NEXT_STATE_FIELDS = ("next_state_valid",)
     # Preserve the old introspection hook for callers that only use the base
     # observation replay format.
     _FIELDS = _BASE_FIELDS
@@ -68,13 +69,16 @@ class SequenceReplayBuffer:
         critic_state: Tensor | None = None,
         next_critic_state: Tensor | None = None,
         previous_action: Tensor | None = None,
+        next_state_valid: Tensor | None = None,
     ) -> None:
         """Store one vectorized step, including actual executed actions.
 
         ``done`` includes both termination and time-limit truncation. Use
         ``terminated`` for the true terminal label so truncations can bootstrap
         the critic. Auto-reset next observations never supervise dynamics on a
-        done transition, regardless of which kind of done occurred.
+        done transition unless ``next_state_valid`` confirms that a pre-reset
+        terminal state was captured. That state supervises the last transition,
+        while the episode mask still excludes subsequent reset observations.
         """
         if state.ndim != 2 or action.ndim != 2:
             raise ValueError("state and action must have shapes [N,D] and [N,A]")
@@ -131,6 +135,11 @@ class SequenceReplayBuffer:
             "done": done.detach().reshape(n).to(device="cpu", dtype=torch.bool),
             "terminated": terminated.detach().reshape(n).to(device="cpu", dtype=torch.bool),
         }
+        if next_state_valid is None:
+            next_state_valid = ~done.bool()
+        if next_state_valid.numel() != n:
+            raise ValueError("next_state_valid must contain one value per environment")
+        values["next_state_valid"] = next_state_valid.detach().reshape(n).to(device="cpu", dtype=torch.bool)
         if goal is not None:
             values["goal"] = goal.detach().to(device="cpu", dtype=torch.float32)
             values["next_goal"] = next_goal.detach().to(device="cpu", dtype=torch.float32)
@@ -176,8 +185,8 @@ class SequenceReplayBuffer:
 
         ``mask`` includes the first done transition so its reward and terminal
         label can be learned. Later transitions receive zero weight.
-        ``dynamics_mask`` additionally excludes that done transition, whose next
-        observation may already belong to a reset episode. ``states`` contains
+        ``dynamics_mask`` excludes a done transition unless its true pre-reset
+        next state was captured. ``states`` contains
         the first state followed by each logged next state, hence ``K+1`` frames.
         """
         if batch_size < 1 or window_length < 1:
@@ -207,7 +216,7 @@ class SequenceReplayBuffer:
             "dones": done,
             "terminated": windows["terminated"],
             "mask": mask,
-            "dynamics_mask": mask & ~done,
+            "dynamics_mask": mask & windows["next_state_valid"],
         }
         if "goal" in windows:
             output["goals"] = torch.cat([windows["goal"][:, :1], windows["next_goal"]], dim=1)
@@ -267,6 +276,7 @@ class SequenceReplayBuffer:
             | set(self._REFERENCE_FIELDS)
             | set(self._CRITIC_FIELDS)
             | set(self._PREVIOUS_ACTION_FIELDS)
+            | set(self._NEXT_STATE_FIELDS)
         ):
             raise ValueError("replay snapshot contains unknown transition tensors")
         if size and not set(self._BASE_FIELDS).issubset(fields):
@@ -280,6 +290,10 @@ class SequenceReplayBuffer:
         if fields.intersection(self._CRITIC_FIELDS) and not set(self._CRITIC_FIELDS).issubset(fields):
             raise ValueError("replay snapshot must contain both critic tensors")
         restored = {}
+        # Older snapshots never stored pre-reset terminal states.
+        storage = dict(storage)
+        if size and "next_state_valid" not in storage:
+            storage["next_state_valid"] = ~storage["done"].bool()
         for key, value in storage.items():
             if not isinstance(value, Tensor) or value.ndim < 2 or value.shape[0] != size:
                 raise ValueError("invalid replay tensor shape")

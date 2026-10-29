@@ -69,6 +69,29 @@ class SequenceReplayTests(unittest.TestCase):
             batch["contexts"], torch.tensor([[[10.0, 20.0], [11.0, 21.0], [12.0, 22.0], [13.0, 23.0]]])
         )
 
+    def test_pre_reset_terminal_state_supervises_last_transition(self):
+        replay = SequenceReplayBuffer(capacity_steps=3)
+        for t in range(3):
+            state = torch.tensor([[float(t)]])
+            replay.add(
+                state, state, state[:, 0], state + 1,
+                torch.tensor([t == 1]), torch.tensor([t == 1]),
+                next_state_valid=torch.tensor([True]),
+            )
+        batch = replay.sample(1, 3)
+        self.assertEqual(batch["mask"].tolist(), [[True, True, False]])
+        self.assertEqual(batch["dynamics_mask"].tolist(), [[True, True, False]])
+        self.assertEqual(batch["states"][0, 2, 0].item(), 2)
+
+    def test_legacy_snapshot_cannot_supervise_reset_state(self):
+        replay = SequenceReplayBuffer(capacity_steps=2)
+        self.add_step(replay, 0, torch.tensor([True]), n=1)
+        snapshot = replay.state_dict()
+        del snapshot["storage"]["next_state_valid"]
+        restored = SequenceReplayBuffer()
+        restored.load_state_dict(snapshot)
+        self.assertFalse(restored.sample(1, 1)["dynamics_mask"].any())
+
     def test_snapshot_restores_cursor_and_continues_inserting(self):
         original = SequenceReplayBuffer(capacity_steps=3)
         for t in range(5):
