@@ -261,3 +261,45 @@ CUDA_VISIBLE_DEVICES=0 "$PY" gear_sonic/eval_agent_trl.py \
   ++manager_env.config.save_rendering_dir="$VIDEO_DIR" \
   manager_env/recorders=render
 ```
+
+## 9. 导出控制策略 ONNX
+
+下面导出 WAM 训练得到的三个 encoder（含 FSQ）和 shared decoder。
+将 `RUN_DIR` 改为实际训练目录，并保留 checkpoint 旁的 `config.yaml`。
+导出入口仍会初始化 Isaac Lab 环境，需要在已配置好 Isaac Lab 的 sonic 环境中运行，
+且保存配置中的机器人资产和运动数据路径必须可访问。
+
+```bash
+cd /data/ouqin/GR00T-WholeBodyControl
+PY=/data/ouqin/envs/sonic/bin/python
+RUN_DIR=/data/ouqin/runs_supermimic/wam_4096_total_20261029_095623
+
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+"$PY" -c 'import gear_sonic; print(gear_sonic.__file__)'
+
+CUDA_VISIBLE_DEVICES=0 "$PY" -m gear_sonic.eval_agent_trl \
+  checkpoint="$RUN_DIR/last.pt" \
+  ++headless=true \
+  ++num_envs=1 \
+  '++eval_callbacks=[]' \
+  ++export_onnx_only=true
+```
+
+导入路径应指向 `/data/ouqin/GR00T-WholeBodyControl/gear_sonic/`。
+使用仓库根目录下的 `-m gear_sonic.eval_agent_trl` 入口，避免环境中的
+`sonic_bumi_full` 等其他仓库抢先提供同名包。导出要求 `num_envs=1`，
+无需使用 8 卡训练启动器；导出完成后程序退出，不进入录屏循环。
+
+输出文件位于：
+
+```text
+RUN_DIR/
+├── exported/
+│   ├── model_step_XXXXXX_encoder.onnx
+│   ├── model_step_XXXXXX_decoder.onnx
+│   ├── model_step_XXXXXX_g1.onnx
+│   ├── model_step_XXXXXX_smpl.onnx
+│   └── model_step_XXXXXX_teleop.onnx
+├── model_config.yaml
+└── model_step_XXXXXX.pt
+```
