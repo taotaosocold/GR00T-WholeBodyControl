@@ -44,7 +44,7 @@ scp /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle \
 
 ## 3. 在 GPU14 同步仓库
 
-先确认服务器上没有正在运行的训练，再执行：
+先按第 7 节停止需要更新的训练，确认进程退出后，再执行：
 
 ```bash
 cd /data/ouqin/GR00T-WholeBodyControl
@@ -73,23 +73,7 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 "$PY" -c 'import sys, torch, accelerate; print(sys.executable); print(torch.__version__); print(accelerate.__version__)'
 ```
 
-## 5. 运行测试
-
-```bash
-"$PY" -m compileall -q gear_sonic/trl gear_sonic/tests
-
-"$PY" -m unittest \
-  gear_sonic.tests.test_sequence_replay \
-  gear_sonic.tests.test_wam_projection \
-  gear_sonic.tests.test_wam_training -v
-
-"$PY" -m gear_sonic.tests.test_wam
-
-GLOO_SOCKET_IFNAME=lo "$PY" \
-  -m unittest gear_sonic.tests.test_wam_distributed -v
-```
-
-## 6. 8 卡 WAM 冒烟测试
+## 5. 8 卡 WAM 冒烟测试
 
 `num_envs` 是每个进程的环境数。下面的 `64` 表示 8 卡共 512 个环境。
 此命令关闭 UTD 调度以固定每轮采集 32 步，并缩短 actor 预热，
@@ -151,7 +135,7 @@ tail -f "$RUN_DIR/train.log"
 确认日志包含 `world/loss`、`actor/loss`、`critic/loss` 且数值有限，
 并生成 `last.pt`，才说明这次冒烟覆盖了三类更新。
 
-## 7. 正式训练
+## 6. 正式训练
 
 下面按 SuperMimic 单进程默认的全局采样规模分配到 8 卡：
 每卡 512 个环境，每环境 replay 1000 步；WAM batch 每卡 256（全局 2048），
@@ -220,11 +204,28 @@ tail -f "$RUN_DIR/train.log"
 nvidia-smi
 ```
 
-停止本次训练：
+## 7. 停止训练与检查残留进程
+
+以下命令在运行训练的服务器上执行。`RUN_DIR` 必须是要停止的那次训练目录，
+重新登录后需要重新设置。将下面的 `/目录名` 替换为实际目录。
+先确认主机；如果有 PID 文件，再查看启动器和 worker：
 
 ```bash
-kill -TERM "$(cat "$RUN_DIR/launcher.pid")"
+RUN_DIR=/data/ouqin/runs_supermimic/wam_4096_total_20261029_095623
+
+for STOP_PID in $(pgrep -u "$(id -u)" -f 'gear_sonic/train_agent_trl[.]py' || true); do
+  if [ "$(stat -c %u "/proc/$STOP_PID" 2>/dev/null)" = "$(id -u)" ] &&
+     grep -Fzxq -- "experiment_dir=$RUN_DIR" "/proc/$STOP_PID/cmdline" 2>/dev/null; then
+    printf '发送 TERM：PID=%s\n' "$STOP_PID"
+    kill -TERM "$STOP_PID"
+  fi
+done
+
+sleep 35
+nvidia-smi
+pgrep -a -u "$(id -u)" -f 'gear_sonic/train_agent_trl[.]py'
 ```
+
 ## 8. 录制屏幕
 ```bash
 cd /data/ouqin/GR00T-WholeBodyControl
