@@ -64,6 +64,16 @@ git status --short
 
 ## 4. 检查 sonic 环境
 
+在 GPU14 上先创建 tmux 会话，本节和第 5、6 节的命令都在该会话内执行：
+
+```bash
+tmux new -s wam
+```
+
+已有 `wam` 会话时使用 `tmux attach -t wam` 返回。
+PyTorch Elastic 会注册 SIGHUP 处理器，可能覆盖 `nohup` 的忽略设置，
+因此这里使用 tmux 保留训练会话。进入 tmux 后再设置下面的环境变量。
+
 ```bash
 cd /data/ouqin/GR00T-WholeBodyControl
 
@@ -148,7 +158,7 @@ actor batch 每卡 512（全局 4096）。`utd=0.4` 每轮交替采集 2、3 步
 RUN_DIR=/data/ouqin/runs_supermimic/wam_4096_total_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$RUN_DIR"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 nohup "$PY" -u \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$PY" -u \
   -m accelerate.commands.launch \
   --multi_gpu \
   --num_machines=1 \
@@ -191,18 +201,33 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 nohup "$PY" -u \
   ++manager_env.commands.motion.encoder_sample_probs.g1=1.0 \
   ++manager_env.commands.motion.encoder_sample_probs.smpl=1.0 \
   ++manager_env.commands.motion.encoder_sample_probs.teleop=0.0 \
-  < /dev/null > "$RUN_DIR/train.log" 2>&1 &
-
-
-echo $! > "$RUN_DIR/launcher.pid"
+  < /dev/null > "$RUN_DIR/train.log" 2>&1
 ```
 
-查看训练：
+正式训练在 tmux 内前台运行。启动后，按 **Ctrl+B**，松开后按 **D** 分离会话，
+随后即可断开 SSH。重新登录后执行 `tmux attach -t wam` 返回训练会话。
+tmux 不会在服务器重启或训练程序报错后自动恢复训练。
+
+查看训练（另开一个 SSH 终端，将 `RUN_DIR` 设为实际训练目录）：
 
 ```bash
+RUN_DIR=/data/ouqin/runs_supermimic/wam_4096_total_实际时间戳
 tail -f "$RUN_DIR/train.log"
 nvidia-smi
 ```
+
+断点续训时，在 tmux 内重新执行第 4 节的环境设置，将第 6 节开头的 `RUN_DIR`
+改为原训练目录，并将原命令中的 `+resume=false` 和 `checkpoint=null` 替换为：
+
+```bash
+  +resume=true \
+  checkpoint="$RUN_DIR/last.pt" \
+```
+
+其余参数保持与原训练一致（包括 8 个进程及每卡环境数），日志重定向改为
+`>> "$RUN_DIR/train.log" 2>&1`，保留已有日志。多卡恢复需要保留 `last.pt`
+引用的配套 `last.*.rank*.pt` 文件。`save_replay=false` 时不恢复经验池，
+会重新采样和预热；恢复的是最近成功保存的 checkpoint。
 
 ## 7. 停止训练与检查残留进程
 
@@ -303,3 +328,65 @@ RUN_DIR/
 ├── model_config.yaml
 └── model_step_XXXXXX.pt
 ```
+
+## 10. Sim2Sim / PICO / Sim2Real
+
+下面以 tsz 的 G1 仓库和第 6000 步模型为例，命令在 tsz 的图形桌面终端执行。
+三种方式共用部署机器上的模型目录：
+
+```text
+/home/user/tsz/GR00T-WholeBodyControl/gear_sonic_deploy/policy/wam_step_006000/
+├── model_step_006000_encoder.onnx
+├── model_step_006000_decoder.onnx
+└── observation_config.yaml
+```
+
+encoder/decoder 使用同一次导出的文件。当前 `sonic_release` 的配置可从
+`gear_sonic_deploy/policy/release/observation_config_sonic_release.yaml` 复制为上述
+`observation_config.yaml`。换模型时同步修改下面的 `--cp` 前缀和配置路径。
+
+### Sim2Sim：两个终端
+
+终端 1 启动 MuJoCo（需已安装 `.venv_sim`）：
+
+```bash
+cd /home/user/tsz/GR00T-WholeBodyControl
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop.py
+```
+
+终端 2 加载 WAM 模型；`--cp` 不带 `_encoder.onnx` / `_decoder.onnx` 后缀：
+
+```bash
+cd /home/user/tsz/GR00T-WholeBodyControl/gear_sonic_deploy
+bash deploy.sh \
+  --cp policy/wam_step_006000/model_step_006000 \
+  --obs-config policy/wam_step_006000/observation_config.yaml \
+  --planner /home/user/Downloads/sonic_bumi-main/gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx \
+  --input-type keyboard \
+  sim
+```
+
+终端 2 按 `]` 启动，MuJoCo 窗口按 `9` 放下机器人；回到终端 2 按 `T` 播放，
+`N/P` 切换动作，`O` 停止退出。
+
+### PICO：仿真增加第三个终端
+
+沿用上面的两个终端，将部署命令的 `--input-type keyboard` 改为
+`--input-type zmq_manager`，保留 planner。终端 3 启动采集（需已配置 `.venv_teleop`）：
+
+```bash
+cd /home/user/tsz/GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py --manager
+```
+
+PICO 按 `A+B+X+Y` 校准并启停控制，`A+X` 切换全身 POSE 模式；仿真中仍需在
+MuJoCo 窗口按 `9` 放下机器人。默认采集与部署在同机，完整操作见
+[PICO 教程](docs/source/tutorials/vr_wholebody_teleop.md)。
+
+### Sim2Real
+
+先用当前权重完成仿真验证，再关闭 MuJoCo。部署命令末尾的 `sim` 改为 `real`
+（自动选择 G1 网卡，启动时核对）；参考动作使用 `keyboard`，PICO 使用
+`zmq_manager` 并继续运行上面的 PICO 采集终端。模型和配置目录不变。
