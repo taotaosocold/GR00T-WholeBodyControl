@@ -196,6 +196,15 @@ class WAMTrainer:
         if accelerator is not None and accelerator.num_processes != self.distributed.world_size:
             raise ValueError("Accelerator and initialized torch.distributed world sizes disagree")
         self.settings = dict(settings or {})
+        reset_sampling = self.settings.get("reset_sampling", "adaptive_failure")
+        if reset_sampling != "adaptive_failure":
+            raise ValueError(
+                "WAM reset_sampling must be 'adaptive_failure' (Sonic's existing sampler); "
+                "the SuperMimic return-based reset sampler is not implemented. "
+                "Old configs with reset_sampling=return must explicitly select adaptive_failure."
+            )
+        if int(self.settings.get("warmup_steps", 0)) < 0:
+            raise ValueError("WAM warmup_steps must be nonnegative")
         self.actor_return_reduction = str(self.settings.get(
             "actor_return_reduction",
             "sum" if dict((world_model_config or {}).get("cfg", {})).get("state_type") == "physical" else "mean",
@@ -255,6 +264,14 @@ class WAMTrainer:
         ):
             raise ValueError("replay_steps must be at least the imagination horizon")
         self.reference_bank = WAMReferenceBank(self.layout.tokenizer_specs) if self.independent_imagination else None
+        self.compact_reference = self.independent_imagination and bool(
+            self.settings.get("compact_reference", True)
+        )
+        if self.compact_reference and (
+            self.layout.goal_specs != [("tokenizer", 0, self.reference_bank.goal_dim)]
+            or not self.reference_bank.routing_specs
+        ):
+            raise ValueError("Compact WAM references require one tokenizer group with modality routing")
         # Sonic's privileged observations contain the *real* robot trajectory.
         # They cannot describe an independently imagined robot. Physical mode
         # builds tracking features from its predicted state and conditions on
@@ -318,6 +335,8 @@ class WAMTrainer:
             "observation_noise": wam_observation_noise(self.settings),
             "actor_return_reduction": self.actor_return_reduction,
             "aux_loss_scale": float(self.settings.get("aux_loss_scale", 1.0)),
+            "error_frame": self.world_model.error_frame,
+            "loss_reduction": self.world_model.loss_reduction,
         } if self.physical_wam else None
         self.distributed.check_consistent(self.numerical_spec, "WAM numerical settings")
         self.control_dt = float(getattr(simulator, "step_dt", self.settings.get("control_dt", 0.02)))
@@ -381,7 +400,12 @@ class WAMTrainer:
         self.actor_optimizer = torch.optim.Adam(trainable, lr=lr, betas=(0.9, 0.95))
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
         self.critic_norm = RunningNorm(self.critic_input_dim).to(self.device)
-        self.replay = SequenceReplayBuffer(int(self.settings.get("replay_steps", 1000)))
+        self.replay = SequenceReplayBuffer(
+            int(self.settings.get("replay_steps", 1000)),
+            actor_history_layout=(
+                self._actor_history_specs if self.settings.get("compact_replay", True) else None
+            ),
+        )
         tracked = min(env.num_envs, int(self.settings.get("replay_envs", env.num_envs)))
         self.replay_env_ids = torch.randperm(env.num_envs, device=self.device)[:tracked]
         self._last_runtime_path = None
@@ -643,7 +667,10 @@ class WAMTrainer:
             # this conversion before substituting terminal states: done rows
             # of next_obs already describe the newly reset robot.
             replay_goal, replay_next_goal = goal, next_goal
-            if self.physical_wam and self.layout.goal_dim:
+            if self.compact_reference:
+                replay_goal = self.reference_bank.pack_routing(goal)
+                replay_next_goal = self.reference_bank.pack_routing(next_goal)
+            elif self.physical_wam and self.layout.goal_dim:
                 replay_goal = self.goal_observations.to_world(goal, state)
                 replay_next_goal = self.goal_observations.to_world(next_goal, next_state)
             next_state_valid = ~dones.bool()
@@ -720,8 +747,8 @@ class WAMTrainer:
                     replay_goal[indices], replay_next_goal[indices],
                     actor_obs[indices], next_actor_obs[indices],
                     context=context[indices] if context is not None else None,
-                    reference=reference[indices] if self.reference_keys else None,
-                    next_reference=next_reference[indices] if self.reference_keys else None,
+                    reference=reference[indices] if self.reference_keys and not self.compact_reference else None,
+                    next_reference=next_reference[indices] if self.reference_keys and not self.compact_reference else None,
                     critic_state=critic_state[indices] if self.critic_keys else None,
                     next_critic_state=next_critic_state[indices] if self.critic_keys else None,
                     previous_action=previous_world_action[indices],
@@ -1010,6 +1037,7 @@ class WAMTrainer:
         batch = self.reference_bank.trajectory(
             seed["reference_index"], seed["goal"], horizon,
             self.critic_future_frames, self.critic_future_stride, self.device,
+            routing_only=self.compact_reference,
         )
         # These are seed metadata, not a logged trajectory. The reference
         # advances independently and ξ remains the seed episode's physics.
@@ -1214,6 +1242,16 @@ class WAMTrainer:
         window = int(self.settings.get("window", 8))
         step_accumulator = 0.0
         collected_steps = 0
+        warmup_steps = int(self.settings.get("warmup_steps", 0))
+        # Seed the real replay before any fitting, as in SuperMimic. Retain
+        # warmup_before_updates=false for controlled comparisons with old runs.
+        missing_warmup = max(0, warmup_steps - len(self.replay))
+        if (
+            self.iteration < iterations and self.world_updates == 0 and missing_warmup
+            and self.settings.get("warmup_before_updates", True)
+        ):
+            self.collect(missing_warmup)
+            collected_steps = missing_warmup
         for iteration in range(self.iteration, iterations):
             started = time.perf_counter()
             self._maybe_resample_motions(iteration)
@@ -1246,7 +1284,10 @@ class WAMTrainer:
             can_imagine = (
                 self.world_updates >= int(self.settings.get("warmup_world_updates", 100))
                 and iteration >= int(self.settings.get("wm_only_iters", 0))
-                and collected_steps >= int(self.settings.get("warmup_steps", 0))
+                and (
+                    collected_steps >= warmup_steps
+                    or (self.settings.get("warmup_before_updates", True) and len(self.replay) >= warmup_steps)
+                )
                 and len(self.replay) >= (1 if self.independent_imagination else int(self.settings.get("horizon", 32)))
             )
             if self.distributed.all_finite(can_imagine):
@@ -1262,6 +1303,7 @@ class WAMTrainer:
                 seconds=time.perf_counter() - started,
                 learning_rate=learning_rate,
                 collected_steps=collected_steps,
+                **{"replay/host_gib": self.replay.storage_nbytes() / 1024**3},
             )
             metrics = self.distributed.reduce_metrics(metrics)
             if self.distributed.is_main:
@@ -1389,6 +1431,7 @@ class WAMTrainer:
             "wam_critic_spec": self.critic_spec if self.physical_wam else None,
             "wam_context_schema": self.context_schema if self.physical_wam else None,
             "wam_numerical_spec": self.numerical_spec,
+            "wam_replay_spec": {"compact_reference": self.compact_reference},
         }
         return payload
 
@@ -1401,7 +1444,9 @@ class WAMTrainer:
         temporary.replace(path)
 
     def load_checkpoint(self, path, *, resume=False):
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        # Replay and immutable motion banks are CPU data, even when inference
+        # runs on CUDA. Never stage the full checkpoint in scarce GPU memory.
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         policy_state = checkpoint.get("policy_state_dict", checkpoint.get("actor_model_state_dict"))
         if policy_state is None:
             model_state = checkpoint.get("model_state_dict", {})
@@ -1422,8 +1467,19 @@ class WAMTrainer:
                 raise ValueError("Cannot resume WAM with different critic future reference settings")
             if self.physical_wam and checkpoint.get("wam_context_schema") != self.context_schema:
                 raise ValueError("Cannot resume WAM with a different physical context schema")
-            if self.physical_wam and checkpoint.get("wam_numerical_spec") != self.numerical_spec:
-                raise ValueError("Cannot resume WAM with different normalization, noise or actor objective settings")
+            saved_numerical_spec = deepcopy(checkpoint.get("wam_numerical_spec"))
+            if saved_numerical_spec is not None:
+                # Missing keys identify the pre-fix algorithm. Never silently
+                # resume its world model under the new target-frame objective.
+                saved_numerical_spec.setdefault("error_frame", "predicted")
+                saved_numerical_spec.setdefault("loss_reduction", "mean_valid")
+            if self.physical_wam and saved_numerical_spec != self.numerical_spec:
+                raise ValueError(
+                    "Cannot resume WAM with different normalization, noise or actor objective settings "
+                    "(including error_frame/loss_reduction). Pre-fix checkpoints use "
+                    "world_model.cfg.error_frame=predicted and loss_reduction=mean_valid; "
+                    "otherwise use resume=false to load only the policy."
+                )
             if checkpoint.get("wam_world_size", 1) != self.distributed.world_size:
                 raise ValueError(
                     "WAM resume requires the saved process count; use resume=false to load policy only"
@@ -1464,6 +1520,11 @@ class WAMTrainer:
                 self._last_checkpoint_path = Path(path).resolve()
             if "wam_replay" in runtime:
                 self.replay.load_state_dict(runtime["wam_replay"])
+                # A legacy full replay remains valid; its stored goal schema
+                # determines how seeds are read until the next fresh run.
+                self.compact_reference = bool(
+                    checkpoint.get("wam_replay_spec", {}).get("compact_reference", False)
+                )
                 if self.reference_bank is not None:
                     if "wam_reference_bank" not in runtime:
                         raise ValueError("WAM replay checkpoint is missing its immutable motion references")

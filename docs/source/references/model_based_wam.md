@@ -81,8 +81,10 @@ The default UTD schedule takes precedence over `collect_steps`; the default
 reaching actor/critic updates. Check for finite `actor/loss` and `critic/loss`
 alongside `world/loss`, rather than treating checkpoint creation as coverage.
 
-The extra WAM observation groups are passive when PPO is selected; PPO's policy,
-reward, termination, and optimizer configuration is unchanged. Omitting
+The extra WAM observation groups are enabled only for WAM. PPO removes these
+four reserved groups from older saved configurations as well, avoiding unused
+rollout storage and simulator-property reads. PPO's policy, reward, termination,
+and optimizer configuration is unchanged. Omitting
 `trainer=wam world_model=wam_dynamics` keeps the existing PPO update path.
 
 New physical WAM runs default to `trainer.settings.align_real_termination=true`.
@@ -164,6 +166,18 @@ refit the world model and critic. Full resume also checks the critic future
 frame count and interval, physical-context layout and numerical settings;
 matching network dimensions alone are insufficient.
 
+Fitting now defaults to `world_model.cfg.error_frame=target`, matching the
+source SuperMimic implementation: predicted-vs-real errors use the real next
+state's heading/rotation. Current-to-next dynamics increments and their
+normalizer still use the current state's frame. Older physical checkpoints
+without this setting used `predicted`; full resume requires explicitly setting
+`world_model.cfg.error_frame=predicted`. Policy-only evaluation/export is
+unaffected. `world_model.cfg.loss_reduction=mean_valid` preserves the previous
+valid-transition average; `sum_per_batch` reproduces the source window sum.
+Changing either numerical setting requires a fresh model fit rather than a
+silent full resume. Checkpoints, including policy-only evaluation, are loaded
+on CPU before model parameters are copied to their device.
+
 ## Observations, references, and replay
 
 The WAM state is the canonical 71-dimensional physical state. The actor's
@@ -229,7 +243,18 @@ clip frames, clamped within that clip. Each clip's physical and multimodal
 references are stored once on CPU and survive motion-library subset reloads;
 replay stores two integer indices per transition. Old generations are retained
 while replay still refers to them. This avoids storing two duplicate critic
-windows per replay transition. Complete context does increase replay storage;
+windows per replay transition. With `compact_reference: true`, replay also
+omits full current/next goals and reference states, storing only clip/frame
+indices and the seed's modality/frame routing. The full clean reference goals
+are reconstructed from the same bank before applying the original noise,
+clipping and scaling. `compact_replay: true` stores single proprioceptive
+frames and reconstructs term-major actor histories with a boundary halo and
+original noisy segment prefixes. No history is re-noised or spliced across a
+reset. Both optimizations have a `false` option for numerical comparisons;
+old replay snapshots restore their saved storage format. The per-rank
+`replay/host_gib` metric counts allocated replay tensors, halo and prefixes,
+excluding reference banks, simulator memory and temporary batches.
+Complete context does increase replay storage;
 its dimension depends on the actual loaded robot. Sampled policy trajectories
 and fitting windows are transferred to GPU.
 
@@ -274,11 +299,23 @@ Non-finite losses or gradients reject the update. Real simulator reward and
 imagined reward are logged separately. Validation must compare open-loop model
 errors and real tracking returns, not just an increasing imagined return.
 
-These configuration values do not imply exact SuperMimic behavior. Currently,
-`warmup_steps` gates actor updates only; WAM fitting starts once replay contains
-`window` steps. SuperMimic collects 64 steps before any optimization. The
-`reset_sampling: return` setting is not yet consumed by the reset sampler;
-GR00T's existing adaptive sampler remains active.
+These configuration values do not imply exact SuperMimic behavior.
+`warmup_before_updates: true` now collects `warmup_steps` real steps before
+the first optimization, including when a restart refills an empty replay.
+Set it to `false` to reproduce the previous actor-only warmup gate.
+`reset_sampling: adaptive_failure` explicitly selects GR00T's existing
+failure-based adaptive sampler; the old misleading value `return` is rejected
+because SuperMimic's return-based reset sampler is not implemented.
+`trainer.settings.terrain_type: null` retains the experiment's terrain;
+set `plane` for a flat-ground baseline. The inherited `trimesh` terrain is
+not encoded in WAM's robot-only physical context.
+
+For controlled comparisons, use the same robot, fixed held-out motion list,
+reward/termination definitions, encoder, observation noise, seeds and GPU-hour
+budget for PPO and WAM. Disable motion augmentation for validation and score
+complete real simulator trajectories per modality, rather than imagined return.
+Evaluate one numerical change at a time; passing unit tests does not establish
+a convergence or hardware-performance improvement.
 
 ## Reading the training diagnostics
 
@@ -300,7 +337,7 @@ input modality before judging control quality or a speedup over PPO.
 | `world/dynamics_valid_fraction` | Fraction of fitting-window steps with a usable, non-reset next state for dynamics supervision. |
 | `world/last_valid_fraction` | Fraction of sampled windows with a usable final dynamics step. Interpret `world/state_error_last` only when this is positive. |
 | `actor/effective_horizon` | Mean number of valid reference steps before the sampled replay boundary, up to `horizon`; this can be far shorter than the configured imagination horizon. |
-| `actor/aux_loss` | Coefficient-weighted FSQ auxiliary loss at the imagined seed. `actor/loss` adds this term multiplied by `aux_loss_scale` to the negative horizon-normalized imagined return. |
+| `actor/aux_loss` | Coefficient-weighted FSQ auxiliary loss at the imagined seed. `actor/loss` adds this term multiplied by `aux_loss_scale` to the negative discounted imagined return (`actor_return_reduction=sum` by default). |
 
 Scalar environment summaries with the prefixes `Episode_Reward/`,
 `Episode_Termination/`, and `Metrics/motion/` are also logged under `real/`.

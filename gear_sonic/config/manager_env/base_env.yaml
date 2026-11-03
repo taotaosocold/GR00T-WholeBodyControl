@@ -9,11 +9,12 @@ defaults:
   - observations/tokenizer:
   - observations/height_map:
   - observations/policy_atm:
-  # Passive WAM groups are ignored by PPO; trainer=wam consumes them.
-  - observations/wam: proprio
-  - observations/wam_state: physical
-  - observations/wam_reference: physical
-  - observations/wam_context: physical
+  # Reserve Hydra override paths without computing WAM observations in PPO.
+  # The physical WAM configurator supplies these templates when needed.
+  - observations/wam:
+  - observations/wam_state:
+  - observations/wam_reference:
+  - observations/wam_context:
   - observations/residual_action:
   - rewards: tracking/base
   - terminations: tracking/base

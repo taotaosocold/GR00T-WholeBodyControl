@@ -34,12 +34,19 @@ class WAMContextConfigurationTests(unittest.TestCase):
         configure_wam_context(config)
         self.assertFalse(config.manager_env.observations.wam_context.xi.params.complete)
 
-    def test_ppo_and_flat_configuration_are_unchanged(self):
-        for config in (configuration(target="PPOTrainer"), configuration(state_type="flat")):
-            with self.subTest(target=config.trainer._target_, state_type=config.world_model.cfg.state_type):
-                before = OmegaConf.to_container(config)
-                self.assertFalse(configure_wam_context(config))
-                self.assertEqual(OmegaConf.to_container(config), before)
+    def test_ppo_removes_legacy_context_without_changing_user_groups(self):
+        config = configuration(target="PPOTrainer")
+        config.manager_env.observations.user_group = {"sensor": {"func": "example.sensor"}}
+        before = OmegaConf.to_container(config.manager_env.observations.user_group)
+        self.assertFalse(configure_wam_context(config))
+        self.assertNotIn("wam_context", config.manager_env.observations)
+        self.assertEqual(OmegaConf.to_container(config.manager_env.observations.user_group), before)
+
+    def test_flat_configuration_is_unchanged(self):
+        config = configuration(state_type="flat")
+        before = OmegaConf.to_container(config)
+        self.assertFalse(configure_wam_context(config))
+        self.assertEqual(OmegaConf.to_container(config), before)
 
 
 if __name__ == "__main__":

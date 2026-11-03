@@ -176,26 +176,47 @@ def physical_state_invariant_features(state: torch.Tensor) -> torch.Tensor:
     )
 
 
-def physical_state_transition_error(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Frame-local state error matching SuperMimic's autoregressive objective."""
-    position, rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = physical_state_parts(predicted)
-    target_position, target_rotation, target_linear_velocity, target_angular_velocity, target_joint_position, target_joint_velocity = physical_state_parts(target)
+def physical_state_transition_delta(current: torch.Tensor, next_state: torch.Tensor) -> torch.Tensor:
+    """Current-frame increments used to normalize and integrate WAM outputs.
+
+    These are dynamics targets, rather than the target-frame prediction error
+    used by SuperMimic's autoregressive fitting objective.
+    """
+    position, rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = physical_state_parts(current)
+    next_position, _, next_linear_velocity, next_angular_velocity, next_joint_position, next_joint_velocity = physical_state_parts(next_state)
     heading = _yaw_mat(rotation)
     rotation_t = rotation.transpose(-1, -2)
-    quaternion = F.normalize(predicted[..., 3:7], dim=-1)
-    target_quaternion = F.normalize(target[..., 3:7], dim=-1)
+    quaternion = F.normalize(current[..., 3:7], dim=-1)
+    next_quaternion = F.normalize(next_state[..., 3:7], dim=-1)
     inverse = torch.cat((quaternion[..., :1], -quaternion[..., 1:]), dim=-1)
-    dtheta = _quat_to_rotvec(_quat_multiply(inverse, target_quaternion))
+    dtheta = _quat_to_rotvec(_quat_multiply(inverse, next_quaternion))
     return torch.cat(
         (
-            (heading.transpose(-1, -2) @ (target_position - position).unsqueeze(-1)).squeeze(-1),
+            (heading.transpose(-1, -2) @ (next_position - position).unsqueeze(-1)).squeeze(-1),
             dtheta,
-            (rotation_t @ (target_linear_velocity - linear_velocity).unsqueeze(-1)).squeeze(-1),
-            (rotation_t @ (target_angular_velocity - angular_velocity).unsqueeze(-1)).squeeze(-1),
-            target_joint_position - joint_position,
-            target_joint_velocity - joint_velocity,
+            (rotation_t @ (next_linear_velocity - linear_velocity).unsqueeze(-1)).squeeze(-1),
+            (rotation_t @ (next_angular_velocity - angular_velocity).unsqueeze(-1)).squeeze(-1),
+            next_joint_position - joint_position,
+            next_joint_velocity - joint_velocity,
         ), dim=-1,
     )
+
+
+def physical_state_transition_error(
+    predicted: torch.Tensor, target: torch.Tensor, *, error_frame: str = "target",
+) -> torch.Tensor:
+    """Autoregressive fitting error, expressed in the true target pose's frame.
+
+    ``predicted`` reproduces the earlier WAM fitting convention for checkpoint
+    continuation and ablations. Its component signs also follow that earlier
+    convention; the weighted squared-error objective is insensitive to them.
+    Neither choice changes the current-frame dynamics output targets.
+    """
+    if error_frame == "target":
+        return physical_state_transition_delta(target, predicted)
+    if error_frame == "predicted":
+        return physical_state_transition_delta(predicted, target)
+    raise ValueError(f"unknown WAM error_frame: {error_frame}; expected target or predicted")
 
 
 def _mlp(in_dim: int, hidden: tuple[int, ...], out_dim: int) -> nn.Sequential:
@@ -293,6 +314,10 @@ class WAMConfig:
     # The six floors correspond to dp, dtheta, dv, dw, dq and dqd.
     delta_norm_eps: float = 1e-4
     state_error_floor: tuple[float, ...] = (0.003, 0.005, 0.02, 0.05, 0.003, 0.05)
+    error_frame: str = "target"
+    # Preserve the existing per-valid-transition scale by default. The source
+    # SuperMimic objective sums each window's errors and averages over the batch.
+    loss_reduction: str = "mean_valid"
 
 
 class StateSpaceWorldModel(nn.Module):
@@ -325,6 +350,14 @@ class StateSpaceWorldModel(nn.Module):
         term_hidden = tuple(int(v) for v in getattr(cfg, "term_hidden", (128, 128)))
         reward_hidden = tuple(int(v) for v in getattr(cfg, "reward_hidden", term_hidden))
         self.reward_loss_coef = float(getattr(cfg, "reward_loss_coef", 1.0))
+        self.error_frame = str(getattr(cfg, "error_frame", "target"))
+        self.loss_reduction = str(getattr(cfg, "loss_reduction", "mean_valid"))
+        if self.error_frame not in {"target", "predicted"}:
+            raise ValueError(f"unknown WAM error_frame: {self.error_frame}; expected target or predicted")
+        if self.loss_reduction not in {"mean_valid", "sum_per_batch"}:
+            raise ValueError(
+                f"unknown WAM loss_reduction: {self.loss_reduction}; expected mean_valid or sum_per_batch"
+            )
         if self.state_dim < 1 or self.action_dim < 1 or self.goal_dim < 0:
             raise ValueError("state/action dimensions must be positive and goal_dim non-negative")
         model_in = self.state_dim + self.action_dim + self.context_dim
@@ -599,7 +632,9 @@ class StateSpaceWorldModel(nn.Module):
             current = result["next_state"]
             error_target = states[:, t + 1]
             if self.state_type == "physical":
-                transition = physical_state_transition_error(current, error_target)
+                transition = physical_state_transition_error(
+                    current, error_target, error_frame=self.error_frame,
+                )
                 error_std = torch.maximum(self.delta_norm.std(), self.state_error_floor)
                 state_errors.append((transition / error_std).square().mean(-1))
             else:
@@ -613,14 +648,14 @@ class StateSpaceWorldModel(nn.Module):
         error = torch.stack(state_errors, dim=1)
         valid = mask.to(error.dtype)
         state_valid = valid if dynamics_mask is None else valid * dynamics_mask.to(error.dtype)
-        state_loss = (error * state_valid).sum() / state_valid.sum().clamp_min(1)
+        state_loss = self._reduce_transition_loss(error, state_valid)
         losses = {"state_loss": state_loss, "loss": state_loss}
         if reward_preds and rewards is not None:
             reward_targets = rewards.to(reward_preds[0].dtype)
             if reward_targets.shape != (actions.shape[0], actions.shape[1]):
                 reward_targets = reward_targets.reshape(actions.shape[0], actions.shape[1])
             reward_error = (torch.stack(reward_preds, dim=1) - reward_targets).square()
-            reward_loss = (reward_error * valid).sum() / valid.sum().clamp_min(1)
+            reward_loss = self._reduce_transition_loss(reward_error, valid)
             losses["reward_loss"] = reward_loss
             losses["loss"] = losses["loss"] + self.reward_loss_coef * reward_loss
         if term_logits and dones is not None:
@@ -628,7 +663,7 @@ class StateSpaceWorldModel(nn.Module):
             if dones.shape != logits.shape:
                 dones = dones.reshape_as(logits)
             term_loss = F.binary_cross_entropy_with_logits(logits, dones.float(), reduction="none")
-            term_loss = (term_loss * valid).sum() / valid.sum().clamp_min(1)
+            term_loss = self._reduce_transition_loss(term_loss, valid)
             losses["termination_loss"] = term_loss
             losses["loss"] = losses["loss"] + term_loss
         losses["last_valid_fraction"] = state_valid[:, -1].mean()
@@ -641,6 +676,10 @@ class StateSpaceWorldModel(nn.Module):
             state_valid[:, -1].sum().clamp_min(1)
         )
         return losses
+
+    def _reduce_transition_loss(self, error: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        denominator = valid.sum().clamp_min(1) if self.loss_reduction == "mean_valid" else max(len(error), 1)
+        return (error * valid).sum() / denominator
 
     @torch.no_grad()
     def update_normalizers(
@@ -663,7 +702,7 @@ class StateSpaceWorldModel(nn.Module):
             self.context_norm.update(context)
         if next_states is not None:
             if self.state_type == "physical":
-                self.delta_norm.update(physical_state_transition_error(states, next_states))
+                self.delta_norm.update(physical_state_transition_delta(states, next_states))
             else:
                 self.delta_norm.update(next_states - states)
 
@@ -748,5 +787,5 @@ DifferentiableWorldModel = StateSpaceWorldModel
 __all__ = [
     "StateSpaceWorldModel", "DifferentiableWorldModel", "RunningNorm", "WAMConfig", "WAMCritic",
     "PHYSICAL_STATE_DIM", "PHYSICAL_DELTA_DIM", "physical_state_parts",
-    "physical_state_invariant_features", "physical_state_transition_error",
+    "physical_state_invariant_features", "physical_state_transition_delta", "physical_state_transition_error",
 ]

@@ -84,6 +84,39 @@ def manager():
 
 
 class WAMReferenceTests(unittest.TestCase):
+    def test_compact_routing_reconstructs_exact_full_goal_trajectories(self):
+        specs = (
+            ("command_z", 0, 1, (1,)),
+            ("encoder_index", 1, 4, (3,)),
+            ("command_num_frames", 4, 5, (1,)),
+        )
+        bank = WAMReferenceBank(specs)
+        states = torch.randn(9, 71)
+        goals = torch.randn(9, 5)
+        key = bank.register(states, goals)
+        indices = torch.tensor([[key, 0], [key, 7]])
+        seeds = torch.tensor([[9., 1., 0., 1., 3.], [8., 0., 1., 0., 2.]])
+        packed = bank.pack_routing(seeds)
+        self.assertEqual(packed.shape, (2, 4))
+        full = bank.trajectory(indices, seeds, 4, 3, 2, "cpu")
+        compact = bank.trajectory(indices, packed, 4, 3, 2, "cpu", routing_only=True)
+        for field in full:
+            torch.testing.assert_close(compact[field], full[field], rtol=0, atol=0)
+        # Packing is independent of the global RNG and leaves inputs untouched.
+        rng = torch.get_rng_state()
+        bank.pack_routing(seeds)
+        torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+        torch.testing.assert_close(seeds[:, 0], torch.tensor([9., 8.]))
+
+    def test_compact_routing_rejects_incompatible_seed_layout(self):
+        bank = WAMReferenceBank(SPECS)
+        key = bank.register(torch.zeros(4, 71), torch.zeros(4, 4))
+        with self.assertRaisesRegex(ValueError, "layout"):
+            bank.pack_routing(torch.zeros(1, 3))
+        with self.assertRaisesRegex(ValueError, "layout"):
+            bank.trajectory(torch.tensor([[key, 0]]), torch.zeros(1, 4), 2, 1, 1,
+                            "cpu", routing_only=True)
+
     def test_capture_reuses_terms_without_advancing_live_command(self):
         command = FakeCommand()
         bank = WAMReferenceBank(SPECS)

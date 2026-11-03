@@ -172,6 +172,60 @@ class PhysicalVectorEnv:
 
 
 class PhysicalTrainingTests(unittest.TestCase):
+    def test_compact_references_preserve_sampled_rollouts_and_actor_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainers = []
+            for compact in (False, True):
+                trainer = self.make_trainer(Path(directory) / str(compact), horizon=3,
+                                            save_replay=True, compact_replay=compact)
+                trainer.independent_imagination = True
+                trainer.compact_reference = compact
+                bank = WAMReferenceBank(TOKENIZER_SPECS)
+                frames = 16
+                reference = trainer.env.reference()[:1].expand(frames, -1).clone()
+                reference[:, 0] = torch.arange(frames) * 0.01
+                goal = trainer.goal_observations.to_world(
+                    trainer.obs["tokenizer"][:1], trainer.obs["wam_state"][:1],
+                ).expand(frames, -1).clone()
+                key = bank.register(reference, goal)
+                bank.capture = lambda command, manager, trainer=trainer, key=key: torch.tensor(
+                    [[key, trainer.env.env.common_step_counter]] * trainer.env.num_envs,
+                    dtype=torch.long,
+                )
+                trainer.reference_bank = bank
+                trainer.env.env.command_manager = SimpleNamespace(get_term=lambda name: None)
+                torch.manual_seed(155)
+                trainer.collect(5)
+                trainers.append(trainer)
+            full, compact = trainers
+            self.assertEqual(full.replay._storage["goal"].shape[-1], 42)
+            self.assertEqual(compact.replay._storage["goal"].shape[-1], 3)
+            self.assertNotIn("reference", compact.replay._storage)
+            torch.manual_seed(500)
+            full_batch = full._sample_policy_batch(3)
+            torch.manual_seed(500)
+            compact_batch = compact._sample_policy_batch(3)
+            for name in full_batch:
+                torch.testing.assert_close(full_batch[name], compact_batch[name], rtol=0, atol=0)
+            for trainer in trainers:
+                torch.manual_seed(500)
+                trainer.improve_policy()
+            for actual, expected in zip(compact.policy.parameters(), full.policy.parameters()):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            checkpoint = Path(directory) / "compact.pt"
+            compact.save_checkpoint(checkpoint)
+            restored = self.make_trainer(Path(directory) / "restored", horizon=3)
+            restored.independent_imagination = True
+            restored.reference_bank = WAMReferenceBank(TOKENIZER_SPECS)
+            restored.load_checkpoint(checkpoint, resume=True)
+            self.assertTrue(restored.compact_reference)
+            torch.manual_seed(600)
+            expected_batch = compact._sample_policy_batch(3)
+            torch.manual_seed(600)
+            restored_batch = restored._sample_policy_batch(3)
+            for name in expected_batch:
+                torch.testing.assert_close(restored_batch[name], expected_batch[name], rtol=0, atol=0)
+
     def make_trainer(self, directory, *, terminate_first=False, terminal_capture=True, **settings):
         torch.manual_seed(91)
         env = PhysicalVectorEnv(terminate_first=terminate_first, terminal_capture=terminal_capture)

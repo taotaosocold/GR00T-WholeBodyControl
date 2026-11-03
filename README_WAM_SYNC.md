@@ -277,7 +277,8 @@ CUDA_VISIBLE_DEVICES=0 "$PY" gear_sonic/eval_agent_trl.py \
   ++manager_env.commands.motion.start_from_first_frame=true \
   ++manager_env.commands.motion.cat_upper_body_poses=false \
   ++manager_env.commands.motion.freeze_frame_aug=false \
-  ++manager_env.observations.policy.enable_corruption=false \
+  '++trainer.settings.observation_noise={gravity_dir:0,base_ang_vel:0,joint_pos:0,joint_vel:0,actions:0}' \
+  ++manager_env.observations.tokenizer.enable_corruption=false \
   ++manager_env.events.physics_material=null \
   ++manager_env.events.add_joint_default_pos=null \
   ++manager_env.events.base_com=null \
@@ -409,3 +410,35 @@ cd /home/user/Desktop/GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```
+
+## 11. WAM 修复后的默认行为与对照
+
+- 世界模型拟合误差默认使用真实下一状态的坐标系；预测增量及其归一化仍使用当前状态坐标系。
+- replay 默认压缩历史观测、复用参考库，保留原始噪声和 episode 边界；世界模型只读取所需字段。
+  `replay/host_gib` 是每个进程的回放内存，不含参考库和模拟器。
+- 检查点在 CPU 加载；普通 PPO 不再计算和保存 WAM 专用观测。
+- `warmup_steps=64` 默认在首次优化前采满。采样器明确为 `reset_sampling=adaptive_failure`；
+  旧的 `return` 值会报错，因为尚未实现源仓库的 return-based reset sampler。
+
+已有策略仍可直接评估、导出。完整续训旧 WAM 检查点时，在原命令中显式加入：
+
+```bash
+  world_model.cfg.error_frame=predicted \
+  world_model.cfg.loss_reduction=mean_valid \
+  ++trainer.settings.reset_sampling=adaptive_failure \
+  ++trainer.settings.warmup_before_updates=false
+```
+
+新训练使用默认 `error_frame=target`；如只继承旧策略并重新拟合 WAM，使用
+`+resume=false checkpoint=/path/to/last.pt`。不要在完整恢复时静默切换拟合目标。
+
+可选对照项：`++trainer.settings.compact_replay=false`、
+`++trainer.settings.compact_reference=false` 关闭压缩；
+`++trainer.settings.terrain_type=plane` 使用平地；
+`world_model.cfg.loss_reduction=sum_per_batch` 使用源仓库的时间窗口求和损失。
+这些选项应逐项对照，不能保证收敛效果提升。
+
+比较 PPO/WAM 时固定留出的动作列表、机器人、奖励/终止条件、观测噪声和 GPU 小时，
+用多个 seed 分别评估 G1、SMPL、teleop 的完整动作成功率和跟踪误差。
+WAM 自带的 reward/termination 对齐会替换 SONIC 原配置，因此不能直接比较两边训练日志的 reward。
+验证时关闭动作增强，使用真实仿真轨迹评估，不以 imagined return 判断效果。

@@ -8,6 +8,233 @@ from gear_sonic.trl.world_model.sequence_replay import SequenceReplayBuffer
 
 
 class SequenceReplayTests(unittest.TestCase):
+    def test_field_selection_never_indexes_unrequested_large_storage(self):
+        replay = SequenceReplayBuffer(2)
+        replay.add(torch.zeros(2, 1), torch.zeros(2, 1), torch.zeros(2), torch.ones(2, 1),
+                   torch.zeros(2, dtype=torch.bool), goal=torch.zeros(2, 100),
+                   next_goal=torch.ones(2, 100), actor_state=torch.zeros(2, 80),
+                   next_actor_state=torch.ones(2, 80))
+
+        class ForbiddenRead:
+            def __getitem__(self, index):
+                raise AssertionError("unrequested replay tensor was indexed")
+
+        for key in ("goal", "next_goal", "actor_state", "next_actor_state"):
+            replay._storage[key] = ForbiddenRead()
+        fields = ["states", "actions", "rewards", "terminated", "mask", "dynamics_mask"]
+        batch = replay.sample(3, 1, fields=fields)
+        self.assertEqual(list(batch), fields)
+        self.assertEqual(replay.sample(3, 1, fields=[]), {})
+        with self.assertRaisesRegex(ValueError, "missing requested"):
+            replay.sample(1, 1, fields=["contexts"])
+
+    @staticmethod
+    def _compact_pair(capacity, histories=(4, 3, 1)):
+        layout, start = [], 0
+        for index, history in enumerate(histories):
+            dim = index + 1
+            layout.append((str(index), start, start + history * dim, history, dim))
+            start += history * dim
+        return (SequenceReplayBuffer(capacity),
+                SequenceReplayBuffer(capacity, actor_history_layout=layout), layout, start)
+
+    def _assert_sample_equivalence(self, full, compact):
+        for fields in (None, ["actor_states"], ["states", "dynamics_mask"]):
+            a = full.sample(29, len(full), fields=fields, generator=torch.Generator().manual_seed(17))
+            b = compact.sample(29, len(compact), fields=fields, generator=torch.Generator().manual_seed(17))
+            self.assertEqual(set(a), set(b))
+            for key in a:
+                torch.testing.assert_close(a[key], b[key], rtol=0, atol=0, msg=key)
+        torch.manual_seed(31)
+        a = full.sample_starts(73)
+        torch.manual_seed(31)
+        b = compact.sample_starts(73)
+        for key in a:
+            torch.testing.assert_close(a[key], b[key], rtol=0, atol=0, msg=key)
+
+    def test_compact_history_preserves_noise_resets_halo_and_discontinuities(self):
+        # Capacity below history length exercises the halo rather than merely
+        # retrieving all the history from ordinary retained transitions.
+        full, compact, layout, width = self._compact_pair(2, histories=(5, 3, 1))
+        torch.manual_seed(9)
+        actors = torch.randn(3, width)
+        for time in range(16):
+            if time in (4, 11):
+                full.mark_discontinuity()
+                compact.mark_discontinuity()
+                actors = torch.randn_like(actors)  # preserve this actual prefix
+            following = torch.cat([
+                torch.cat((actors[:, start + dim:end], torch.randn(3, dim)), dim=-1)
+                for _, start, end, _, dim in layout
+            ], dim=-1)
+            done = torch.tensor([time % 3 == 0, time % 5 == 0, False])
+            if done[0]:
+                # Production resets repeat one noisy observation per term.
+                for _, start, end, history, dim in layout:
+                    following[0, start:end] = torch.randn(dim).repeat(history)
+            if done[1]:
+                # Also accept a caller's non-repeated initial noisy history.
+                following[1] = torch.randn(width)
+            state = torch.arange(3)[:, None].float() + time * 10
+            for replay in (full, compact):
+                replay.add(state, state, state[:, 0], state + 1, done,
+                           actor_state=actors, next_actor_state=following)
+            self._assert_sample_equivalence(full, compact)
+            actors = following
+        # Sealing an existing transition must not reinterpret its already
+        # captured next history as a reset observation.
+        full.mark_discontinuity()
+        compact.mark_discontinuity()
+        self._assert_sample_equivalence(full, compact)
+
+    def test_compact_history_checkpoint_roundtrip_continues_exactly(self):
+        full, compact, layout, width = self._compact_pair(3)
+        torch.manual_seed(13)
+        actors = torch.randn(2, width)
+        for time in range(10):
+            following = torch.cat([
+                torch.cat((actors[:, start + dim:end], torch.randn(2, dim)), dim=-1)
+                for _, start, end, _, dim in layout
+            ], dim=-1)
+            state = torch.full((2, 1), float(time))
+            for replay in (full, compact):
+                replay.add(state, state, state[:, 0], state + 1, torch.zeros(2, dtype=torch.bool),
+                           actor_state=actors, next_actor_state=following)
+            if time == 6:
+                snapshot = compact.state_dict()
+                restored = SequenceReplayBuffer(1)
+                restored.load_state_dict(snapshot)
+                self._assert_sample_equivalence(full, restored)
+                compact = restored
+            actors = following
+        self._assert_sample_equivalence(full, compact)
+        self.assertEqual(snapshot["actor_history"]["time"], 7)
+        # A legacy full-history checkpoint overrides a new compact preference.
+        compact.load_state_dict(full.state_dict())
+        self.assertIsNone(compact.actor_history_layout)
+        legacy_restored = SequenceReplayBuffer()
+        legacy_restored.load_state_dict(full.state_dict())
+        self._assert_sample_equivalence(legacy_restored, compact)
+
+    def test_compact_memory_scales_with_frames_and_keeps_no_noise_resampling(self):
+        full, compact, layout, width = self._compact_pair(64, histories=(10, 10, 10))
+        torch.manual_seed(4)
+        actors = torch.cat([torch.randn(4, dim).repeat(1, history)
+                            for _, _, _, history, dim in layout], dim=-1)
+        for time in range(70):
+            following = torch.cat([
+                torch.cat((actors[:, start + dim:end], torch.randn(4, dim)), dim=-1)
+                for _, start, end, _, dim in layout
+            ], dim=-1)
+            state = torch.full((4, 1), float(time))
+            for replay in (full, compact):
+                replay.add(state, state, state[:, 0], state + 1, torch.zeros(4, dtype=torch.bool),
+                           actor_state=actors, next_actor_state=following)
+            actors = following
+        self.assertLess(compact.storage_nbytes(), full.storage_nbytes() / 3)
+        self.assertEqual(compact._storage["actor_state"].shape[-1], 6)
+        rng = torch.get_rng_state().clone()
+        compact._restore_actor_history(torch.tensor([6, 69]), torch.tensor([0, 3]))
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+        self._assert_sample_equivalence(full, compact)
+
+    def test_compact_snapshot_preserves_active_noisy_segment_prefixes(self):
+        full, compact, layout, width = self._compact_pair(2, histories=(5, 3, 1))
+        torch.manual_seed(27)
+        actors = torch.randn(2, width)
+        for time in range(4):
+            following = torch.randn(2, width)  # deliberately nonstandard prefix
+            state = torch.full((2, 1), float(time))
+            for replay in (full, compact):
+                replay.add(state, state, state[:, 0], state + 1, torch.ones(2, dtype=torch.bool),
+                           actor_state=actors, next_actor_state=following)
+            actors = following
+        full.mark_discontinuity()
+        compact.mark_discontinuity()
+        snapshot = compact.state_dict()
+        restored = SequenceReplayBuffer()
+        restored.load_state_dict(snapshot)
+        self._assert_sample_equivalence(full, restored)
+        self.assertTrue(restored._history_discontinuous)
+        # Checkpoints own the seed/halo tensors too, not just the main ring.
+        saved_prefix = next(iter(snapshot["actor_history"]["seeds"].values()))[1].clone()
+        for _, prefix in compact._history_seeds.values():
+            prefix.fill_(999)
+        torch.testing.assert_close(next(iter(snapshot["actor_history"]["seeds"].values()))[1], saved_prefix)
+        fresh = torch.randn_like(actors)
+        following = torch.cat([
+            torch.cat((fresh[:, start + dim:end], torch.randn(2, dim)), dim=-1)
+            for _, start, end, _, dim in layout
+        ], dim=-1)
+        for replay in (full, restored):
+            replay.add(state + 1, state, state[:, 0], state + 2, torch.zeros(2, dtype=torch.bool),
+                       actor_state=fresh, next_actor_state=following)
+        self._assert_sample_equivalence(full, restored)
+
+    def test_compact_nonterminal_next_history_reset_starts_a_new_prefix(self):
+        # Mixed history lengths, a ring shorter than the longest term, and a
+        # nonterminal history reset previously lost the reset's prefix when
+        # that next history became a later current history.
+        layout = [("a", 0, 3, 1, 3), ("b", 3, 9, 3, 2), ("c", 9, 49, 10, 4)]
+        full = SequenceReplayBuffer(7)
+        compact = SequenceReplayBuffer(7, actor_history_layout=layout)
+        torch.manual_seed(930)
+        actors = torch.randn(4, 49)
+        for time in range(90):
+            if time % 17 == 3:
+                actors = torch.randn(4, 49)
+            following = torch.cat([
+                torch.cat((actors[:, start + dim:end], torch.randn(4, dim)), dim=-1)
+                for _, start, end, _, dim in layout
+            ], dim=-1)
+            done = torch.rand(4) < 0.22
+            following[done] = torch.randn(int(done.sum()), 49)
+            if time % 11 == 2:
+                following[0] = torch.randn(49)  # need not coincide with done
+            state, action, reward, next_state = torch.randn(4, 5), torch.randn(4, 2), torch.randn(4), torch.randn(4, 5)
+            for replay in (full, compact):
+                replay.add(state, action, reward, next_state, done, done,
+                           actor_state=actors, next_actor_state=following)
+            actors = following
+            window = min(len(full), 5)
+            a = full.sample(19, window, generator=torch.Generator().manual_seed(133 + time))
+            b = compact.sample(19, window, generator=torch.Generator().manual_seed(133 + time))
+            for key in a:
+                torch.testing.assert_close(a[key], b[key], rtol=0, atol=0, msg=f"{time}: {key}")
+            torch.manual_seed(time + 991)
+            b = compact.sample_starts(19)
+            # Legacy restore normalizes its physical ring cursor, whereas a
+            # compact snapshot preserves absolute time for the halo. Compare
+            # sampled transitions by their unique state, not physical row RNG.
+            stored_states = full._storage["state"][:len(full)].flatten(0, 1)
+            matches = (b["state"][:, None] == stored_states[None]).all(-1)
+            self.assertTrue((matches.sum(-1) == 1).all())
+            selected = matches.long().argmax(-1)
+            for key, value in b.items():
+                expected = full._storage[key][:len(full)].flatten(0, 1)[selected]
+                torch.testing.assert_close(expected, value, rtol=0, atol=0, msg=f"start {time}: {key}")
+            if time % 23 == 0:
+                restored_full, restored_compact = SequenceReplayBuffer(7), SequenceReplayBuffer(7)
+                restored_full.load_state_dict(full.state_dict())
+                restored_compact.load_state_dict(compact.state_dict())
+                full, compact = restored_full, restored_compact
+            if time % 19 == 0:
+                full.mark_discontinuity()
+                compact.mark_discontinuity()
+
+    def test_compact_history_rejects_invalid_layout_and_preserves_single_frame_terms(self):
+        for layout in ([], [("x", 0, 3, 0, 3)], [("x", 1, 4, 1, 3)], [("x", 0, 4, 2, 3)]):
+            with self.subTest(layout=layout), self.assertRaises(ValueError):
+                SequenceReplayBuffer(actor_history_layout=layout)
+        full, compact, _, width = self._compact_pair(2, histories=(1, 1, 1))
+        for time in range(4):
+            actors, following = torch.randn(2, width), torch.randn(2, width)
+            state = torch.full((2, 1), float(time))
+            for replay in (full, compact):
+                replay.add(state, state, state[:, 0], state + 1, torch.ones(2, dtype=torch.bool),
+                           actor_state=actors, next_actor_state=following)
+        self._assert_sample_equivalence(full, compact)
+
     def test_start_sampling_ignores_old_done_and_preserves_reference_indices(self):
         replay = SequenceReplayBuffer(2)
         for t in range(4):

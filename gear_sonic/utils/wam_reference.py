@@ -32,11 +32,23 @@ class WAMReferenceBank:
 
     def __init__(self, tokenizer_specs=()):
         self.specs = tuple(tokenizer_specs)
+        self.goal_dim = max((spec[2] for spec in self.specs), default=0)
+        self.routing_specs = tuple(
+            spec for spec in self.specs if spec[0] in {"encoder_index", "command_num_frames"}
+        )
         self.clips = {}
         self.current = {}
         self.next_key = 0
         self.transforms = ()
         self._lengths = torch.zeros(0, dtype=torch.long)
+
+    def pack_routing(self, goals):
+        """Keep only seed-specific routing; clip goals already live in the bank."""
+        if goals.shape[-1] != self.goal_dim:
+            raise ValueError("WAM routing requires the complete tokenizer layout")
+        if not self.routing_specs:
+            return goals[..., :0]
+        return torch.cat([goals[..., start:end] for _, start, end, *_ in self.routing_specs], -1)
 
     def register(self, states, goals):
         if states.ndim != 2 or states.shape[-1] != 71 or states.shape[0] < 2:
@@ -151,11 +163,21 @@ class WAMReferenceBank:
             raise ValueError("Replay refers to a missing WAM reference clip")
         return (indices[..., 1] >= 0) & (indices[..., 1] < lengths - 1)
 
-    def trajectory(self, indices, seed_goals, horizon, future_frames, future_stride, device):
+    def trajectory(
+        self, indices, seed_goals, horizon, future_frames, future_stride, device,
+        *, routing_only=False,
+    ):
         """Advance each reference cursor; only the physical clip boundary masks it."""
         indices = indices.cpu()
         batch = len(indices)
-        goals = torch.empty(batch, horizon + 1, seed_goals.shape[-1])
+        goal_dim = self.goal_dim if routing_only else seed_goals.shape[-1]
+        expected_seed_dim = (
+            sum(end - start for _, start, end, *_ in self.routing_specs)
+            if routing_only else self.goal_dim
+        )
+        if seed_goals.shape != (batch, expected_seed_dim):
+            raise ValueError("WAM reference seed has an incompatible routing/goal layout")
+        goals = torch.empty(batch, horizon + 1, goal_dim)
         states = torch.empty(batch, horizon + 1, 71)
         future = torch.empty(batch, horizon + 1, future_frames, 71)
         lengths = torch.empty(batch, dtype=torch.long)
@@ -171,9 +193,12 @@ class WAMReferenceBank:
             future[rows] = clip_state[future_times]
         # Modality routing / variable frame choice belongs to the sampled seed,
         # not to a random environment used while rendering the clip bank.
-        for name, start, end, *_ in self.specs:
-            if name in {"encoder_index", "command_num_frames"}:
-                goals[..., start:end] = seed_goals[:, None, start:end].detach().cpu()
+        route_offset = 0
+        for _, start, end, *_ in self.routing_specs:
+            source_start = route_offset if routing_only else start
+            source_end = source_start + end - start
+            goals[..., start:end] = seed_goals[:, None, source_start:source_end].detach().cpu()
+            route_offset += end - start
         mask = torch.arange(horizon)[None] < lengths[:, None]
         return {"goals": goals.to(device), "references": states.to(device),
                 "future_references": future.flatten(-2).to(device), "mask": mask.to(device)}

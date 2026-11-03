@@ -37,6 +37,10 @@ settings:
   motion_resample_frequency: 250
   replay_steps: 1000
   replay_envs: 4096
+  # Compress actor history only when its observation metadata is known.
+  compact_replay: true
+  # Rebuild reference features from the retained clip, preserving seed routing.
+  compact_reference: true
   window: 8
   horizon: 32
   # Real done masks supervise dynamics; actor imagination follows its own
@@ -54,8 +58,13 @@ settings:
   learning_rate_min_ratio: 0.03
   utd: 0.4
   warmup_steps: 64
+  # Collect the initial replay before fitting either dynamics or the policy.
+  warmup_before_updates: true
   wm_only_iters: 500
-  reset_sampling: return
+  # Keep Sonic's adaptive failure sampler; return-based reset is not implemented.
+  reset_sampling: adaptive_failure
+  # null preserves Sonic's terrain; plane provides a flat-ground comparison.
+  terrain_type: null
   action_noise: 0.1
   # Jointly optimize encoder/FSQ/decoder with SuperMimic's summed return.
   actor_return_reduction: sum

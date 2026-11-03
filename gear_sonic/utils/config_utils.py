@@ -1,18 +1,95 @@
 import math
+from contextlib import nullcontext
+from functools import lru_cache
 from pathlib import Path
 
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from loguru import logger
 from omegaconf import OmegaConf, open_dict
 
 from gear_sonic.utils.wam_noise import wam_observation_noise
 
 
-def configure_wam_context(config):
-    """Enable detailed simulator context only for the physical WAM branch."""
+_WAM_OBSERVATION_GROUPS = {
+    "wam": "proprio",
+    "wam_state": "physical",
+    "wam_reference": "physical",
+    "wam_context": "physical",
+}
+
+
+@lru_cache(maxsize=1)
+def _wam_observation_templates():
+    """Resolve group defaults with Hydra, without instantiating Isaac Lab terms."""
+    config_dir = Path(__file__).resolve().parents[1] / "config"
+    # Training already owns Hydra's config directory; loaded checkpoints and
+    # standalone tools may call the same helpers outside a Hydra application.
+    scope = nullcontext() if GlobalHydra.instance().is_initialized() else initialize_config_dir(
+        config_dir=str(config_dir), version_base="1.1",
+    )
+    with scope:
+        templates = compose(config_name=None, overrides=[
+            f"+manager_env/observations/{name}={selection}"
+            for name, selection in _WAM_OBSERVATION_GROUPS.items()
+        ])
+    return OmegaConf.to_container(templates.manager_env.observations, resolve=False)
+
+
+def _configure_wam_observation_groups(config):
+    """Opt physical WAM into its extra groups; remove legacy copies from PPO.
+
+    Group templates are merged before user or saved-checkpoint overrides, so
+    repeated calls preserve explicit terms and contain no unresolved defaults.
+    Only the four reserved WAM groups are removed from other trainers.
+    """
     target = str(OmegaConf.select(config, "trainer._target_", default=""))
-    if target.rsplit(".", 1)[-1] != "WAMTrainer":
+    is_wam = target.rsplit(".", 1)[-1] == "WAMTrainer"
+    observations = OmegaConf.select(config, "manager_env.observations")
+    if not is_wam:
+        if observations is not None:
+            with open_dict(observations):
+                for name in _WAM_OBSERVATION_GROUPS:
+                    observations.pop(name, None)
         return False
     if OmegaConf.select(config, "world_model.cfg.state_type", default="flat") != "physical":
+        # Flat adapters can still explicitly request the legacy WAM groups.
+        # Add only missing requested groups; their custom observation contract
+        # must not be merged with physical defaults or sensor-noise settings.
+        requested = set()
+        for key in ("state_observation_keys", "context_observation_keys",
+                    "reference_observation_keys", "goal_observation_keys", "observation_keys"):
+            requested.update(OmegaConf.select(config, f"trainer.settings.{key}", default=[]) or [])
+        requested.intersection_update(_WAM_OBSERVATION_GROUPS)
+        if "wam_state" in requested:
+            requested.add("wam")
+        if requested:
+            if observations is None:
+                raise ValueError("WAM observation keys require manager_env.observations")
+            defaults = _wam_observation_templates()
+            with open_dict(observations):
+                for name in _WAM_OBSERVATION_GROUPS:
+                    if name in requested and observations.get(name) is None:
+                        observations[name] = OmegaConf.create(defaults[name])
+        return False
+    terrain = OmegaConf.select(config, "trainer.settings.terrain_type")
+    if terrain is not None and (not isinstance(terrain, str) or terrain not in {"plane", "trimesh"}):
+        raise ValueError("WAM terrain_type must be null, 'plane', or 'trimesh'")
+    if observations is None:
+        raise ValueError("Physical WAM requires manager_env.observations")
+    defaults = _wam_observation_templates()
+    with open_dict(observations):
+        for name in _WAM_OBSERVATION_GROUPS:
+            overrides = observations.get(name)
+            observations[name] = OmegaConf.merge(defaults[name], overrides or {})
+    if terrain is not None:
+        OmegaConf.update(config, "manager_env.config.terrain_type", terrain, force_add=True)
+    return True
+
+
+def configure_wam_context(config):
+    """Enable detailed simulator context only for the physical WAM branch."""
+    if not _configure_wam_observation_groups(config):
         return False
     enabled = bool(OmegaConf.select(config, "trainer.settings.complete_context", default=False))
     term = OmegaConf.select(config, "manager_env.observations.wam_context.xi")
@@ -31,12 +108,10 @@ def configure_wam_observations(config):
 
     Collection builds the actor history from the single-frame ``wam`` group;
     evaluation uses the native ``policy`` history. Both groups therefore need
-    identical per-term corruption. This helper is inactive for PPO/flat WAM.
+    identical per-term corruption. PPO drops only the reserved WAM groups;
+    flat WAM configurations keep their existing observation contract.
     """
-    target = str(OmegaConf.select(config, "trainer._target_", default=""))
-    if target.rsplit(".", 1)[-1] != "WAMTrainer":
-        return False
-    if OmegaConf.select(config, "world_model.cfg.state_type", default="flat") != "physical":
+    if not _configure_wam_observation_groups(config):
         return False
     widths = wam_observation_noise(OmegaConf.select(config, "trainer.settings", default={}))
     for name in ("policy", "wam"):

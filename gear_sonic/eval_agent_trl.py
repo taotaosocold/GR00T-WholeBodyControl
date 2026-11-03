@@ -434,7 +434,9 @@ def main(override_config: omegaconf.OmegaConf):
 
     checkpoint_path = str(config.checkpoint)
     logger.info(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=accelerator.device, weights_only=False)
+    # WAM checkpoints may embed large CPU replay/reference banks. Only policy
+    # tensors are copied to the evaluator's device by load_state_dict below.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # Load policy state dict with backward compatibility for std/log_std
     if "actor_model_state_dict" in checkpoint:

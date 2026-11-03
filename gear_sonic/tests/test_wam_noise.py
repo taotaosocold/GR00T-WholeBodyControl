@@ -54,7 +54,7 @@ class WAMNoiseTests(unittest.TestCase):
         configure_wam_observations(config)
         self.assert_matching_noise(config)
 
-    def test_ppo_and_flat_configurations_are_not_changed(self):
+    def test_ppo_removes_legacy_wam_group_and_flat_configuration_is_unchanged(self):
         for case in ("ppo", "flat"):
             with self.subTest(case=case):
                 config = self.make_config()
@@ -64,6 +64,8 @@ class WAMNoiseTests(unittest.TestCase):
                     config.world_model.cfg.state_type = "flat"
                 before = OmegaConf.to_container(config, resolve=False)
                 self.assertFalse(configure_wam_observations(config))
+                if case == "ppo":
+                    del before["manager_env"]["observations"]["wam"]
                 self.assertEqual(before, OmegaConf.to_container(config, resolve=False))
 
     def test_noise_definition_rejects_unknown_negative_and_nonfinite_values(self):
@@ -71,18 +73,19 @@ class WAMNoiseTests(unittest.TestCase):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 wam_observation_noise({"observation_noise": override})
 
-    def test_release_config_and_passive_wam_yaml_match_supermimic_widths(self):
+    def test_release_configuration_loads_wam_groups_only_when_configured(self):
         config_dir = Path(__file__).resolve().parents[1] / "config"
         with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
             config = compose(config_name="base", overrides=[
                 "+exp=manager/universal_token/all_modes/sonic_release",
                 "trainer=wam", "world_model=wam_dynamics",
             ])
+        self.assertNotIn("wam", config.manager_env.observations)
+        configure_wam_observations(config)
         before = config.manager_env.observations.wam
         for name, width in WAM_OBSERVATION_NOISE.items():
             self.assertEqual(before[name].noise.n_min, -width)
             self.assertEqual(before[name].noise.n_max, width)
-        configure_wam_observations(config)
         self.assert_matching_noise(config)
 
 
