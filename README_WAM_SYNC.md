@@ -387,6 +387,25 @@ MuJoCo 窗口按 `9` 放下机器人。默认采集与部署在同机，完整�
 
 ### Sim2Real
 
-先用当前权重完成仿真验证，再关闭 MuJoCo。部署命令末尾的 `sim` 改为 `real`
-（自动选择 G1 网卡，启动时核对）；参考动作使用 `keyboard`，PICO 使用
-`zmq_manager` 并继续运行上面的 PICO 采集终端。模型和配置目录不变。
+```bash
+cd /home/user/Desktop/GR00T-WholeBodyControl/gear_sonic_deploy
+source scripts/setup_env_local.sh
+
+ROBOT_IF=enp3s0  # 改为连接 G1 的实际有线网卡名
+
+bash deploy.sh \
+  --cp policy/11.2/model_step_007000 \
+  --obs-config policy/11.2/observation_config.yaml \
+  --planner planner/target_vel/V2/planner_sonic.onnx \
+  --motion-data reference/example/ \
+  --input-type keyboard \
+  --output-type zmq \
+  "$ROBOT_IF"
+```
+### 如果用PICO实机遥操作则
+--input-type keyboard改成--input-type zmq_manager，然后在开一个终端执行
+```bash
+cd /home/user/Desktop/GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py --manager
+```
