@@ -70,6 +70,7 @@ from gear_sonic.utils.config_utils import (
     configure_wam_rewards,
     configure_wam_terminations,
     register_rl_resolvers,
+    validate_robot_motion_config,
 )
 from gear_sonic.utils.obs_utils import get_group_term_obs_shape
 
@@ -110,6 +111,7 @@ def create_manager_env(config, device, args_cli):
 
     from gear_sonic.envs.wrapper.manager_env_wrapper import ManagerEnvWrapper
 
+    validate_robot_motion_config(config)
     configure_wam_context(config)
     configure_wam_observations(config)
     configure_wam_terminations(config)
@@ -164,6 +166,7 @@ def create_manager_env(config, device, args_cli):
 
 @hydra.main(config_path="config", config_name="base", version_base="1.1")
 def main(config: OmegaConf):
+    validate_robot_motion_config(config)
     # Resolve WAM-specific real termination before logging/saving config.yaml.
     # create_manager_env applies the same selection for checkpoint evaluation.
     configure_wam_context(config)

@@ -433,7 +433,9 @@ class MotionLibBase:
         self.randomize_wrist_prob = self.m_cfg.get("randomize_wrist_prob", 0.3)
         self.randomize_wrist_std = self.m_cfg.get("randomize_wrist_std", 0.1)
         # MuJoCo DOF indices for wrist joints (L/R roll/pitch/yaw)
-        self.wrist_mujoco_dof_indices = [19, 20, 21, 26, 27, 28]
+        self.wrist_mujoco_dof_indices = list(self.m_cfg.get(
+            "wrist_mujoco_dof_indices", [19, 20, 21, 26, 27, 28],
+        ))
 
     def load_data(self, motion_file):
         if osp.isfile(motion_file):
@@ -1925,9 +1927,18 @@ class MotionLibBase:
             ):
                 # ZL: this randomization is not combatiable with SMPL, so only for kinematic generated data.
                 # find the index for the upper body, skip the first index in pose_aa as it is the root.
-                upper_body_indices = [
-                    i for i in range(1, J) if i - 1 not in self.m_cfg.lower_joint_indices_mujoco
-                ]
+                if self.m_cfg.get("robot_type", "g1") == "n3":
+                    joint_names = self.m_cfg.body_joint_names_mujoco
+                    body_names = self.m_cfg.body_names_mujoco
+                    upper_body_indices = [
+                        body_names.index(name.removesuffix("_joint") + "_link")
+                        for i, name in enumerate(joint_names)
+                        if i not in self.m_cfg.lower_joint_indices_mujoco
+                    ]
+                else:
+                    upper_body_indices = [
+                        i for i in range(1, J) if i - 1 not in self.m_cfg.lower_joint_indices_mujoco
+                    ]
                 # randomly select a motion from the non-navigation dataset
                 selected_file, selected_motion = random.choice(
                     list(self.res_non_nav_dataset.values())
@@ -1966,7 +1977,17 @@ class MotionLibBase:
                 and self.randomize_wrist_poses
                 and random.random() < self.randomize_wrist_prob
             ):
-                wrist_pose_aa_indices = [d + 1 for d in self.wrist_mujoco_dof_indices]
+                # Fixed bodies can occur between actuated links (N3 toes).
+                # pose_aa indexes bodies, not the compact hinge-joint array.
+                if self.m_cfg.get("robot_type", "g1") == "n3":
+                    joint_names = self.m_cfg.body_joint_names_mujoco
+                    body_names = self.m_cfg.body_names_mujoco
+                    wrist_pose_aa_indices = [
+                        body_names.index(joint_names[d].removesuffix("_joint") + "_link")
+                        for d in self.wrist_mujoco_dof_indices
+                    ]
+                else:
+                    wrist_pose_aa_indices = [d + 1 for d in self.wrist_mujoco_dof_indices]
                 noise = torch.randn(B, len(wrist_pose_aa_indices), N) * self.randomize_wrist_std
                 pose_aa[:, wrist_pose_aa_indices] = pose_aa[:, wrist_pose_aa_indices] + noise
 
@@ -2208,9 +2229,10 @@ class MotionLibBase:
                 hand_dof_count = self.m_cfg.get("hand_dof_count", 0)
                 if hand_dof_count > 0 and "dof" in curr_file:
                     raw_dof = to_torch(curr_file["dof"]).clone()[start:end]
-                    if raw_dof.shape[-1] > 29:
+                    body_dof_count = len(self.m_cfg.get("body_joint_names_mujoco", range(29)))
+                    if raw_dof.shape[-1] > body_dof_count:
                         # Extract hand DOFs (indices 29 onwards) and interpolate to target FPS
-                        hand_dof = raw_dof[:, 29 : 29 + hand_dof_count]
+                        hand_dof = raw_dof[:, body_dof_count : body_dof_count + hand_dof_count]
                         if curr_file["fps"] != self.target_fps:
                             # Simple linear interpolation for hand DOFs
                             num_target_frames = curr_motion["dof_pos"].shape[0]

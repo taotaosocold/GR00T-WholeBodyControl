@@ -150,6 +150,10 @@ class WAMReferenceBank:
         proxy.robot = SimpleNamespace(data=SimpleNamespace(
             body_pos_w=origins[:, None].expand(-1, bodies, -1), body_quat_w=rotation,
         ))
+        # Reference capture needs the same robot-specific joint permutation as
+        # the live command; the synthetic data above only replaces root poses.
+        if hasattr(getattr(command, "robot", None), "joint_names"):
+            proxy.robot.joint_names = tuple(command.robot.joint_names)
         env.command_manager = SimpleNamespace(get_term=lambda name: proxy)
         return proxy, env
 

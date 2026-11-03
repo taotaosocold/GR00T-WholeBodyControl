@@ -12,17 +12,24 @@ from numbers import Integral
 import torch
 from torch import nn
 
-from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.trl.modules.wam import (
     PHYSICAL_STATE_DIM,
     physical_state_invariant_features,
     physical_state_parts,
 )
-from gear_sonic.utils.wam_kinematics import G1Kinematics, G1_MUJOCO_JOINT_NAMES
+from gear_sonic.utils.wam_kinematics import make_robot_kinematics
 
 
-_REFERENCE_ORDER = tuple(G1_ISAACLab_ORDER.index(name) for name in G1_MUJOCO_JOINT_NAMES)
 FUTURE_REFERENCE_DIM = 73
+
+
+def reference_joint_order(command, device=None):
+    """Map the motion library's robot joint order to its physical WAM order."""
+    robot = getattr(command, "robot", "g1")
+    source_names = joint_utils.get_robot_joint_names(robot, order="isaaclab")
+    target_names = joint_utils.get_robot_joint_names(robot, order="mujoco")
+    return torch.tensor([source_names.index(name) for name in target_names], device=device)
 
 
 def _heading(rotation):
@@ -45,13 +52,19 @@ class WAMCriticFeatures(nn.Module):
     modality choice and learned goal representation.
     """
 
-    def __init__(self, kinematics=None, future_frames=10, context_dim=33):
+    def __init__(
+        self, kinematics=None, future_frames=10, context_dim=33,
+        robot_type="g1", mjcf_path=None, tracked_bodies=None,
+    ):
         super().__init__()
         if not isinstance(future_frames, Integral) or future_frames < 1:
             raise ValueError("WAM critic future_frames must be a positive integer")
         if not isinstance(context_dim, Integral) or context_dim < 0:
             raise ValueError("WAM critic context_dim must be a nonnegative integer")
-        self.kinematics = G1Kinematics() if kinematics is None else kinematics
+        self.kinematics = (
+            make_robot_kinematics(robot_type, mjcf_path, tracked_bodies)
+            if kinematics is None else kinematics
+        )
         self.future_frames = int(future_frames)
         self.context_dim = int(context_dim)
         body_dim = 3 * len(self.kinematics.tracked_bodies)
@@ -135,7 +148,7 @@ def future_reference_states(command, num_frames=10, frame_stride=1, next_step=Fa
     velocities = library.get_dof_vel(ids, frames)
     if joints.shape[-1] != 29 or velocities.shape[-1] != 29:
         raise ValueError("Physical WAM critic references require 29 body joints")
-    order = torch.as_tensor(_REFERENCE_ORDER, device=joints.device)
+    order = reference_joint_order(command, device=joints.device)
     state = torch.cat((
         library.get_body_pos_w(ids, frames)[:, anchor],
         library.get_body_quat_w(ids, frames)[:, anchor],

@@ -33,11 +33,9 @@ class IsaacLabMuJoCoConverter(ABC):
             - body transforms [..., num_dof, D]             -> reorder directly
             - rotation mats   [..., num_dof (+ 1), 3, 3]   -> same as above on dim -3
 
-        Note: Body reordering for per-body transforms uses DOF_MAPPINGS (not
-        BODY_MAPPINGS) because each DOF link has exactly one parent body in G1,
-        so DOF order and DOF-body order are consistent by construction.  The
-        separate BODY_MAPPINGS include the root (pelvis) at index 0 and are used
-        only when the full 30-body ordering is needed.
+        Full body transforms use BODY_MAPPINGS when available, including fixed
+        bodies such as N3's toes. Actuated-link subsets retain the historical
+        DOF-based conversion, with an optional leading root body.
         """
         if from_order == to_order:
             return data
@@ -64,7 +62,10 @@ class IsaacLabMuJoCoConverter(ABC):
             )
             num_bodies = data.shape[body_dim]
 
-            if num_bodies == self.num_dof + 1:
+            full_body_mapping = getattr(self, "BODY_MAPPINGS", {}).get((from_order, to_order))
+            if full_body_mapping is not None and num_bodies == len(full_body_mapping):
+                body_order = full_body_mapping
+            elif num_bodies == self.num_dof + 1:
                 # Includes root at index 0 — keep root, reorder DOF bodies
                 body_order = [0] + [m + 1 for m in mapping]
             elif num_bodies == self.num_dof:
@@ -92,6 +93,22 @@ class IsaacLabMuJoCoConverter(ABC):
     def num_dof(self) -> int:
         """Number of actuated DOFs (excluding root)."""
         return len(self.DOF_MAPPINGS[(self.VALID_DOF_ORDERS[0], self.VALID_DOF_ORDERS[1])])
+
+    @property
+    def isaaclab_to_mujoco_dof(self):
+        return self.DOF_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_dof(self):
+        return self.DOF_MAPPINGS[("mujoco", "isaaclab")]
+
+    @property
+    def isaaclab_to_mujoco_body(self):
+        return self.BODY_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_body(self):
+        return self.BODY_MAPPINGS[("mujoco", "isaaclab")]
 
 
 class G1Converter(IsaacLabMuJoCoConverter):
@@ -200,6 +217,65 @@ class H2Converter(IsaacLabMuJoCoConverter):
 
     VR_3POINTS_BODY_NAMES = ["torso_link", "left_wrist_pitch_link", "right_wrist_pitch_link"]
     FOOT_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+
+class N3Converter(IsaacLabMuJoCoConverter):
+    """N3 ordering with independent joint/body maps, including fixed toes.
+
+    Runtime articulation names override the expected IsaacLab traversal order.
+    Validation is by name and rejects missing/extra joints or bodies before
+    motion data can be silently assigned to the wrong coordinate.
+    """
+
+    VR_3POINTS_BODY_NAMES = ["l_arm_hand_pitch_link", "r_arm_hand_pitch_link", "head_yaw_link"]
+    FOOT_BODY_NAMES = ["l_leg_ankle_roll_link", "r_leg_ankle_roll_link"]
+
+    def __init__(self, *, joint_names=None, body_names=None):
+        from gear_sonic.envs.env_utils.n3_utils import (
+            N3_ISAACLAB_BODY_NAMES, N3_ISAACLAB_DOF_NAMES,
+            N3_LOWER_BODY_JOINT_NAMES, N3_MUJOCO_BODY_NAMES,
+            N3_MUJOCO_JOINT_NAMES, N3_WRIST_JOINT_NAMES,
+        )
+
+        self.isaaclab_joint_names = tuple(N3_ISAACLAB_DOF_NAMES if joint_names is None else joint_names)
+        self.isaaclab_body_names = tuple(N3_ISAACLAB_BODY_NAMES if body_names is None else body_names)
+        self.mujoco_joint_names = tuple(N3_MUJOCO_JOINT_NAMES)
+        self.mujoco_body_names = tuple(N3_MUJOCO_BODY_NAMES)
+        for label, supplied, expected in (
+            ("joints", self.isaaclab_joint_names, self.mujoco_joint_names),
+            ("bodies", self.isaaclab_body_names, self.mujoco_body_names),
+        ):
+            if len(set(supplied)) != len(supplied) or set(supplied) != set(expected):
+                raise ValueError(f"N3 {label} mismatch: missing={sorted(set(expected) - set(supplied))}, "
+                                 f"extra={sorted(set(supplied) - set(expected))}")
+        self.JOINT_NAMES = self.isaaclab_body_names  # legacy key denotes body names
+        self.DOF_MAPPINGS = {
+            ("isaaclab", "mujoco"): [self.isaaclab_joint_names.index(name) for name in self.mujoco_joint_names],
+            ("mujoco", "isaaclab"): [self.mujoco_joint_names.index(name) for name in self.isaaclab_joint_names],
+        }
+        self.BODY_MAPPINGS = {
+            ("isaaclab", "mujoco"): [self.isaaclab_body_names.index(name) for name in self.mujoco_body_names],
+            ("mujoco", "isaaclab"): [self.mujoco_body_names.index(name) for name in self.isaaclab_body_names],
+        }
+        self.motion_metadata = {
+            "robot_type": "n3",
+            "body_joint_names_mujoco": list(self.mujoco_joint_names),
+            "body_names_mujoco": list(self.mujoco_body_names),
+            "lower_joint_indices_mujoco": [self.mujoco_joint_names.index(name) for name in N3_LOWER_BODY_JOINT_NAMES],
+            "wrist_mujoco_dof_indices": [self.mujoco_joint_names.index(name) for name in N3_WRIST_JOINT_NAMES],
+            "left_foot_body_idx": [self.mujoco_body_names.index(self.FOOT_BODY_NAMES[0])],
+            "right_foot_body_idx": [self.mujoco_body_names.index(self.FOOT_BODY_NAMES[1])],
+        }
+
+    def get_isaaclab_to_mujoco_mapping(self):
+        return {
+            "isaaclab_joints": list(self.isaaclab_body_names),
+            "isaaclab_dof_names": list(self.isaaclab_joint_names),
+            "isaaclab_to_mujoco_dof": self.DOF_MAPPINGS[("isaaclab", "mujoco")],
+            "mujoco_to_isaaclab_dof": self.DOF_MAPPINGS[("mujoco", "isaaclab")],
+            "isaaclab_to_mujoco_body": self.BODY_MAPPINGS[("isaaclab", "mujoco")],
+            "mujoco_to_isaaclab_body": self.BODY_MAPPINGS[("mujoco", "isaaclab")],
+        }
 
 
 def load_qpos_from_csv(csv_path: str) -> torch.Tensor:

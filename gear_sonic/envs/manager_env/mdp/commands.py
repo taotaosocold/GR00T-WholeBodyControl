@@ -132,6 +132,15 @@ class TrackingCommand(CommandTerm):
         self.is_evaluating = False
         self.cmd_body_names = self.cfg.body_names
         self.robot: Articulation = env.scene[cfg.asset_name]
+        self.robot_type = getattr(cfg, "robot_type", "g1")
+        if joint_utils.get_robot_type(self.robot) == "n3":
+            self.robot_type = "n3"
+        if self.robot_type not in {"g1", "n3"}:
+            raise ValueError(f"Unsupported motion robot_type: {self.robot_type!r}")
+        n3_converter = (
+            order_converter.N3Converter(joint_names=self.robot.joint_names, body_names=self.robot.body_names)
+            if self.robot_type == "n3" else None
+        )
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body)
         self.motion_anchor_body_index = self.cfg.body_names.index(self.cfg.anchor_body)
         self.vr_3point_body_indices = [
@@ -169,16 +178,21 @@ class TrackingCommand(CommandTerm):
             device=self.device,
         )
 
-        isaac_lab_joints = env.cfg.isaaclab_to_mujoco_mapping["isaaclab_joints"]
+        mapping = (n3_converter.get_isaaclab_to_mujoco_mapping() if n3_converter is not None
+                   else env.cfg.isaaclab_to_mujoco_mapping)
+        isaac_lab_joints = mapping["isaaclab_joints"]
 
-        self.isaaclab_to_mujoco_dof = env.cfg.isaaclab_to_mujoco_mapping["isaaclab_to_mujoco_dof"]
-        self.mujoco_to_isaaclab_dof = env.cfg.isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_dof"]
-        self.lower_joint_indices_mujoco = list(range(12))
+        self.isaaclab_to_mujoco_dof = mapping["isaaclab_to_mujoco_dof"]
+        self.mujoco_to_isaaclab_dof = mapping["mujoco_to_isaaclab_dof"]
+        self.lower_joint_indices_mujoco = (
+            n3_converter.motion_metadata["lower_joint_indices_mujoco"]
+            if n3_converter is not None else list(range(12))
+        )
         self.lower_joint_isaaclab_indices = [
             self.isaaclab_to_mujoco_dof[i] for i in self.lower_joint_indices_mujoco
         ]
-        self.isaaclab_to_mujoco_body = env.cfg.isaaclab_to_mujoco_mapping["isaaclab_to_mujoco_body"]
-        self.mujoco_to_isaaclab_body = env.cfg.isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_body"]
+        self.isaaclab_to_mujoco_body = mapping["isaaclab_to_mujoco_body"]
+        self.mujoco_to_isaaclab_body = mapping["mujoco_to_isaaclab_body"]
         self.running_ref_root_height = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
         )
@@ -227,6 +241,8 @@ class TrackingCommand(CommandTerm):
                 "randomize_wrist_std": self.cfg.randomize_wrist_std,
             }
         )
+        if n3_converter is not None:
+            motion_lib_cfg.update(n3_converter.motion_metadata)
 
         self.motion_lib = motion_lib_robot.MotionLibRobot(
             motion_lib_cfg, self.num_envs, self.device
@@ -580,6 +596,8 @@ class TrackingCommand(CommandTerm):
         cls,
         motion_lib_cfg,
         device,
+        *,
+        robot_type="g1",
     ):
         """Create a MotionCommand without env/sim for offline kinematic use.
 
@@ -619,7 +637,14 @@ class TrackingCommand(CommandTerm):
         # Inject body/DOF mapping into motion_lib_cfg so motion_lib handles
         # body reordering and xyzw→wxyz quaternion conversion at load time.
 
-        isaaclab_to_mujoco_mapping = order_converter.G1Converter().get_isaaclab_to_mujoco_mapping()
+        robot_type = motion_lib_cfg.get("robot_type", robot_type)
+        if robot_type not in {"g1", "n3"}:
+            raise ValueError(f"Unsupported motion robot_type: {robot_type!r}")
+        inst.robot_type = robot_type
+        converter = order_converter.N3Converter() if robot_type == "n3" else order_converter.G1Converter()
+        isaaclab_to_mujoco_mapping = converter.get_isaaclab_to_mujoco_mapping()
+        if robot_type == "n3":
+            motion_lib_cfg.update(converter.motion_metadata)
         motion_lib_cfg.update(
             {
                 "mujoco_to_isaaclab_body": isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_body"],
@@ -675,7 +700,7 @@ class TrackingCommand(CommandTerm):
         if isaaclab_to_mujoco_mapping is not None:
             inst.isaaclab_to_mujoco_dof = isaaclab_to_mujoco_mapping["isaaclab_to_mujoco_dof"]
             inst.mujoco_to_isaaclab_dof = isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_dof"]
-        inst.lower_joint_indices_mujoco = list(range(12))
+        inst.lower_joint_indices_mujoco = motion_lib_cfg.get("lower_joint_indices_mujoco", list(range(12)))
         if hasattr(inst, "isaaclab_to_mujoco_dof"):
             inst.lower_joint_isaaclab_indices = [
                 inst.isaaclab_to_mujoco_dof[i] for i in inst.lower_joint_indices_mujoco
@@ -3406,12 +3431,12 @@ class TrackingCommand(CommandTerm):
 
         if hasattr(self, "feet_contact_goal_visualizers"):
             for i in range(len(self.cfg.body_names)):
-                if self.cfg.body_names[i] == "left_ankle_roll_link":
+                if self.cfg.body_names[i] == self.cfg.feet_body_names[0]:
                     self.feet_contact_goal_visualizers[0].visualize(
                         translations=self.body_pos_relative_w[:, i],
                         marker_indices=self.feet_l.int().reshape(-1),
                     )
-                if self.cfg.body_names[i] == "right_ankle_roll_link":
+                if self.cfg.body_names[i] == self.cfg.feet_body_names[1]:
                     self.feet_contact_goal_visualizers[1].visualize(
                         translations=self.body_pos_relative_w[:, i],
                         marker_indices=self.feet_r.int().reshape(-1),
@@ -4069,6 +4094,7 @@ class TrackingCommandCfg(CommandTermCfg):
     class_type: type = TrackingCommand
 
     asset_name: str = dataclasses.MISSING
+    robot_type: str = "g1"
 
     motion_lib_cfg: dict = None
     motion_file: str = None

@@ -5,9 +5,10 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.trl.modules.wam import physical_state_parts
-from gear_sonic.utils.wam_kinematics import G1Kinematics, G1_MUJOCO_JOINT_NAMES
+from gear_sonic.utils.wam_critic import reference_joint_order
+from gear_sonic.utils.wam_kinematics import make_robot_kinematics
 from gear_sonic.utils.wam_state import robot_state as _robot_state
 from gear_sonic.utils.wam_termination import next_motion_frame, reference_pose
 
@@ -26,7 +27,6 @@ DEFAULT_WEIGHTS = {
     "action_rate_l2": -0.1,
     "joint_limit": -2.0,
 }
-_REFERENCE_ORDER = tuple(G1_ISAACLab_ORDER.index(name) for name in G1_MUJOCO_JOINT_NAMES)
 
 
 def _heading(rotation):
@@ -54,10 +54,11 @@ class WAMTrackingReward(nn.Module):
 
     def __init__(
         self, mjcf_path=None, tracked_bodies=None, stds=None, weights=None,
-        soft_limit_factor=0.9,
+        soft_limit_factor=0.9, robot_type="g1",
     ):
         super().__init__()
-        self.kinematics = G1Kinematics(mjcf_path=mjcf_path, tracked_bodies=tracked_bodies)
+        self.robot_type = joint_utils.get_robot_type(robot_type)
+        self.kinematics = make_robot_kinematics(self.robot_type, mjcf_path, tracked_bodies)
         self.stds = DEFAULT_STDS | dict(stds or {})
         self.weights = DEFAULT_WEIGHTS | dict(weights or {})
         if set(self.stds) != set(DEFAULT_STDS) or any(float(v) <= 0 for v in self.stds.values()):
@@ -126,7 +127,7 @@ def reference_state(command):
     velocities = library.get_dof_vel(command.motion_ids, frame)
     if joints.shape[-1] != 29 or velocities.shape[-1] != 29:
         raise ValueError("Physical WAM rewards require 29 reference body joints")
-    order = torch.as_tensor(_REFERENCE_ORDER, device=joints.device)
+    order = reference_joint_order(command, device=joints.device)
     anchor = command.motion_anchor_body_index
     return torch.cat((
         position, quaternion,
@@ -147,7 +148,8 @@ def _body_action(robot, action):
     if action.shape[-1] == 29:
         return action
     order = torch.as_tensor(
-        [robot.joint_names.index(name) for name in G1_MUJOCO_JOINT_NAMES], device=action.device,
+        [robot.joint_names.index(name) for name in joint_utils.get_robot_joint_names(robot, order="mujoco")],
+        device=action.device,
     )
     return action[:, order]
 
@@ -161,6 +163,7 @@ def tracking_reward_term(env, term_name, reward_config=None, command_name="motio
     """
     cfg = {key: value for key, value in dict(reward_config or {}).items() if not key.startswith("_")}
     command = env.command_manager.get_term(command_name)
+    cfg.setdefault("robot_type", joint_utils.get_robot_type(getattr(command, "robot", "g1")))
     model = getattr(env, "_wam_reward_model", None)
     if model is None or getattr(env, "_wam_reward_config", None) != cfg:
         model = WAMTrackingReward(**cfg).to(

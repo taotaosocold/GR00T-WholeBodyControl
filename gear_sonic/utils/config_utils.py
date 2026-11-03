@@ -11,6 +11,27 @@ from omegaconf import OmegaConf, open_dict
 from gear_sonic.utils.wam_noise import wam_observation_noise
 
 
+def validate_robot_motion_config(config):
+    """Require explicitly supplied N3 motion data before launching Isaac Sim.
+
+    The shipped N3 experiment has no invented dataset path and cannot silently
+    use G1 motions merely because both robots have 29 joints.
+    """
+    if OmegaConf.select(config, "manager_env.config.robot.type") != "n3":
+        return
+    prefix = "manager_env.commands.motion.motion_lib_cfg"
+    for name in ("motion_file", "smpl_motion_file"):
+        value = OmegaConf.select(config, f"{prefix}.{name}")
+        if not value or value in {"dummy", "zeros"}:
+            raise ValueError(
+                f"N3 training/evaluation requires paired N3 motion and SMPL data: "
+                f"set ++{prefix}.{name}=<your-data-path>. "
+                "The asset package contains no training motions; G1 data is not an N3 substitute."
+            )
+        if not Path(str(value)).exists():
+            raise FileNotFoundError(f"N3 {name} path does not exist: {value}")
+
+
 _WAM_OBSERVATION_GROUPS = {
     "wam": "proprio",
     "wam_state": "physical",

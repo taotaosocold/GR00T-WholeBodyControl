@@ -442,3 +442,32 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 用多个 seed 分别评估 G1、SMPL、teleop 的完整动作成功率和跟踪误差。
 WAM 自带的 reward/termination 对齐会替换 SONIC 原配置，因此不能直接比较两边训练日志的 reward。
 验证时关闭动作增强，使用真实仿真轨迹评估，不以 imagined return 判断效果。
+
+## 12. N3 V3 训练
+
+N3 使用 `+exp=manager/universal_token/all_modes/sonic_n3`，默认已选择 WAM、FSQ 和三种输入。
+资产已放在仓库的 `gear_sonic/data/assets/robot_description/`，配置不依赖原桌面目录；
+电机 PD/armature 按提供文件中的 `make_mjlab_cfg`，保持 29 维动作（含头部）。
+内部 `g1` encoder 名称表示机器人动作参考分支，此配置下其数据语义是 N3。
+
+数据路径目前留空。提供配对的 N3 robot PKL 和 SMPL 数据后，从仓库根目录启动：
+
+```bash
+N3_ROBOT_MOTIONS=data/n3/robot  # 改为实际 N3 动作目录
+N3_SMPL_MOTIONS=data/n3/smpl   # 改为配对 SMPL 目录
+
+"$PY" gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/all_modes/sonic_n3 \
+  +resume=false checkpoint=null auto_load_latest=false \
+  num_envs=512 headless=true use_wandb=false \
+  experiment_dir=logs_rl/n3_wam \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file="$N3_ROBOT_MOTIONS" \
+  ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file="$N3_SMPL_MOTIONS"
+```
+
+8 卡仍用第 6 节的 Accelerate/tmux 启动方式，替换 experiment 和数据路径，
+保留 N3 默认的三个非零 encoder 采样概率。缺少数据会明确报错，不会自动使用 G1 数据。
+N3/G1 虽同为 29 维，关节语义不同，不能直接加载旧 G1 权重。
+
+完整冒烟命令、数据格式和导出说明见 [N3 训练](docs/source/user_guide/n3_training.md)。
+新 mesh 按仓库 Git LFS 规则管理；使用 bundle 同步时还需同步 LFS 实体文件。

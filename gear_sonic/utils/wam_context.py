@@ -12,7 +12,7 @@ from copy import deepcopy
 
 import torch
 
-from gear_sonic.utils.wam_kinematics import G1_MUJOCO_JOINT_NAMES
+from gear_sonic.envs.env_utils.joint_utils import get_robot_joint_names, get_robot_torso_name
 
 
 CONTEXT_PREFIX_DIM = 33
@@ -103,7 +103,7 @@ def _snapshot(asset):
         "version": CONTEXT_SCHEMA_VERSION,
         "dim": cursor,
         "prefix_dim": CONTEXT_PREFIX_DIM,
-        "prefix_joint_names": list(G1_MUJOCO_JOINT_NAMES),
+        "prefix_joint_names": list(get_robot_joint_names(asset, order="mujoco")),
         "body_names": list(bodies),
         "joint_names": list(joints),
         "shapes_per_body": list(counts),
@@ -150,10 +150,10 @@ def physical_context(asset, legacy_context=None):
     prefix[:, 0] = cached["friction"]
     try:
         indices = torch.as_tensor(
-            [asset.joint_names.index(name) for name in G1_MUJOCO_JOINT_NAMES], device=values.device,
+            [asset.joint_names.index(name) for name in get_robot_joint_names(asset, order="mujoco")], device=values.device,
         )
     except ValueError as exc:
-        raise ValueError("Complete physical WAM context requires all 29 named G1 body joints") from exc
+        raise ValueError("Complete physical WAM context requires all 29 named robot joints") from exc
     current = asset.data.default_joint_pos
     nominal = getattr(asset.data, "default_joint_pos_nominal", None)
     if nominal is None:
@@ -167,8 +167,9 @@ def physical_context(asset, legacy_context=None):
     offsets = current - nominal
     prefix[:, 1:30] = offsets[:, indices]
     nominal_coms = getattr(asset, "_wam_nominal_coms", None)
-    if nominal_coms is not None and "torso_link" in asset.body_names:
-        torso = asset.body_names.index("torso_link")
+    torso_name = get_robot_torso_name(asset)
+    if nominal_coms is not None and torso_name in asset.body_names:
+        torso = asset.body_names.index(torso_name)
         prefix[:, 30:33] = cached["coms"][:, torso, :3] - nominal_coms[:, torso, :3].to(values)
     return torch.cat((prefix, values, offsets), -1)
 

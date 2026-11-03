@@ -52,7 +52,7 @@ import yaml
 from gear_sonic import train_agent_trl
 from gear_sonic.trl.utils import common as trl_utils_common
 from gear_sonic.trl.utils import scheduler
-from gear_sonic.trl.utils.checkpoint import get_checkpoint_step
+from gear_sonic.trl.utils.checkpoint import get_checkpoint_step, validate_checkpoint_robot
 from gear_sonic.utils import common as rl_utils_common
 from gear_sonic.utils import config_utils, obs_utils
 
@@ -124,6 +124,7 @@ def main(override_config: omegaconf.OmegaConf):
     else:
         config = override_config
 
+    config_utils.validate_robot_motion_config(config)
     config_utils.configure_wam_context(config)
     config_utils.configure_wam_observations(config)
     meta_path = Path(config.experiment_dir) / "meta.yaml"
@@ -437,6 +438,11 @@ def main(override_config: omegaconf.OmegaConf):
     # WAM checkpoints may embed large CPU replay/reference banks. Only policy
     # tensors are copied to the evaluator's device by load_state_dict below.
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    robot_type = config.manager_env.config.robot.get("type", "g1")
+    if robot_type == "n3" or checkpoint.get("wam_robot_spec") is not None:
+        from gear_sonic.envs.env_utils.joint_utils import get_robot_spec
+
+        validate_checkpoint_robot(checkpoint, get_robot_spec(env.env.scene["robot"]))
 
     # Load policy state dict with backward compatibility for std/log_std
     if "actor_model_state_dict" in checkpoint:
@@ -561,6 +567,14 @@ def main(override_config: omegaconf.OmegaConf):
             "env_config": omegaconf.OmegaConf.to_container(env.config, resolve=True),
             "algo_config": omegaconf.OmegaConf.to_container(config.algo.config, resolve=True),
         }
+        if robot_type == "n3":
+            from gear_sonic.envs.env_utils.n3_utils import get_n3_policy_parameters
+
+            asset = env.env.scene["robot"]
+            export_config["robot_spec"] = get_robot_spec(asset)
+            export_config["policy_parameters"] = get_n3_policy_parameters(
+                asset.joint_names, control_dt=env.env.step_dt,
+            )
         config_yaml_path = os.path.join(os.path.dirname(config.checkpoint), "model_config.yaml")
         with open(config_yaml_path, "w") as f:
             yaml.dump(export_config, f, default_flow_style=False)

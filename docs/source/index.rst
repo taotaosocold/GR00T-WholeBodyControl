@@ -110,6 +110,7 @@ Documentation
    user_guide/training
    user_guide/training_data
    user_guide/new_embodiments
+   user_guide/n3_training
 
 .. toctree::
    :maxdepth: 2

@@ -5,6 +5,24 @@ from numbers import Integral
 from typing import Any
 
 
+def validate_checkpoint_robot(checkpoint: Mapping[str, Any], expected: Mapping | None) -> None:
+    """Reject equal-sized policies belonging to different joint semantics.
+
+    Pre-embodiment WAM/PPO files are G1 checkpoints. They remain loadable for
+    G1; a 29-D tensor alone never establishes compatibility with N3.
+    """
+    if expected is None:
+        return
+    saved = checkpoint.get("wam_robot_spec")
+    if saved is None and expected.get("type") == "g1":
+        return
+    if saved != dict(expected):
+        raise ValueError(
+            "Checkpoint robot/joint ordering does not match the current embodiment. "
+            "N3 requires an N3 checkpoint; G1 weights cannot be reused by dimension alone."
+        )
+
+
 def get_checkpoint_step(checkpoint: Mapping[str, Any]) -> int:
     """Read an evaluation/export step from PPO or WAM checkpoint metadata.
 

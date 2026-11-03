@@ -207,6 +207,20 @@ teleop_vids/
 *.code-workspace
 # Motion/training data (large local datasets, not tracked in git)
 data/
+# Keep the portable N3 robot description while ignoring local motion datasets.
+!gear_sonic/data/
+gear_sonic/data/*
+!gear_sonic/data/assets/
+gear_sonic/data/assets/*
+!gear_sonic/data/assets/robot_description/
+gear_sonic/data/assets/robot_description/*
+!gear_sonic/data/assets/robot_description/mjcf/
+gear_sonic/data/assets/robot_description/mjcf/*
+!gear_sonic/data/assets/robot_description/mjcf/n3.xml
+!gear_sonic/data/assets/robot_description/urdf/
+gear_sonic/data/assets/robot_description/urdf/*
+!gear_sonic/data/assets/robot_description/urdf/n3/
+!gear_sonic/data/assets/robot_description/urdf/n3/**
 bones_seed_smpl/
 sonic_release/
 # Training output logs

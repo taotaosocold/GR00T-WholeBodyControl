@@ -898,7 +898,11 @@ def wam_joint_pos(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tens
     values = asset.data.joint_pos[:, indices]
     if values.shape[-1] != len(isaaclab_to_mujoco_dof):
         return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
-    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    names = joint_utils.get_robot_joint_names(asset, order="isaaclab")
+    order = torch.as_tensor(
+        [names.index(name) for name in joint_utils.get_robot_joint_names(asset, order="mujoco")],
+        device=values.device,
+    )
     return values[:, order]
 
 
@@ -909,7 +913,11 @@ def wam_joint_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tens
     values = asset.data.joint_vel[:, indices]
     if values.shape[-1] != len(isaaclab_to_mujoco_dof):
         return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
-    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    names = joint_utils.get_robot_joint_names(asset, order="isaaclab")
+    order = torch.as_tensor(
+        [names.index(name) for name in joint_utils.get_robot_joint_names(asset, order="mujoco")],
+        device=values.device,
+    )
     return values[:, order]
 
 
@@ -967,7 +975,11 @@ def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg, complete: bool 
         nominal_body = nominal[..., indices]
     offsets = current - nominal_body
     if offsets.shape[-1] == len(isaaclab_to_mujoco_dof):
-        order = torch.as_tensor(isaaclab_to_mujoco_dof, device=offsets.device)
+        names = joint_utils.get_robot_joint_names(asset, order="isaaclab")
+        order = torch.as_tensor(
+            [names.index(name) for name in joint_utils.get_robot_joint_names(asset, order="mujoco")],
+            device=offsets.device,
+        )
         xi[:, 1:30] = offsets[:, order]
     else:
         xi[:, 1:30] = 0.0
@@ -999,7 +1011,12 @@ def wam_reference_joint_pos(env: ManagerBasedEnv, command_name: str) -> torch.Te
     values = command.joint_pos
     if values.shape[-1] != len(isaaclab_to_mujoco_dof):
         return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
-    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    asset = getattr(command, "robot", "g1")
+    names = joint_utils.get_robot_joint_names(asset, order="isaaclab")
+    order = torch.as_tensor(
+        [names.index(name) for name in joint_utils.get_robot_joint_names(asset, order="mujoco")],
+        device=values.device,
+    )
     return values[:, order]
 
 
@@ -1008,7 +1025,12 @@ def wam_reference_joint_vel(env: ManagerBasedEnv, command_name: str) -> torch.Te
     values = command.joint_vel
     if values.shape[-1] != len(isaaclab_to_mujoco_dof):
         return values.new_zeros(values.shape[0], len(isaaclab_to_mujoco_dof))
-    order = torch.as_tensor(isaaclab_to_mujoco_dof, device=values.device)
+    asset = getattr(command, "robot", "g1")
+    names = joint_utils.get_robot_joint_names(asset, order="isaaclab")
+    order = torch.as_tensor(
+        [names.index(name) for name in joint_utils.get_robot_joint_names(asset, order="mujoco")],
+        device=values.device,
+    )
     return values[:, order]
 
 
@@ -1742,12 +1764,10 @@ def joint_pos_multi_future_select_joints(
 
 
 def joint_pos_multi_future_select_joints_for_smpl(
-    env: ManagerBasedEnv, command_name: str, joints_idx: list
+    env: ManagerBasedEnv, command_name: str, joints_idx: list | None = None,
+    joint_names: list[str] | None = None,
 ) -> torch.Tensor:
     """Extract reference joint positions for selected joints across SMPL-aligned future frames.
-
-    Uses smpl_num_future_frames (which may differ from num_future_frames) for
-    alignment with SMPL motion data.
 
     Args:
         command_name: Name of the tracking command term.
@@ -1759,30 +1779,13 @@ def joint_pos_multi_future_select_joints_for_smpl(
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
     joint_pos = command.joint_pos_multi_future_for_smpl
-    # Flatten case: (num_envs, num_future_frames * num_joints)
-    joint_pos_reshaped = joint_pos.view(env.num_envs, command.smpl_num_future_frames, -1)
-    joint_pos_selected = joint_pos_reshaped[..., joints_idx]
-    return joint_pos_selected
-
-
-def joint_pos_multi_future_select_joints_for_smpl(  # noqa: F811
-    env: ManagerBasedEnv, command_name: str, joints_idx: list
-) -> torch.Tensor:
-    """Extract reference joint positions for selected joints across SMPL-aligned future frames.
-
-    NOTE: This is a duplicate definition that shadows the previous one. Only this
-    version is active at runtime.
-
-    Args:
-        command_name: Name of the tracking command term.
-        joints_idx: Indices of joints to select.
-
-    Returns:
-        torch.Tensor: Selected joint positions,
-            shape (num_envs, smpl_num_future_frames, len(joints_idx)).
-    """
-    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-    joint_pos = command.joint_pos_multi_future_for_smpl
+    if joint_names is not None:
+        if joints_idx is not None:
+            raise ValueError("Specify robot wrist joint_names or joints_idx, not both")
+        names = joint_utils.get_robot_joint_names(getattr(command, "robot", "g1"), order="isaaclab")
+        joints_idx = [names.index(name) for name in joint_names]
+    if joints_idx is None:
+        raise ValueError("Selected SMPL robot joints require named joints or indices")
     # Flatten case: (num_envs, num_future_frames * num_joints)
     joint_pos_reshaped = joint_pos.view(env.num_envs, command.smpl_num_future_frames, -1)
     joint_pos_selected = joint_pos_reshaped[..., joints_idx]

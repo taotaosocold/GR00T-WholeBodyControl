@@ -15,7 +15,6 @@ import numpy as np
 from omegaconf import DictConfig
 
 # import logging
-import open3d as o3d
 from rich.progress import track
 import scipy.ndimage.filters as filters
 from scipy.spatial.transform import Rotation as sRot
@@ -153,6 +152,7 @@ def _compute_idx_levels(parents):
 class Humanoid_Batch:
     def __init__(self, cfg, device=torch.device("cpu")):
         self.cfg = cfg
+        self.robot_type = cfg.get("robot_type", "g1")
         self.asset_root = Path(cfg.asset.assetRoot)
 
         self.asset_file = cfg.asset.assetFileName
@@ -160,7 +160,7 @@ class Humanoid_Batch:
 
         parser = XMLParser(remove_blank_text=True)
         tree = parse(
-            BytesIO(open(self.mjcf_file, "rb").read()),
+            BytesIO(self.mjcf_file.read_bytes()),
             parser=parser,
         )
         self.dof_axis = []
@@ -168,9 +168,12 @@ class Humanoid_Batch:
         joints = sorted(
             [j.attrib["name"] for j in tree.getroot().find("worldbody").findall(".//joint")]
         )
-        motors = sorted([m.attrib["name"] for m in tree.getroot().find("actuator").getchildren()])
-
-        assert len(motors) > 0, "No motors found in the mjcf file"
+        actuator = tree.getroot().find("actuator")
+        motors = sorted([m.attrib["name"] for m in actuator.getchildren()]) if actuator is not None else []
+        if not motors and self.robot_type == "n3":
+            motors = sorted(j.attrib["name"] for j in tree.getroot().find("worldbody").findall(".//joint")
+                            if j.attrib.get("type", "hinge") == "hinge")
+        assert len(motors) > 0, "No motors found in the mjcf file (or no N3 hinge joints)"
 
         self.num_dof = len(motors)
         self.num_extend_dof = self.num_dof
@@ -196,15 +199,15 @@ class Humanoid_Batch:
             and tree.getroot().find("worldbody").findall(".//joint")[0].attrib["type"] == "free"
         ):
             for j in tree.getroot().find("worldbody").findall(".//joint")[1:]:
-                self.dof_axis.append([int(i) for i in j.attrib["axis"].split(" ")])
+                self.dof_axis.append([float(i) for i in j.attrib["axis"].split()])
             self.has_freejoint = True
         elif "type" not in tree.getroot().find("worldbody").findall(".//joint")[0].attrib:
             for j in tree.getroot().find("worldbody").findall(".//joint"):
-                self.dof_axis.append([int(i) for i in j.attrib["axis"].split(" ")])
+                self.dof_axis.append([float(i) for i in j.attrib["axis"].split()])
             self.has_freejoint = True
         else:
             for j in tree.getroot().find("worldbody").findall(".//joint")[6:]:
-                self.dof_axis.append([int(i) for i in j.attrib["axis"].split(" ")])
+                self.dof_axis.append([float(i) for i in j.attrib["axis"].split()])
             self.has_freejoint = False
 
         self.dof_axis = torch.tensor(self.dof_axis)
@@ -300,6 +303,8 @@ class Humanoid_Batch:
                     if not joint.attrib.get("type") == "free":
                         joints_range.append([-np.pi, np.pi])
             for joint_node in xml_node.findall("joint"):
+                if self.robot_type == "n3" and joint_node.attrib.get("type") == "free":
+                    continue
                 body_to_joint[node_name] = joint_node.attrib.get("name")
 
             for next_node in xml_node.findall("body"):
@@ -371,6 +376,15 @@ class Humanoid_Batch:
 
         B, seq_len = pose.shape[:2]
 
+        if self.robot_type == "n3" and pose.shape[-2] == self.num_dof + 1 and self.num_bodies != self.num_dof + 1:
+            # Motion files may contain root + hinge rotations rather than one
+            # rotation per body. Insert fixed toe identities at their real
+            # tree positions; appending zeros would shift subsequent links.
+            expanded = pose.new_zeros(*pose.shape[:-2], self.num_bodies, 3)
+            expanded[..., 0, :] = pose[..., 0, :]
+            expanded[..., self.actuated_joints_idx, :] = pose[..., 1:, :]
+            pose = expanded
+
         pose = pose[..., : len(self._parents), :]  # G1 fitted joints might have extra joints
 
         if (
@@ -436,7 +450,9 @@ class Humanoid_Batch:
             return_dict.global_angular_velocity = rigidbody_angular_velocity
             return_dict.global_velocity = rigidbody_linear_velocity
 
-            if len(self.cfg.extend_config) > 0:
+            if self.robot_type == "n3":
+                return_dict.dof_pos = (pose[..., self.actuated_joints_idx, :] * self.dof_axis.to(pose)).sum(-1)
+            elif len(self.cfg.extend_config) > 0:
                 return_dict.dof_pos = pose.sum(dim=-1)[
                     ..., 1 : self.num_bodies
                 ]  # you can sum it up since unitree's each joint has 1 dof. Last two are for hands. doesn't really matter.
@@ -612,6 +628,12 @@ class Humanoid_Batch:
         root_rot_mat = quaternion_to_matrix(root_quat).unsqueeze(2)
         joint_rot_mat = dof_to_rotation_matrices(dof_angles, self.dof_axis)
 
+        if self.robot_type == "n3":
+            eye = torch.eye(3, device=joint_rot_mat.device, dtype=joint_rot_mat.dtype)
+            body_rot_mat = eye.expand(flat_B, 1, self.num_bodies - 1, 3, 3).clone()
+            body_rot_mat[..., self.actuated_joints_idx - 1, :, :] = joint_rot_mat
+            joint_rot_mat = body_rot_mat
+
         # Pad with identity matrices for extended bodies
         num_extended = self.num_bodies_augment - self.num_bodies
         if num_extended > 0:
@@ -659,9 +681,10 @@ class Humanoid_Batch:
 
         root_quat = matrix_to_quaternion(local_rotations[..., 0, :, :])
         local_rot_mat = self._local_rotation_mat.to(local_rotations.device)
+        selected = self.actuated_joints_idx if self.robot_type == "n3" else slice(1, self.num_bodies)
         joint_rot_mat = torch.matmul(
-            local_rot_mat[:, 1 : self.num_bodies].transpose(-1, -2),
-            local_rotations[..., 1 : self.num_bodies, :, :],
+            local_rot_mat[:, selected].transpose(-1, -2),
+            local_rotations[..., selected, :, :],
         )
         dof_angles = rotation_matrices_to_dof(joint_rot_mat, self.dof_axis)
 
@@ -752,6 +775,8 @@ class Humanoid_Batch:
         return angular_velocity
 
     def load_mesh(self):
+        import open3d as o3d
+
         xml_base = os.path.dirname(self.mjcf_file)
         # Read the compiler tag from the g1.xml file to find if there is a meshdir defined
         tree = ETree.parse(self.mjcf_file)

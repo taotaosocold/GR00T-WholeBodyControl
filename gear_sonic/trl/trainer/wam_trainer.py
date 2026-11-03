@@ -33,6 +33,7 @@ from gear_sonic.trl.modules.wam import (
 from gear_sonic.trl.world_model.distributed import DistributedContext
 from gear_sonic.trl.world_model.sequence_replay import SequenceReplayBuffer
 from gear_sonic.trl.utils.common import custom_instantiate
+from gear_sonic.trl.utils.checkpoint import validate_checkpoint_robot
 from gear_sonic.utils.wam_critic import WAMCriticFeatures, future_reference_states
 from gear_sonic.utils.wam_context import get_push_versions
 from gear_sonic.utils.wam_kinematics import G1_MUJOCO_JOINT_NAMES
@@ -256,6 +257,22 @@ class WAMTrainer:
         self.context_keys = list(self.settings.get("context_observation_keys", []))
         self.reference_keys = list(self.settings.get("reference_observation_keys", []))
         self.physical_wam = dict((world_model_config or {}).get("cfg", {})).get("state_type", "flat") == "physical"
+        simulator = getattr(env, "env", env)
+        scene = getattr(simulator, "scene", None)
+        robot = None if scene is None else scene["robot"]
+        declared_type = env.config.get("robot", {}).get("type")
+        identity = declared_type or robot or "g1"
+        self.robot_type = joint_utils.get_robot_type(identity) if self.physical_wam else "g1"
+        self.robot_spec = None
+        if self.physical_wam:
+            if robot is not None and joint_utils.get_robot_type(robot) != self.robot_type:
+                raise ValueError("Configured WAM robot type does not match the articulation joint names")
+            self.robot_spec = joint_utils.get_robot_spec(robot if robot is not None else identity)
+        self.distributed.check_consistent(self.robot_spec, "WAM robot joint ordering")
+        native_names = joint_utils.get_robot_joint_names(self.robot_type, order="mujoco")
+        policy_names = tuple(self.robot_spec["policy_joint_names"]) if self.robot_spec else tuple(joint_utils.G1_ISAACLab_ORDER)
+        self._mujoco_to_policy = tuple(native_names.index(name) for name in policy_names)
+        self._policy_to_mujoco = tuple(policy_names.index(name) for name in native_names)
         self.independent_imagination = self.physical_wam and bool(
             self.settings.get("independent_imagination", True)
         )
@@ -346,7 +363,7 @@ class WAMTrainer:
             if reward_cfg:
                 self.reward_model = custom_instantiate(reward_cfg, _resolve=False).to(self.device)
             else:
-                self.reward_model = WAMTrackingReward().to(self.device)
+                self.reward_model = WAMTrackingReward(robot_type=self.robot_type).to(self.device)
         self.previous_world_action = torch.zeros(
             env.num_envs, self.wam_action_dim, device=self.device
         )
@@ -370,6 +387,7 @@ class WAMTrainer:
             self.critic_features = WAMCriticFeatures(
                 kinematics=self.reward_model.kinematics if self.reward_model is not None else None,
                 future_frames=self.critic_future_frames, context_dim=self.context_dim,
+                robot_type=self.robot_type,
             ).to(self.device)
             self.critic_input_dim = self.critic_features.input_dim
         else:
@@ -889,6 +907,10 @@ class WAMTrainer:
         if not self.physical_wam:
             return action
         if action.shape[-1] == self.wam_action_dim:
+            if self.robot_type == "n3":
+                order = torch.as_tensor(self._policy_to_mujoco, device=action.device)
+                return action[..., order]
+            # Preserve the historical G1 29-action convention for checkpoints.
             return action
         scene = getattr(getattr(self.env, "env", None), "scene", None)
         robot = None if scene is None else scene["robot"]
@@ -896,14 +918,14 @@ class WAMTrainer:
             raise ValueError("physical WAM needs the IsaacLab robot asset to select body actions")
         indices = joint_utils.get_body_joint_indices(robot)
         body_action = action[..., indices]
-        order = torch.as_tensor(_ISAAC_TO_MUJOCO, device=action.device)
+        order = torch.as_tensor(self._policy_to_mujoco, device=action.device)
         return body_action[..., order]
 
     def _physical_actor_frame(self, state, action, context=None):
         """Convert a physical WAM state into one Sonic proprioceptive frame."""
         position, rotation, _, angular_velocity, joint_position, joint_velocity = physical_state_parts(state)
         del position
-        index = torch.as_tensor(_MUJOCO_TO_ISAAC, device=state.device)
+        index = torch.as_tensor(self._mujoco_to_policy, device=state.device)
         joint_position = joint_position[..., index]
         joint_velocity = joint_velocity[..., index]
         scene = getattr(getattr(self.env, "env", None), "scene", None)
@@ -1431,6 +1453,7 @@ class WAMTrainer:
             "wam_critic_spec": self.critic_spec if self.physical_wam else None,
             "wam_context_schema": self.context_schema if self.physical_wam else None,
             "wam_numerical_spec": self.numerical_spec,
+            "wam_robot_spec": getattr(self, "robot_spec", None),
             "wam_replay_spec": {"compact_reference": self.compact_reference},
         }
         return payload
@@ -1447,6 +1470,7 @@ class WAMTrainer:
         # Replay and immutable motion banks are CPU data, even when inference
         # runs on CUDA. Never stage the full checkpoint in scarce GPU memory.
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        validate_checkpoint_robot(checkpoint, getattr(self, "robot_spec", None))
         policy_state = checkpoint.get("policy_state_dict", checkpoint.get("actor_model_state_dict"))
         if policy_state is None:
             model_state = checkpoint.get("model_state_dict", {})

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from gear_sonic.utils.wam_kinematics import G1_MUJOCO_JOINT_NAMES
+from gear_sonic.envs.env_utils.joint_utils import get_robot_joint_names
 
 
 def _first_tensor(data, names):
@@ -80,7 +80,7 @@ def robot_state(env, command=None, command_name="motion"):
         command = env.command_manager.get_term(command_name)
     robot = command.robot
     order = torch.as_tensor(
-        [robot.joint_names.index(name) for name in G1_MUJOCO_JOINT_NAMES],
+        [robot.joint_names.index(name) for name in get_robot_joint_names(robot, order="mujoco")],
         device=robot.data.joint_pos.device,
     )
     return torch.cat((

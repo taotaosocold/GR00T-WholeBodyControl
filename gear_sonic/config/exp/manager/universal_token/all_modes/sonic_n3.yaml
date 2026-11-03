@@ -1,0 +1,102 @@
+# @package _global_
+# Noetix N3 V3: SONIC's three FSQ input interfaces with physical WAM updates.
+# Asset parameters follow n3_v3_asset_definition.py / make_mjlab_cfg.
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_release
+  - override /trainer: wam
+  - override /world_model: wam_dynamics
+  - override /manager_env/rewards: tracking/wam
+  - override /manager_env/terminations: tracking/wam
+  - _self_
+
+project_name: TRL_N3_Track
+
+manager_env:
+  config:
+    robot:
+      type: n3
+    terrain_type: plane
+  commands:
+    motion:
+      robot_type: n3
+      motion_lib_num_dof: 29
+      anchor_body: base_link
+      body_names: &n3_tracked_bodies
+        - base_link
+        - l_leg_hip_roll_link
+        - l_leg_knee_pitch_link
+        - l_leg_ankle_roll_link
+        - r_leg_hip_roll_link
+        - r_leg_knee_pitch_link
+        - r_leg_ankle_roll_link
+        - waist_yaw_link
+        - l_arm_shoulder_roll_link
+        - l_arm_elbow_pitch_link
+        - l_arm_hand_pitch_link
+        - r_arm_shoulder_roll_link
+        - r_arm_elbow_pitch_link
+        - r_arm_hand_pitch_link
+        - head_yaw_link
+      vr_3point_body: [l_arm_hand_pitch_link, r_arm_hand_pitch_link, head_yaw_link]
+      vr_3point_body_offset: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+      reward_point_body: [waist_yaw_link, l_arm_hand_pitch_link, r_arm_hand_pitch_link]
+      reward_point_body_offset: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+      waist_joints: [waist_yaw_joint]
+      left_eef_deps:
+        - l_arm_shoulder_pitch_joint
+        - l_arm_shoulder_roll_joint
+        - l_arm_shoulder_yaw_joint
+        - l_arm_elbow_pitch_joint
+        - l_arm_elbow_yaw_joint
+        - l_arm_hand_roll_joint
+        - l_arm_hand_pitch_joint
+      right_eef_deps:
+        - r_arm_shoulder_pitch_joint
+        - r_arm_shoulder_roll_joint
+        - r_arm_shoulder_yaw_joint
+        - r_arm_elbow_pitch_joint
+        - r_arm_elbow_yaw_joint
+        - r_arm_hand_roll_joint
+        - r_arm_hand_pitch_joint
+      feet_body_names: [l_leg_ankle_roll_link, r_leg_ankle_roll_link]
+      # No G1-specific upper-body dataset names or pose mixing by default.
+      cat_upper_body_poses: false
+      freeze_frame_aug: false
+      randomize_wrist_poses: false
+      encoder_sample_probs: {g1: 1.0, teleop: 1.0, smpl: 1.0}
+      motion_lib_cfg:
+        # Supply paired, N3-retargeted data before launching real training.
+        motion_file: null
+        smpl_motion_file: null
+        upper_body_augment_prefixes: []
+        asset:
+          assetRoot: gear_sonic/data/assets/robot_description/mjcf/
+          assetFileName: n3.xml
+          urdfFileName: gear_sonic/data/assets/robot_description/urdf/n3/n3_v3_isaac.urdf
+  observations:
+    tokenizer:
+      joint_pos_multi_future_wrist_for_smpl:
+        params:
+          joints_idx: null
+          joint_names:
+            - l_arm_elbow_yaw_joint
+            - l_arm_hand_roll_joint
+            - l_arm_hand_pitch_joint
+            - r_arm_elbow_yaw_joint
+            - r_arm_hand_roll_joint
+            - r_arm_hand_pitch_joint
+  events:
+    base_com:
+      params:
+        asset_cfg:
+          body_names: waist_yaw_link
+    randomize_rigid_body_mass:
+      params:
+        asset_cfg:
+          body_names: ".*_arm_hand_.*|waist_yaw_link"
+
+trainer:
+  reward_config:
+    robot_type: n3
+    mjcf_path: gear_sonic/data/assets/robot_description/mjcf/n3.xml
+    tracked_bodies: *n3_tracked_bodies

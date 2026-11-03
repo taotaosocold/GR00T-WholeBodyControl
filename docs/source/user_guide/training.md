@@ -23,6 +23,7 @@ modality. Training uses PPO with auxiliary losses in Isaac Lab simulation.
 | `sonic_release` | G1, teleop, SMPL | **Default** — matches the released checkpoint |
 | `sonic_v1_1` | G1, teleop, SMPL | SONIC v1.1 with heading-normalized targets and wrist-pose augmentation |
 | `sonic_bones_seed` | G1, teleop, SMPL, SOMA | Extended training with SOMA skeleton encoder |
+| `sonic_n3` | N3 robot reference, teleop, SMPL | N3 V3 with physical WAM updates; see [N3 Training](n3_training.md) |
 
 Use `sonic_release` for finetuning and evaluation. The `sonic_bones_seed`
 config adds a fourth SOMA encoder (see [Training with SOMA](#training-with-soma-encoder)).
