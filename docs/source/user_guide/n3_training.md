@@ -37,11 +37,46 @@ The current robot loader consumes its existing PKL contract: `fps`,
 with shape `[T,32,3]`. A `[T,30,3]` root-plus-29-joint representation is also
 accepted and the two fixed toe identities are inserted by name. Robot joint
 coordinates follow the native hinge order recorded in `n3_utils.py`, rather
-than assuming the first twelve coordinates are legs. Raw NPZ/qpos data needs
-conversion and joint-order validation before use with this loader.
+than assuming the first twelve coordinates are legs.
 SMPL clips must match the robot motion keys and timeline; the existing paired
-frame checks apply. Data conversion and real-data validation remain pending
-until the datasets are supplied.
+frame checks apply.
+
+### Convert NPZ motions
+
+The CPU-only converter follows the G1 CSV converter's PKL contract, using the
+vendored N3 MJCF for hinge axes and the 32-body pose layout, including fixed
+toes. It writes one `{motion_key: entry}` PKL per clip. Run from the repository
+root; no Isaac Lab, CUDA or Torch is required:
+
+```bash
+python gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
+  --input data/n3/npz --output data/n3/robot \
+  --smpl-dir data/n3/smpl
+```
+
+Required NPZ fields are `fps`, `joint_pos[T,29]`, `body_pos_w[T,B,3]` and
+`body_quat_w[T,B,4]`, with at least three frames. Positions must be metres in a
+Z-up world and angles radians. The script preserves frame count, frame rate and
+root height; it does not retarget old geometry to V3 or synthesize SMPL data.
+
+By default, `joint_names` identifies joint columns and `body_names` identifies
+`base_link`. Legacy files without these fields require an explicitly confirmed
+source order: add `--joint-names-file data/n3/source_joint_names.json` (a JSON
+list of the 29 N3 joint names in source column order) and `--root-body-index 0`
+if the first source body is the base. Alternatively, `--joint-order isaaclab`
+selects the current N3 Isaac order from `n3_utils.py`, and `--joint-order mujoco`
+selects its native MJCF order. These flags assert the source order; neither is
+inferred from a legacy `n3_0905` filename. Explicit names conflicting with NPZ
+metadata are rejected. Quaternions default to `wxyz`; use `--quat-order xyzw`
+only for data exported with that convention.
+
+The known `_from_g1_noetix_n3_0905` filename suffix is removed so PKL stems
+match the original SMPL stems. Use `--strip-suffix ''` to retain it or supply a
+different suffix. `--smpl-dir` checks same-name file presence; the training
+loader still validates paired timelines. Duplicate keys, invalid data and
+existing outputs fail before publishing any clips. Writes are atomic per file;
+`--overwrite` explicitly allows replacement. Use `--dry-run` to validate without
+writing. Original NPZ files are never changed.
 
 From the repository root, activate the existing Isaac Lab training environment
 and supply your actual data locations, for example under the untracked `data/`:

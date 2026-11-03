@@ -34,7 +34,7 @@ rm -f /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle
 
 git bundle create \
   /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle \
-  supermimic
+  supermimic_n3
 
 git bundle verify /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle
 
@@ -52,8 +52,8 @@ cd /data/ouqin/GR00T-WholeBodyControl
 git status --short
 git branch --show-current
 
-git fetch /data/ouqin/GR00T-WholeBodyControl.bundle supermimic
-git checkout supermimic
+git fetch /data/ouqin/GR00T-WholeBodyControl.bundle supermimic_n3
+git checkout supermimic_n3
 git reset --hard FETCH_HEAD
 
 git log -1 --oneline
@@ -449,6 +449,19 @@ N3 使用 `+exp=manager/universal_token/all_modes/sonic_n3`，默认已选择 WA
 资产已放在仓库的 `gear_sonic/data/assets/robot_description/`，配置不依赖原桌面目录；
 电机 PD/armature 按提供文件中的 `make_mjlab_cfg`，保持 29 维动作（含头部）。
 内部 `g1` encoder 名称表示机器人动作参考分支，此配置下其数据语义是 N3。
+
+NPZ 动作先用 CPU 转为训练 PKL，保留原文件、帧率和根轨迹：
+
+```bash
+"$PY" gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
+  --input data/n3/npz --output data/n3/robot \
+  --smpl-dir data/n3/smpl
+```
+
+默认从 NPZ 的 `joint_names/body_names` 读取顺序。无名称的旧文件必须显式提供
+`--joint-names-file <29列关节名JSON> --root-body-index 0`；也支持已确认的
+`--joint-order isaaclab|mujoco`，不能仅凭文件后缀推断。默认四元数为 `wxyz`。
+脚本会去掉 `_from_g1_noetix_n3_0905` 后缀以配对 SMPL；`--dry-run` 仅检查，默认不覆盖输出。
 
 数据路径目前留空。提供配对的 N3 robot PKL 和 SMPL 数据后，从仓库根目录启动：
 
