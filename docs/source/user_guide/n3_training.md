@@ -32,41 +32,58 @@ The experiment deliberately sets both dataset paths to `null`. Provide paired
 N3-retargeted robot motion and SMPL data; startup fails with a specific message
 until both paths exist. No G1 or `n3_0905` dataset is selected automatically.
 
-The current robot loader consumes its existing PKL contract: `fps`,
-`root_trans_offset` with shape `[T,3]`, and `pose_aa` in the N3 MJCF body order
-with shape `[T,32,3]`. A `[T,30,3]` root-plus-29-joint representation is also
-accepted and the two fixed toe identities are inserted by name. Robot joint
-coordinates follow the native hinge order recorded in `n3_utils.py`, rather
-than assuming the first twelve coordinates are legs.
+The robot loader consumes `fps`, `root_trans_offset[T,3]`, and
+`pose_aa[T,32,3]`. Named files carry `joint_names` and `body_names`; the loader
+normalizes their declared order to the native MJCF layout before any FK or
+augmentation. Named 30-body data is also supported and the two fixed toe
+identities are inserted by name. Old unnamed PKLs retain their original native
+MJCF interpretation. Robot joint coordinates use the native hinge order
+recorded in `n3_utils.py`, rather than assuming the first twelve are legs.
 SMPL clips must match the robot motion keys and timeline; the existing paired
 frame checks apply.
 
 ### Convert NPZ motions
 
-The CPU-only converter follows the G1 CSV converter's PKL contract, using the
-vendored N3 MJCF for hinge axes and the 32-body pose layout, including fixed
-toes. It writes one `{motion_key: entry}` PKL per clip. Run from the repository
-root; no Isaac Lab, CUDA or Torch is required:
+The CPU-only converter uses the vendored N3 MJCF for hinge axes and the full
+32-body pose layout, including fixed toes. It writes one `{motion_key: entry}`
+PKL per clip. The default output stores `dof` and `pose_aa` in actual Isaac/PhysX
+BFS order, with names and `motion_order=isaaclab`. Use `--output-order mujoco`
+for native storage. The G1 CSV converter, in contrast, takes Isaac-order inputs
+and always writes native MJCF order; input and storage order are different
+choices. Run from the repository root; no Isaac Lab, CUDA or Torch is required:
 
 ```bash
 python gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
   --input data/n3/npz --output data/n3/robot \
-  --smpl-dir data/n3/smpl
+  --joint-order n3_0905 --output-order isaaclab
 ```
+
+The legacy `n3_0905` profile comes from the old Isaac training ONNX's
+`joint_names` metadata (SHA256
+`838e402e874e7497eb6604d8e6c497e43f8c8dbc58c978ae09e7b132ea70aa80`).
+It was verified against the old URDF on 189 NPZ clips / 945 sampled frames:
+maximum link-position error `4.37e-6 m`, rotation-matrix error `2.56e-6`.
+The GPU14 smoke split's 159 files match that verified source subset by SHA256.
+They use actual PhysX BFS order, root body 0 and wxyz quaternions, without
+default-angle offsets. Old short names are mapped to the corresponding V3
+names; no external joint-name JSON is needed for this profile. Actual sibling
+order is measured, rather than inferred from URDF XML declaration order.
+The current V3 BFS table was separately checked with a live GPU14 articulation.
 
 Required NPZ fields are `fps`, `joint_pos[T,29]`, `body_pos_w[T,B,3]` and
 `body_quat_w[T,B,4]`, with at least three frames. Positions must be metres in a
 Z-up world and angles radians. The script preserves frame count, frame rate and
 root height; it does not retarget old geometry to V3 or synthesize SMPL data.
 
-By default, `joint_names` identifies joint columns and `body_names` identifies
-`base_link`. Legacy files without these fields require an explicitly confirmed
+For other sources, default `--joint-order auto` reads `joint_names` to identify
+columns and `body_names` to identify `base_link`. Legacy files without these
+fields require an explicitly confirmed
 source order: add `--joint-names-file data/n3/source_joint_names.json` (a JSON
 list of the 29 N3 joint names in source column order) and `--root-body-index 0`
 if the first source body is the base. Alternatively, `--joint-order isaaclab`
 selects the current N3 Isaac order from `n3_utils.py`, and `--joint-order mujoco`
-selects its native MJCF order. These flags assert the source order; neither is
-inferred from a legacy `n3_0905` filename. Explicit names conflicting with NPZ
+selects its native MJCF order. These flags assert the source order; no order is
+inferred merely from filenames. Explicit names conflicting with NPZ
 metadata are rejected. Quaternions default to `wxyz`; use `--quat-order xyzw`
 only for data exported with that convention.
 

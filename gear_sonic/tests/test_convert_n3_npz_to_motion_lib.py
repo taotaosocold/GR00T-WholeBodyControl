@@ -16,12 +16,15 @@ import joblib
 import numpy as np
 
 from gear_sonic.data_process.convert_n3_npz_to_motion_lib import (
-    DEFAULT_STRIP_SUFFIX, convert_directory, convert_motion, motion_key_from_path,
+    DEFAULT_STRIP_SUFFIX, N3_0905_ISAACLAB_DOF_NAMES, convert_directory, convert_motion,
+    motion_key_from_path, order_motion_for_storage,
 )
 from gear_sonic.envs.env_utils.n3_utils import (
     N3_ISAACLAB_BODY_NAMES, N3_ISAACLAB_DOF_NAMES, N3_MJCF_PATH,
     N3_MUJOCO_BODY_NAMES, N3_MUJOCO_JOINT_NAMES, N3_TRACKED_BODIES,
+    N3_TRAINING_TO_DEPLOYMENT_JOINT_NAMES,
 )
+from gear_sonic.utils.motion_lib.n3_motion_order import normalize_n3_motion_order
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -226,6 +229,9 @@ class N3ConversionTests(unittest.TestCase):
                 payload = joblib.load(root / "out" / f"{key}.pkl")
                 self.assertEqual(list(payload), [key])
                 self.assertEqual(payload[key]["pose_aa"].shape, (5, 32, 3))
+                self.assertEqual(payload[key]["joint_names"], list(N3_ISAACLAB_DOF_NAMES))
+                self.assertEqual(payload[key]["body_names"], list(N3_ISAACLAB_BODY_NAMES))
+                self.assertEqual(payload[key]["motion_order"], "isaaclab")
             for path in paths:
                 self.assertEqual(path.read_bytes(), before[path])
 
@@ -247,7 +253,7 @@ class N3ConversionTests(unittest.TestCase):
             summary = convert_directory(root / "compatible.npz", root / "valid", quat_order="xyzw")
             self.assertEqual(summary["files"], 1)
             converted = joblib.load(root / "valid/compatible.pkl")["compatible"]
-            np.testing.assert_array_equal(converted["dof"], native)
+            np.testing.assert_array_equal(normalize_n3_motion_order(converted)["dof"], native)
             np.testing.assert_allclose(converted["pose_aa"][:, 0, 2], np.pi / 2, atol=2e-7, rtol=0)
 
     def test_batch_rejects_duplicate_stems_existing_targets_and_missing_pairs_before_publish(self):
@@ -310,7 +316,8 @@ class N3ConversionTests(unittest.TestCase):
             summary = convert_directory(root / "input", out, overwrite=True)
             self.assertEqual(summary["files"], 2)
             for key in ("a", "z"):
-                np.testing.assert_array_equal(joblib.load(out / f"{key}.pkl")[key]["dof"], native)
+                converted = joblib.load(out / f"{key}.pkl")[key]
+                np.testing.assert_array_equal(normalize_n3_motion_order(converted)["dof"], native)
 
     def test_overwrite_rejects_directory_and_symlink_targets_before_publishing(self):
         data, _ = self.fixture()
@@ -356,7 +363,45 @@ class N3ConversionTests(unittest.TestCase):
                 self.write_npz(root / "clip.npz", data)
                 convert_directory(root / "clip.npz", root / profile, joint_order=profile)
                 payload = joblib.load(root / profile / "clip.pkl")["clip"]
-                np.testing.assert_array_equal(payload["dof"], native)
+                np.testing.assert_array_equal(normalize_n3_motion_order(payload)["dof"], native)
+
+    def test_legacy_0905_actual_bfs_profile_needs_no_external_names_json(self):
+        data, native = self.fixture()
+        aliases = {alias: name for name, alias in N3_TRAINING_TO_DEPLOYMENT_JOINT_NAMES.items()}
+        source_names = [aliases[name] for name in N3_0905_ISAACLAB_DOF_NAMES]
+        # Independently checked against real old-export metadata and current
+        # GPU14 articulation names: renaming does not change the 29 DOF order.
+        self.assertEqual(source_names, list(N3_ISAACLAB_DOF_NAMES))
+        data["joint_pos"] = native[:, [N3_MUJOCO_JOINT_NAMES.index(name) for name in source_names]]
+        data["body_pos_w"] = data["body_pos_w"][:, -1:]
+        data["body_quat_w"] = data["body_quat_w"][:, -1:]
+        del data["joint_names"], data["body_names"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / f"clip{DEFAULT_STRIP_SUFFIX}.npz"
+            self.write_npz(source, data)
+            for output_order in ("isaaclab", "mujoco"):
+                summary = convert_directory(source, root / output_order, joint_order="n3_0905",
+                                            output_order=output_order)
+                self.assertEqual(summary["output_order"], output_order)
+                result = joblib.load(root / output_order / "clip.pkl")["clip"]
+                np.testing.assert_array_equal(normalize_n3_motion_order(result)["dof"], native)
+                self.assertEqual(result["source_joint_names"], list(N3_0905_ISAACLAB_DOF_NAMES))
+                self.assertEqual(result["source_root_body_index"], 0)
+
+    def test_bfs_and_native_storage_preserve_named_values_and_source_arrays(self):
+        data, _ = self.fixture()
+        native = convert_motion(data)
+        before = deepcopy(native)
+        bfs = order_motion_for_storage(native)
+        recovered = normalize_n3_motion_order(bfs)
+        for key in ("dof", "pose_aa", "root_trans_offset", "root_rot"):
+            np.testing.assert_array_equal(recovered[key], native[key])
+            np.testing.assert_array_equal(native[key], before[key])
+        native_again = order_motion_for_storage(bfs, "mujoco")
+        np.testing.assert_array_equal(native_again["pose_aa"], native["pose_aa"])
+        with self.assertRaises(ValueError):
+            order_motion_for_storage(native, "unknown")
 
     def test_converted_output_loads_real_motion_library_and_adaptive_sampler(self):
         import torch

@@ -12,10 +12,10 @@ Examples, from the repository root::
     python gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
         --input data/n3/npz --output data/n3/robot
 
-    # Legacy files need an explicitly confirmed joint order and root index.
+    # Verified legacy n3_0905 exports have a built-in actual PhysX BFS order.
     python gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
         --input data/n3/npz --output data/n3/robot \
-        --joint-order isaaclab --root-body-index 0 --quat-order wxyz
+        --joint-order n3_0905 --output-order isaaclab
 
 Only NumPy, SciPy and joblib are required; Isaac Lab and CUDA are not imported.
 """
@@ -37,14 +37,37 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gear_sonic.envs.env_utils.n3_utils import (  # noqa: E402
+    N3_ISAACLAB_BODY_NAMES,
     N3_ISAACLAB_DOF_NAMES,
     N3_MJCF_PATH,
     N3_MUJOCO_BODY_NAMES,
     N3_MUJOCO_JOINT_NAMES,
+    N3_TRAINING_TO_DEPLOYMENT_JOINT_NAMES,
 )
 
 DEFAULT_STRIP_SUFFIX = "_from_g1_noetix_n3_0905"
 _FIELDS = ("fps", "joint_pos", "body_pos_w", "body_quat_w")
+
+# Actual joint_names metadata from the old Isaac/PhysX training export:
+# tracking_n3_mha_mimic/2026-09-15_01-22-53_wf_v5/exported/policy.onnx
+# SHA256 838e402e874e7497eb6604d8e6c497e43f8c8dbc58c978ae09e7b132ea70aa80.
+# This BFS sibling order differs from simply walking the URDF XML children.
+# Verified against old-URDF FK for 189 legacy NPZ clips (945 sampled frames).
+N3_0905_ISAACLAB_DOF_NAMES = (
+    "l_hip_pitch_joint", "r_hip_pitch_joint", "waist_yaw_joint",
+    "l_hip_roll_joint", "r_hip_roll_joint", "head_pitch_joint",
+    "l_arm_pitch_joint", "r_arm_pitch_joint", "l_hip_yaw_joint", "r_hip_yaw_joint",
+    "head_yaw_joint", "l_arm_roll_joint", "r_arm_roll_joint",
+    "l_knee_pitch_joint", "r_knee_pitch_joint", "l_arm_yaw_joint", "r_arm_yaw_joint",
+    "l_ankle_pitch_joint", "r_ankle_pitch_joint", "l_elbow_pitch_joint", "r_elbow_pitch_joint",
+    "l_ankle_roll_joint", "r_ankle_roll_joint", "l_hand_yaw_joint", "r_hand_yaw_joint",
+    "l_hand_roll_joint", "r_hand_roll_joint", "l_hand_pitch_joint", "r_hand_pitch_joint",
+)
+_JOINT_ALIASES = {alias: name for name, alias in N3_TRAINING_TO_DEPLOYMENT_JOINT_NAMES.items()}
+
+
+def _canonical_joint_names(names):
+    return tuple(_JOINT_ALIASES.get(name, name) for name in names)
 
 
 def _names(value, label):
@@ -146,12 +169,15 @@ def convert_motion(data, source_joint_names=None, *, root_body_index=None, quat_
     if quaternions.shape != (*positions.shape[:2], 4):
         raise ValueError("body_quat_w must have shape [T,B,4] matching body_pos_w")
 
-    names = _names(source_joint_names, "source_joint_names") if source_joint_names is not None else None
+    raw_names = _names(source_joint_names, "source_joint_names") if source_joint_names is not None else None
+    names = _canonical_joint_names(raw_names) if raw_names is not None else None
     if "joint_names" in data:
-        metadata_names = _names(data["joint_names"], "joint_names")
+        metadata_raw_names = _names(data["joint_names"], "joint_names")
+        metadata_names = _canonical_joint_names(metadata_raw_names)
         if names is not None and names != metadata_names:
             raise ValueError("Explicit source joint order conflicts with NPZ joint_names metadata")
         names = metadata_names
+        raw_names = metadata_raw_names
     if names is None:
         raise ValueError("NPZ has no joint_names; specify --joint-order or --joint-names-file")
     if len(names) != 29 or set(names) != set(N3_MUJOCO_JOINT_NAMES):
@@ -199,10 +225,34 @@ def convert_motion(data, source_joint_names=None, *, root_body_index=None, quat_
         "root_rot": _float32(root_quat, "root_rot"),  # xyzw, as in the G1 converter
         "joint_names": list(N3_MUJOCO_JOINT_NAMES),
         "body_names": list(N3_MUJOCO_BODY_NAMES),
-        "source_joint_names": list(names),
+        "source_joint_names": list(raw_names),
         "source_root_body_index": int(root_body_index),
         "source_quat_order": quat_order,
         "robot_type": "n3",
+        "motion_order": "mujoco",
+    }
+
+
+def order_motion_for_storage(entry, output_order="isaaclab"):
+    """Save pose and DOFs in named BFS order, or retain MJCF native order.
+
+    The training loader normalizes named N3 motions back to native FK order.
+    This permutation changes no joint angles, root trajectory or frame times.
+    """
+    if output_order == "isaaclab":
+        joint_names, body_names = N3_ISAACLAB_DOF_NAMES, N3_ISAACLAB_BODY_NAMES
+    elif output_order == "mujoco":
+        joint_names, body_names = N3_MUJOCO_JOINT_NAMES, N3_MUJOCO_BODY_NAMES
+    else:
+        raise ValueError(f"Unknown output_order: {output_order}")
+    source_joints, source_bodies = list(entry["joint_names"]), list(entry["body_names"])
+    return {
+        **entry,
+        "dof": entry["dof"][:, [source_joints.index(name) for name in joint_names]],
+        "pose_aa": entry["pose_aa"][:, [source_bodies.index(name) for name in body_names]],
+        "joint_names": list(joint_names),
+        "body_names": list(body_names),
+        "motion_order": output_order,
     }
 
 
@@ -225,18 +275,23 @@ def _load_and_convert(path, source_joint_names, root_body_index, quat_order):
 
 def convert_directory(input_path, output_dir, *, source_joint_names=None, joint_order="auto",
                       root_body_index=None, quat_order="wxyz", strip_suffix=DEFAULT_STRIP_SUFFIX,
-                      overwrite=False, dry_run=False, smpl_dir=None):
+                      overwrite=False, dry_run=False, smpl_dir=None, output_order="isaaclab"):
     """Convert a single NPZ or a recursive directory into one PKL per clip.
 
     All inputs are validated in a temporary staging directory before publishing
     any output. Existing files and duplicate sequence keys are rejected by
     default. Optional SMPL checking verifies filenames, not frame alignment.
     """
-    profiles = {"auto": None, "isaaclab": N3_ISAACLAB_DOF_NAMES, "mujoco": N3_MUJOCO_JOINT_NAMES}
+    profiles = {"auto": None, "isaaclab": N3_ISAACLAB_DOF_NAMES, "mujoco": N3_MUJOCO_JOINT_NAMES,
+                "n3_0905": N3_0905_ISAACLAB_DOF_NAMES}
     if joint_order not in profiles:
         raise ValueError(f"Unknown joint_order: {joint_order}")
     if source_joint_names is not None and joint_order != "auto":
         raise ValueError("Use either source_joint_names or a joint_order profile")
+    if output_order not in {"isaaclab", "mujoco"}:
+        raise ValueError(f"Unknown output_order: {output_order}")
+    if root_body_index is None and joint_order == "n3_0905":
+        root_body_index = 0
     names = source_joint_names if source_joint_names is not None else profiles[joint_order]
     source, destination = Path(input_path), Path(output_dir)
     if source.is_file() and source.suffix.lower() == ".npz":
@@ -284,6 +339,8 @@ def convert_directory(input_path, output_dir, *, source_joint_names=None, joint_
                 except (ValueError, KeyError, OSError) as exc:
                     raise ValueError(f"{path}: {exc}") from exc
                 total_frames += entry["pose_aa"].shape[0]
+                entry = order_motion_for_storage(entry, output_order)
+                entry["source_joint_order"] = joint_order if source_joint_names is None else "custom"
                 joblib.dump({key: entry}, Path(staging) / f"{key}.pkl", compress=3)
             # Recheck after staging so a late conflict also leaves all outputs untouched.
             for _, _, target in plan:
@@ -298,7 +355,7 @@ def convert_directory(input_path, output_dir, *, source_joint_names=None, joint_
                 else:
                     os.link(staged, target)  # atomic publication without overwriting another file
     return {"files": len(plan), "total_frames": total_frames,
-            "output_dir": str(destination), "dry_run": dry_run}
+            "output_dir": str(destination), "output_order": output_order, "dry_run": dry_run}
 
 
 def main(argv=None):
@@ -307,9 +364,11 @@ def main(argv=None):
     parser.add_argument("--output", required=True, help="Output directory for individual robot PKLs")
     order = parser.add_mutually_exclusive_group()
     order.add_argument(
-        "--joint-order", choices=("auto", "isaaclab", "mujoco"), default="auto",
-        help="auto requires NPZ joint_names; named profiles assert the confirmed source column order",
+        "--joint-order", choices=("auto", "isaaclab", "mujoco", "n3_0905"), default="auto",
+        help="auto reads metadata; n3_0905 is the verified old PhysX BFS export order",
     )
+    parser.add_argument("--output-order", choices=("isaaclab", "mujoco"), default="isaaclab",
+                        help="Save named BFS order (default) or MJCF native order")
     order.add_argument("--joint-names-file", help="JSON list of the 29 source column names in order")
     parser.add_argument(
         "--root-body-index", type=int, help="Source base_link body index; required without body_names",
@@ -329,7 +388,7 @@ def main(argv=None):
             args.input, args.output, source_joint_names=names, joint_order=args.joint_order,
             root_body_index=args.root_body_index, quat_order=args.quat_order,
             strip_suffix=args.strip_suffix, overwrite=args.overwrite, dry_run=args.dry_run,
-            smpl_dir=args.smpl_dir,
+            smpl_dir=args.smpl_dir, output_order=args.output_order,
         )
     except (ValueError, KeyError, OSError, ET.ParseError) as exc:
         parser.exit(2, f"Error: {exc}\n")

@@ -455,13 +455,14 @@ NPZ 动作先用 CPU 转为训练 PKL，保留原文件、帧率和根轨迹：
 ```bash
 "$PY" gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
   --input data/n3/npz --output data/n3/robot \
-  --smpl-dir data/n3/smpl
+  --joint-order n3_0905 --output-order isaaclab
 ```
 
-默认从 NPZ 的 `joint_names/body_names` 读取顺序。无名称的旧文件必须显式提供
-`--joint-names-file <29列关节名JSON> --root-body-index 0`；也支持已确认的
-`--joint-order isaaclab|mujoco`，不能仅凭文件后缀推断。默认四元数为 `wxyz`。
-脚本会去掉 `_from_g1_noetix_n3_0905` 后缀以配对 SMPL；`--dry-run` 仅检查，默认不覆盖输出。
+这批 `n3_0905` NPZ 已按旧策略 ONNX 的关节表和 FK 验证为实际 Isaac/PhysX BFS 顺序，
+使用内置 `--joint-order n3_0905` 即可，无需外部 JSON；其根为 body 0、四元数为 `wxyz`。
+输出默认按 BFS 保存 `dof/pose_aa` 和名称；训练加载时按名称恢复 MJCF 顺序，兼容旧 native PKL。
+其他来源可使用 NPZ 名称元数据或显式指定源顺序。`--smpl-dir` 仅可选检查同名配对，
+脚本会去掉 `_from_g1_noetix_n3_0905` 后缀；`--dry-run` 仅检查，默认不覆盖输出。
 
 数据路径目前留空。提供配对的 N3 robot PKL 和 SMPL 数据后，从仓库根目录启动：
 

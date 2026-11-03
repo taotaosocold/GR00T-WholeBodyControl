@@ -108,7 +108,7 @@ class N3AssetTests(unittest.TestCase):
                     self.assertEqual((float(limit.get("lower")), float(limit.get("upper"))),
                                      vector(native.get("range")))
 
-    def test_expected_isaac_order_is_the_full_urdf_breadth_first_order(self):
+    def test_measured_isaac_order_is_a_full_breadth_first_traversal(self):
         urdf = ET.parse(REPOSITORY / n3.N3_URDF_PATH).getroot()
         children = defaultdict(list)
         roots = {link.get("name") for link in urdf.findall("link")}
@@ -118,15 +118,27 @@ class N3AssetTests(unittest.TestCase):
             roots.discard(child)
         self.assertEqual(roots, {"base_link"})
         queue = deque([("base_link", None)])
-        bodies, joints = [], []
+        bodies, joints, depths = [], [], {"base_link": 0}
+        body_to_joint = {}
         while queue:
             body, joint = queue.popleft()
             bodies.append(body)
             if joint is not None and joint.get("type") != "fixed":
                 joints.append(joint.get("name"))
+                body_to_joint[body] = joint.get("name")
+            for child, _ in children[body]:
+                depths[child] = depths[body] + 1
             queue.extend(children[body])
-        self.assertEqual(tuple(joints), n3.N3_ISAACLAB_DOF_NAMES)
-        self.assertEqual(tuple(bodies), n3.N3_ISAACLAB_BODY_NAMES)
+        # PhysX chooses its own sibling order. XML declaration order is not
+        # the runtime order; validate BFS levels and the measured first level.
+        self.assertEqual(set(joints), set(n3.N3_ISAACLAB_DOF_NAMES))
+        self.assertEqual(set(bodies), set(n3.N3_ISAACLAB_BODY_NAMES))
+        levels = [depths[name] for name in n3.N3_ISAACLAB_BODY_NAMES]
+        self.assertEqual(levels, sorted(levels))
+        self.assertEqual(n3.N3_ISAACLAB_BODY_NAMES[:4],
+                         ("base_link", "l_leg_hip_pitch_link", "r_leg_hip_pitch_link", "waist_yaw_link"))
+        self.assertEqual(tuple(body_to_joint[body] for body in n3.N3_ISAACLAB_BODY_NAMES if body in body_to_joint),
+                         n3.N3_ISAACLAB_DOF_NAMES)
 
     def test_joint_and_body_permutations_are_exact_inverses(self):
         for native, isaac, to_native, to_isaac in (

@@ -1,7 +1,7 @@
 """N3 V3 training-asset metadata; safe to import without Isaac Lab.
 
 Joint/body native order follows the vendored training MJCF. Isaac Lab order
-is the expected breadth-first URDF traversal with fixed toe links retained.
+is the actual PhysX breadth-first order measured with fixed toe links retained.
 Each ``ISAACLAB_TO_MUJOCO`` array selects Isaac entries in MuJoCo order.
 """
 
@@ -37,26 +37,26 @@ N3_MUJOCO_BODY_NAMES = (
 )
 
 N3_ISAACLAB_DOF_NAMES = (
-    "waist_yaw_joint", "l_leg_hip_pitch_joint", "r_leg_hip_pitch_joint",
-    "l_arm_shoulder_pitch_joint", "r_arm_shoulder_pitch_joint", "head_pitch_joint",
-    "l_leg_hip_roll_joint", "r_leg_hip_roll_joint",
-    "l_arm_shoulder_roll_joint", "r_arm_shoulder_roll_joint", "head_yaw_joint",
-    "l_leg_hip_yaw_joint", "r_leg_hip_yaw_joint", "l_arm_shoulder_yaw_joint", "r_arm_shoulder_yaw_joint",
-    "l_leg_knee_pitch_joint", "r_leg_knee_pitch_joint", "l_arm_elbow_pitch_joint", "r_arm_elbow_pitch_joint",
-    "l_leg_ankle_pitch_joint", "r_leg_ankle_pitch_joint", "l_arm_elbow_yaw_joint", "r_arm_elbow_yaw_joint",
-    "l_leg_ankle_roll_joint", "r_leg_ankle_roll_joint", "l_arm_hand_roll_joint", "r_arm_hand_roll_joint",
+    "l_leg_hip_pitch_joint", "r_leg_hip_pitch_joint", "waist_yaw_joint",
+    "l_leg_hip_roll_joint", "r_leg_hip_roll_joint", "head_pitch_joint",
+    "l_arm_shoulder_pitch_joint", "r_arm_shoulder_pitch_joint", "l_leg_hip_yaw_joint", "r_leg_hip_yaw_joint",
+    "head_yaw_joint", "l_arm_shoulder_roll_joint", "r_arm_shoulder_roll_joint",
+    "l_leg_knee_pitch_joint", "r_leg_knee_pitch_joint", "l_arm_shoulder_yaw_joint", "r_arm_shoulder_yaw_joint",
+    "l_leg_ankle_pitch_joint", "r_leg_ankle_pitch_joint", "l_arm_elbow_pitch_joint", "r_arm_elbow_pitch_joint",
+    "l_leg_ankle_roll_joint", "r_leg_ankle_roll_joint", "l_arm_elbow_yaw_joint", "r_arm_elbow_yaw_joint",
+    "l_arm_hand_roll_joint", "r_arm_hand_roll_joint",
     "l_arm_hand_pitch_joint", "r_arm_hand_pitch_joint",
 )
 
 N3_ISAACLAB_BODY_NAMES = (
-    "base_link", "waist_yaw_link", "l_leg_hip_pitch_link", "r_leg_hip_pitch_link",
-    "l_arm_shoulder_pitch_link", "r_arm_shoulder_pitch_link", "head_pitch_link",
-    "l_leg_hip_roll_link", "r_leg_hip_roll_link", "l_arm_shoulder_roll_link", "r_arm_shoulder_roll_link",
-    "head_yaw_link", "l_leg_hip_yaw_link", "r_leg_hip_yaw_link",
-    "l_arm_shoulder_yaw_link", "r_arm_shoulder_yaw_link", "l_leg_knee_pitch_link", "r_leg_knee_pitch_link",
-    "l_arm_elbow_pitch_link", "r_arm_elbow_pitch_link", "l_leg_ankle_pitch_link", "r_leg_ankle_pitch_link",
-    "l_arm_elbow_yaw_link", "r_arm_elbow_yaw_link", "l_leg_ankle_roll_link", "r_leg_ankle_roll_link",
-    "l_arm_hand_roll_link", "r_arm_hand_roll_link", "l_toe_link", "r_toe_link",
+    "base_link", "l_leg_hip_pitch_link", "r_leg_hip_pitch_link", "waist_yaw_link",
+    "l_leg_hip_roll_link", "r_leg_hip_roll_link", "head_pitch_link",
+    "l_arm_shoulder_pitch_link", "r_arm_shoulder_pitch_link", "l_leg_hip_yaw_link", "r_leg_hip_yaw_link",
+    "head_yaw_link", "l_arm_shoulder_roll_link", "r_arm_shoulder_roll_link",
+    "l_leg_knee_pitch_link", "r_leg_knee_pitch_link", "l_arm_shoulder_yaw_link", "r_arm_shoulder_yaw_link",
+    "l_leg_ankle_pitch_link", "r_leg_ankle_pitch_link", "l_arm_elbow_pitch_link", "r_arm_elbow_pitch_link",
+    "l_leg_ankle_roll_link", "r_leg_ankle_roll_link", "l_arm_elbow_yaw_link", "r_arm_elbow_yaw_link",
+    "l_toe_link", "r_toe_link", "l_arm_hand_roll_link", "r_arm_hand_roll_link",
     "l_arm_hand_pitch_link", "r_arm_hand_pitch_link",
 )
 

@@ -21,6 +21,7 @@ from gear_sonic.isaac_utils import rotations
 from gear_sonic.trl.utils import common
 from gear_sonic.utils.motion_lib import skeleton
 from gear_sonic.utils.motion_lib.paired_resampling import resample_smpl_to_robot_window
+from gear_sonic.utils.motion_lib.n3_motion_order import normalize_n3_motion_order
 
 
 class FixHeightMode(enum.Enum):
@@ -1844,6 +1845,8 @@ class MotionLibBase:
                 curr_file, *_ = joblib.load(
                     curr_file["path"]
                 ).values()  # First value since it's a single item dictionary
+            if self.m_cfg.get("robot_type", "g1") == "n3":
+                curr_file = normalize_n3_motion_order(curr_file)
 
             curr_smpl_data = None
             if smpl_data_list is not None and smpl_data_list[f] is not None:
@@ -1943,6 +1946,8 @@ class MotionLibBase:
                 selected_file, selected_motion = random.choice(
                     list(self.res_non_nav_dataset.values())
                 )
+                if self.m_cfg.get("robot_type", "g1") == "n3":
+                    selected_file = normalize_n3_motion_order(selected_file)
                 selected_pose_aa = to_torch(selected_file["pose_aa"])
 
                 # Sample a matching slice from the selected motion
