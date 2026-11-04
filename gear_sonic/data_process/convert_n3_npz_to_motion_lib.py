@@ -15,7 +15,7 @@ Examples, from the repository root::
     # Verified legacy n3_0905 exports have a built-in actual PhysX BFS order.
     python gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
         --input data/n3/npz --output data/n3/robot \
-        --joint-order n3_0905 --output-order isaaclab
+        --joint-order n3_0905 --output-order mujoco
 
 Only NumPy, SciPy and joblib are required; Isaac Lab and CUDA are not imported.
 """
@@ -233,8 +233,8 @@ def convert_motion(data, source_joint_names=None, *, root_body_index=None, quat_
     }
 
 
-def order_motion_for_storage(entry, output_order="isaaclab"):
-    """Save pose and DOFs in named BFS order, or retain MJCF native order.
+def order_motion_for_storage(entry, output_order="mujoco"):
+    """Save pose and DOFs in MJCF native order, or explicitly request BFS.
 
     The training loader normalizes named N3 motions back to native FK order.
     This permutation changes no joint angles, root trajectory or frame times.
@@ -275,7 +275,7 @@ def _load_and_convert(path, source_joint_names, root_body_index, quat_order):
 
 def convert_directory(input_path, output_dir, *, source_joint_names=None, joint_order="auto",
                       root_body_index=None, quat_order="wxyz", strip_suffix=DEFAULT_STRIP_SUFFIX,
-                      overwrite=False, dry_run=False, smpl_dir=None, output_order="isaaclab"):
+                      overwrite=False, dry_run=False, smpl_dir=None, output_order="mujoco"):
     """Convert a single NPZ or a recursive directory into one PKL per clip.
 
     All inputs are validated in a temporary staging directory before publishing
@@ -367,8 +367,8 @@ def main(argv=None):
         "--joint-order", choices=("auto", "isaaclab", "mujoco", "n3_0905"), default="auto",
         help="auto reads metadata; n3_0905 is the verified old PhysX BFS export order",
     )
-    parser.add_argument("--output-order", choices=("isaaclab", "mujoco"), default="isaaclab",
-                        help="Save named BFS order (default) or MJCF native order")
+    parser.add_argument("--output-order", choices=("isaaclab", "mujoco"), default="mujoco",
+                        help="Save MJCF native/DFS order (default); isaaclab explicitly requests named BFS")
     order.add_argument("--joint-names-file", help="JSON list of the 29 source column names in order")
     parser.add_argument(
         "--root-body-index", type=int, help="Source base_link body index; required without body_names",

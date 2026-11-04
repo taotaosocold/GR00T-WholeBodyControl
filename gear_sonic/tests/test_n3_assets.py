@@ -36,21 +36,135 @@ SOURCE_DEPLOYMENT_JOINT_ORDER = (
 
 
 class N3AssetTests(unittest.TestCase):
-    def test_vendored_files_match_the_training_snapshot_except_mesh_paths(self):
+    @staticmethod
+    def canonical_xml(element):
+        return ET.canonicalize(ET.tostring(element, encoding="unicode"), strip_text=True)
+
+    @classmethod
+    def collision_subtrees(cls, root):
+        return {
+            link.get("name"): tuple(cls.canonical_xml(collision) for collision in link.findall("collision"))
+            for link in root.findall("link")
+        }
+
+    def test_vendored_sources_and_training_collision_derivative_are_traceable(self):
         source = json.loads((ASSETS / "urdf/n3/source_manifest.json").read_text())
         self.assertEqual(source["source_snapshot"], "2026-11-03_n3_current")
         self.assertEqual(source["training_definition"]["source"], "training/n3_v3_asset_definition.py")
         self.assertEqual(len(source["files"]), 32)
+        derivative = source["collision_derivative"]
+        self.assertEqual(derivative["version"], 1)
+        self.assertEqual(derivative["file"], "urdf/n3/n3_v3_isaac.urdf")
+        self.assertEqual(derivative["original_copy"], "urdf/n3/provenance/n3_v3_isaac.vendor.urdf")
+        self.assertTrue(derivative["reason"].strip())
         for name, entry in source["files"].items():
             with self.subTest(file=name):
-                data = (ASSETS / name).read_bytes()
-                if name in source["path_rewrites"]:
+                # The active URDF is a documented collision derivative. Keep
+                # checking the original source hash against its immutable copy.
+                is_derivative = name == derivative["file"]
+                data = (ASSETS / (derivative["original_copy"] if is_derivative else name)).read_bytes()
+                if name in source["path_rewrites"] and not is_derivative:
                     rewrite = source["path_rewrites"][name]
                     self.assertIn(rewrite["to"].encode(), data)
                     data = data.replace(rewrite["to"].encode(), rewrite["from"].encode())
                 self.assertTrue(entry["source"].startswith("training/"))
                 self.assertEqual(len(data), entry["size"])
                 self.assertEqual(hashlib.sha256(data).hexdigest(), entry["sha256"])
+        patched = (ASSETS / derivative["file"]).read_bytes()
+        self.assertEqual(len(patched), derivative["patched_size"])
+        self.assertEqual(hashlib.sha256(patched).hexdigest(), derivative["patched_sha256"])
+
+    def test_urdf_derivative_changes_only_declared_collision_subtrees(self):
+        source = json.loads((ASSETS / "urdf/n3/source_manifest.json").read_text())
+        derivative = source["collision_derivative"]
+        original = ET.parse(ASSETS / derivative["original_copy"]).getroot()
+        data = (ASSETS / derivative["file"]).read_text()
+        rewrite = source["path_rewrites"][derivative["file"]]
+        self.assertIn(rewrite["to"], data)
+        patched = ET.fromstring(data.replace(rewrite["to"], rewrite["from"]))
+        old_collisions, new_collisions = self.collision_subtrees(original), self.collision_subtrees(patched)
+        self.assertEqual(set(old_collisions), set(new_collisions))
+        actual_changes = {name for name in old_collisions if old_collisions[name] != new_collisions[name]}
+        declared_changes = derivative["changed_links"]
+        self.assertTrue(actual_changes)
+        self.assertEqual(len(declared_changes), len(set(declared_changes)))
+        self.assertEqual(actual_changes, set(declared_changes))
+        # Removing only collision elements must recover all visual, inertial,
+        # joint, link-order and topology data from the vendor source exactly.
+        for root in (original, patched):
+            for link in root.findall("link"):
+                for collision in link.findall("collision"):
+                    link.remove(collision)
+        self.assertEqual(self.canonical_xml(patched), self.canonical_xml(original))
+        self.assertEqual(len(patched.findall("link")), 32)
+        self.assertEqual(sum(joint.get("type") != "fixed" for joint in patched.findall("joint")), 29)
+
+    def test_collision_derivative_preserves_all_fourteen_foot_colliders(self):
+        source = json.loads((ASSETS / "urdf/n3/source_manifest.json").read_text())
+        derivative = source["collision_derivative"]
+        original = self.collision_subtrees(ET.parse(ASSETS / derivative["original_copy"]).getroot())
+        patched = self.collision_subtrees(ET.parse(ASSETS / derivative["file"]).getroot())
+        for side in ("l", "r"):
+            foot = f"{side}_leg_ankle_roll_link"
+            with self.subTest(foot=foot):
+                self.assertEqual(len(original[foot]), 7)
+                self.assertEqual(patched[foot], original[foot])
+                self.assertNotIn(foot, derivative["changed_links"])
+            toe = f"{side}_toe_link"
+            self.assertEqual(patched[toe], original[toe])
+            self.assertEqual(patched[toe], ())
+
+    def test_training_collision_primitives_have_finite_positive_dimensions(self):
+        urdf = ET.parse(REPOSITORY / n3.N3_URDF_PATH).getroot()
+        dimensions = {"sphere": {"radius": 1}, "cylinder": {"radius": 1, "length": 1}, "box": {"size": 3}}
+        for collision in urdf.findall("./link/collision"):
+            with self.subTest(collision=collision.get("name")):
+                geometry = collision.find("geometry")
+                self.assertIsNotNone(geometry)
+                self.assertEqual(len(geometry), 1)
+                primitive = geometry[0]
+                self.assertIn(primitive.tag, dimensions)
+                for attribute, count in dimensions[primitive.tag].items():
+                    values = tuple(map(float, primitive.get(attribute).split()))
+                    self.assertEqual(len(values), count)
+                    self.assertTrue(all(math.isfinite(value) and value > 0 for value in values))
+                origin = collision.find("origin")
+                if origin is not None:
+                    for attribute in ("xyz", "rpy"):
+                        values = tuple(map(float, origin.get(attribute, "0 0 0").split()))
+                        self.assertEqual(len(values), 3)
+                        self.assertTrue(all(math.isfinite(value) for value in values))
+
+    def test_collision_derivative_has_the_reviewed_torso_arm_and_leg_dimensions(self):
+        urdf = ET.parse(REPOSITORY / n3.N3_URDF_PATH).getroot()
+        expected = {
+            "base_link": ("box", {"size": (0.12, 0.10, 0.08)}, (0., 0., 0.10)),
+            "waist_yaw_link": ("box", {"size": (0.14, 0.18, 0.25)}, (0., 0., 0.205)),
+        }
+        for side in ("l", "r"):
+            expected.update({
+                f"{side}_arm_shoulder_roll_link": ("cylinder", {"radius": (0.028,), "length": (0.09,)}, (0., 0., -0.09)),
+                f"{side}_arm_elbow_pitch_link": ("cylinder", {"radius": (0.025,), "length": (0.10,)}, (0., 0., -0.095)),
+                f"{side}_arm_hand_pitch_link": ("cylinder", {"radius": (0.025,), "length": (0.06,)}, (0., 0., -0.06)),
+                f"{side}_leg_hip_roll_link": ("cylinder", {"radius": (0.05,), "length": (0.14,)}, (0.005, 0., -0.09)),
+                f"{side}_leg_knee_pitch_link": ("cylinder", {"radius": (0.045,), "length": (0.24,)}, (0.005, 0., -0.1525)),
+            })
+        source = json.loads((ASSETS / "urdf/n3/source_manifest.json").read_text())
+        self.assertEqual(set(source["collision_derivative"]["changed_links"]), set(expected))
+        self.assertEqual(len(urdf.findall("./link/collision")), 29)
+        for name, (shape, dimensions, center) in expected.items():
+            with self.subTest(link=name):
+                collisions = urdf.find(f"./link[@name='{name}']").findall("collision")
+                self.assertEqual(len(collisions), 1)
+                collision = collisions[0]
+                self.assertEqual(tuple(map(float, collision.find("origin").get("xyz").split())), center)
+                self.assertEqual(tuple(map(float, collision.find("origin").get("rpy").split())), (0., 0., 0.))
+                geometry = collision.find("geometry")
+                self.assertEqual(len(geometry), 1)
+                self.assertEqual(geometry[0].tag, shape)
+                self.assertEqual(set(geometry[0].attrib), set(dimensions))
+                for attribute, values in dimensions.items():
+                    self.assertEqual(tuple(map(float, geometry[0].get(attribute).split())), values)
 
     def test_mesh_paths_resolve_and_collision_primitives_are_retained(self):
         mjcf_path, urdf_path = REPOSITORY / n3.N3_MJCF_PATH, REPOSITORY / n3.N3_URDF_PATH

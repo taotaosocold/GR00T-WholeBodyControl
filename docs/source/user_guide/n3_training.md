@@ -19,6 +19,18 @@ implicit actuators, so the physics backend differs. There is no random command
 lag or extra joint-velocity clamp. Policy control remains 50 Hz and the action
 scale follows GR00T's `0.25 * torque_limit / Kp` convention.
 
+The training URDF uses inset primitive collision proxies for the base, torso,
+arms and legs to reduce overlap around connected joints. The base and torso
+use boxes; limb cylinders become capsules during Isaac import (total length
+is cylinder length plus twice the radius). Foot contacts retain all 14 source
+primitives. The geometry table and the original vendor URDF are recorded in
+`gear_sonic/data/assets/robot_description/urdf/n3/README.md` and
+`provenance/n3_v3_isaac.vendor.urdf` beside the training asset. Visuals, mass,
+inertia, joint frames and control parameters are preserved. The MJCF remains
+the original FK reference, including its source collision exclusions. These
+smaller collision envelopes do not guarantee collision-free reference motions
+or resolve every possible cause of non-finite training states.
+
 All 29 joints, including head pitch/yaw, remain active. The two fixed toe links
 are retained as separate bodies. Fifteen links, including the head, contribute
 to tracking rewards. Live joint/body mappings are checked by name; motion/FK
@@ -46,16 +58,17 @@ frame checks apply.
 
 The CPU-only converter uses the vendored N3 MJCF for hinge axes and the full
 32-body pose layout, including fixed toes. It writes one `{motion_key: entry}`
-PKL per clip. The default output stores `dof` and `pose_aa` in actual Isaac/PhysX
-BFS order, with names and `motion_order=isaaclab`. Use `--output-order mujoco`
-for native storage. The G1 CSV converter, in contrast, takes Isaac-order inputs
-and always writes native MJCF order; input and storage order are different
-choices. Run from the repository root; no Isaac Lab, CUDA or Torch is required:
+PKL per clip. The default output stores `dof` and `pose_aa` in native MJCF/DFS
+order, with names and `motion_order=mujoco`, matching the G1 CSV converter's
+storage convention. Use `--output-order isaaclab` only to explicitly request
+named BFS storage; the training loader remains compatible with those files.
+Input and storage order are separate choices. Run from the repository root;
+no Isaac Lab, CUDA or Torch is required:
 
 ```bash
 python gear_sonic/data_process/convert_n3_npz_to_motion_lib.py \
   --input data/n3/npz --output data/n3/robot \
-  --joint-order n3_0905 --output-order isaaclab
+  --joint-order n3_0905 --output-order mujoco
 ```
 
 The legacy `n3_0905` profile comes from the old Isaac training ONNX's
@@ -69,6 +82,10 @@ default-angle offsets. Old short names are mapped to the corresponding V3
 names; no external joint-name JSON is needed for this profile. Actual sibling
 order is measured, rather than inferred from URDF XML declaration order.
 The current V3 BFS table was separately checked with a live GPU14 articulation.
+The converter gathers source joint columns into native V3 order with
+`[2,6,11,15,19,23,25,27,7,12,16,20,24,26,28,5,10,0,3,8,13,17,21,1,4,9,14,18,22]`.
+This array only reorders the 29 joint coordinates. The 32 `pose_aa` slots follow
+the MJCF body tree, including the two fixed toes, and have their own body mapping.
 
 Required NPZ fields are `fps`, `joint_pos[T,29]`, `body_pos_w[T,B,3]` and
 `body_quat_w[T,B,4]`, with at least three frames. Positions must be metres in a

@@ -214,6 +214,7 @@ class N3ConversionTests(unittest.TestCase):
 
     def test_recursive_batch_pairs_normalized_stems_and_writes_loader_wrappers(self):
         data, _ = self.fixture()
+        expected = convert_motion(data)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = [root / "input/sub" / f"walk{DEFAULT_STRIP_SUFFIX}.npz", root / "input/run.npz"]
@@ -225,13 +226,18 @@ class N3ConversionTests(unittest.TestCase):
             summary = convert_directory(root / "input", root / "out", smpl_dir=root / "smpl")
             self.assertEqual(summary["files"], 2)
             self.assertEqual(summary["total_frames"], 10)
+            self.assertEqual(summary["output_order"], "mujoco")
             for key in ("walk", "run"):
                 payload = joblib.load(root / "out" / f"{key}.pkl")
                 self.assertEqual(list(payload), [key])
                 self.assertEqual(payload[key]["pose_aa"].shape, (5, 32, 3))
-                self.assertEqual(payload[key]["joint_names"], list(N3_ISAACLAB_DOF_NAMES))
-                self.assertEqual(payload[key]["body_names"], list(N3_ISAACLAB_BODY_NAMES))
-                self.assertEqual(payload[key]["motion_order"], "isaaclab")
+                self.assertEqual(payload[key]["joint_names"], list(N3_MUJOCO_JOINT_NAMES))
+                self.assertEqual(payload[key]["body_names"], list(N3_MUJOCO_BODY_NAMES))
+                self.assertEqual(payload[key]["motion_order"], "mujoco")
+                # Compare the stored arrays directly: normalizing first would
+                # conceal a regression that still writes the former BFS order.
+                for field in ("dof", "pose_aa", "root_trans_offset", "root_rot"):
+                    np.testing.assert_array_equal(payload[key][field], expected[field], err_msg=field)
             for path in paths:
                 self.assertEqual(path.read_bytes(), before[path])
 
@@ -376,32 +382,91 @@ class N3ConversionTests(unittest.TestCase):
         data["body_pos_w"] = data["body_pos_w"][:, -1:]
         data["body_quat_w"] = data["body_quat_w"][:, -1:]
         del data["joint_names"], data["body_names"]
+        original = deepcopy(data)
+        expected = convert_motion(data, N3_0905_ISAACLAB_DOF_NAMES, root_body_index=0)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / f"clip{DEFAULT_STRIP_SUFFIX}.npz"
             self.write_npz(source, data)
-            for output_order in ("isaaclab", "mujoco"):
-                summary = convert_directory(source, root / output_order, joint_order="n3_0905",
-                                            output_order=output_order)
+            source_bytes = source.read_bytes()
+            for selection in (None, "isaaclab", "mujoco"):
+                output_order = "mujoco" if selection is None else selection
+                destination = root / (selection or "default")
+                kwargs = {} if selection is None else {"output_order": selection}
+                summary = convert_directory(source, destination, joint_order="n3_0905", **kwargs)
                 self.assertEqual(summary["output_order"], output_order)
-                result = joblib.load(root / output_order / "clip.pkl")["clip"]
-                np.testing.assert_array_equal(normalize_n3_motion_order(result)["dof"], native)
+                result = joblib.load(destination / "clip.pkl")["clip"]
+                joints = N3_MUJOCO_JOINT_NAMES if output_order == "mujoco" else N3_ISAACLAB_DOF_NAMES
+                bodies = N3_MUJOCO_BODY_NAMES if output_order == "mujoco" else N3_ISAACLAB_BODY_NAMES
+                self.assertEqual(result["joint_names"], list(joints))
+                self.assertEqual(result["body_names"], list(bodies))
+                self.assertEqual(result["motion_order"], output_order)
+                np.testing.assert_array_equal(result["dof"], native[:, [N3_MUJOCO_JOINT_NAMES.index(n) for n in joints]])
+                np.testing.assert_array_equal(result["pose_aa"], expected["pose_aa"][:, [N3_MUJOCO_BODY_NAMES.index(n) for n in bodies]])
+                self.assertEqual(result["dof"].shape, (5, 29))
+                self.assertEqual(result["pose_aa"].shape, (5, 32, 3))
                 self.assertEqual(result["source_joint_names"], list(N3_0905_ISAACLAB_DOF_NAMES))
                 self.assertEqual(result["source_root_body_index"], 0)
+                self.assertEqual(result["source_joint_order"], "n3_0905")
+                for field in ("root_trans_offset", "root_rot"):
+                    np.testing.assert_array_equal(result[field], expected[field])
+                for toe in ("l_toe_link", "r_toe_link"):
+                    np.testing.assert_array_equal(result["pose_aa"][:, bodies.index(toe)], 0)
+            self.assertEqual(source.read_bytes(), source_bytes)
+        for field in data:
+            np.testing.assert_array_equal(data[field], original[field], err_msg=field)
 
     def test_bfs_and_native_storage_preserve_named_values_and_source_arrays(self):
         data, _ = self.fixture()
         native = convert_motion(data)
         before = deepcopy(native)
-        bfs = order_motion_for_storage(native)
+        default = order_motion_for_storage(native)
+        self.assertEqual(default["motion_order"], "mujoco")
+        self.assertEqual(default["joint_names"], list(N3_MUJOCO_JOINT_NAMES))
+        self.assertEqual(default["body_names"], list(N3_MUJOCO_BODY_NAMES))
+        for key in ("dof", "pose_aa", "root_trans_offset", "root_rot"):
+            np.testing.assert_array_equal(default[key], native[key], err_msg=key)
+        bfs = order_motion_for_storage(native, "isaaclab")
+        np.testing.assert_array_equal(bfs["dof"], native["dof"][:, [N3_MUJOCO_JOINT_NAMES.index(n) for n in N3_ISAACLAB_DOF_NAMES]])
+        np.testing.assert_array_equal(bfs["pose_aa"], native["pose_aa"][:, [N3_MUJOCO_BODY_NAMES.index(n) for n in N3_ISAACLAB_BODY_NAMES]])
         recovered = normalize_n3_motion_order(bfs)
         for key in ("dof", "pose_aa", "root_trans_offset", "root_rot"):
             np.testing.assert_array_equal(recovered[key], native[key])
             np.testing.assert_array_equal(native[key], before[key])
-        native_again = order_motion_for_storage(bfs, "mujoco")
+        native_again = order_motion_for_storage(bfs)
+        self.assertEqual(native_again["motion_order"], "mujoco")
+        np.testing.assert_array_equal(native_again["dof"], native["dof"])
         np.testing.assert_array_equal(native_again["pose_aa"], native["pose_aa"])
         with self.assertRaises(ValueError):
             order_motion_for_storage(native, "unknown")
+
+    def test_cli_legacy_bfs_input_defaults_to_native_and_explicit_bfs_remains_supported(self):
+        data, native = self.fixture()
+        data["joint_pos"] = native[:, [N3_MUJOCO_JOINT_NAMES.index(n) for n in N3_ISAACLAB_DOF_NAMES]]
+        data["body_pos_w"] = data["body_pos_w"][:, -1:]
+        data["body_quat_w"] = data["body_quat_w"][:, -1:]
+        del data["joint_names"], data["body_names"]
+        expected = convert_motion(data, N3_0905_ISAACLAB_DOF_NAMES, root_body_index=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / f"clip{DEFAULT_STRIP_SUFFIX}.npz"
+            self.write_npz(source, data)
+            source_bytes = source.read_bytes()
+            for output_order, flags in (("mujoco", []), ("isaaclab", ["--output-order", "isaaclab"])):
+                command = [sys.executable, str(SCRIPT), "--input", str(source),
+                           "--output", str(root / output_order), "--joint-order", "n3_0905", *flags]
+                result = subprocess.run(command, cwd=REPO, text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["output_order"], output_order)
+                stored = joblib.load(root / output_order / "clip.pkl")["clip"]
+                joints = N3_MUJOCO_JOINT_NAMES if output_order == "mujoco" else N3_ISAACLAB_DOF_NAMES
+                bodies = N3_MUJOCO_BODY_NAMES if output_order == "mujoco" else N3_ISAACLAB_BODY_NAMES
+                self.assertEqual(stored["motion_order"], output_order)
+                self.assertEqual(stored["joint_names"], list(joints))
+                self.assertEqual(stored["body_names"], list(bodies))
+                np.testing.assert_array_equal(stored["dof"], native[:, [N3_MUJOCO_JOINT_NAMES.index(n) for n in joints]])
+                np.testing.assert_array_equal(stored["pose_aa"], expected["pose_aa"][:, [N3_MUJOCO_BODY_NAMES.index(n) for n in bodies]])
+                self.assertEqual(source.read_bytes(), source_bytes)
 
     def test_converted_output_loads_real_motion_library_and_adaptive_sampler(self):
         import torch

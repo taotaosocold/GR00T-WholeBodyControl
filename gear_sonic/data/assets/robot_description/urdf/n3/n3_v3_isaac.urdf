@@ -16,9 +16,9 @@
             <inertia ixx="5.244647e-02" ixy="1.327729e-06" ixz="3.943404e-05" iyy="3.060057e-02" iyz="-1.464863e-05" izz="3.306376e-02"/>
         </inertial>
             <collision name="base_link_collision">
-            <origin xyz="0 0 0.07" rpy="0 0 0" />
+            <origin xyz="0 0 0.10" rpy="0 0 0" />
             <geometry>
-                <sphere radius="0.09" />
+                <box size="0.12 0.10 0.08" />
             </geometry>
         </collision>
 </link>
@@ -37,24 +37,10 @@
             <mass value="1.205599e+01"/>
             <inertia ixx="1.655153e-01" ixy="1.600667e-04" ixz="-5.421387e-04" iyy="1.373737e-01" iyz="6.496606e-04" izz="8.498551e-02"/>
         </inertial>
-            <collision name="waist_yaw_collision1">
-            <origin xyz="0.0 0.0 0.3" rpy="1.5707963267948966 0 0" />
+            <collision name="waist_yaw_collision">
+            <origin xyz="0 0 0.205" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.094" length="0.07" />
-            </geometry>
-        </collision>
-
-        <collision name="waist_yaw_collision2">
-            <origin xyz="0.0 0.0 0.19" rpy="1.5707963267948966 0 0" />
-            <geometry>
-                <cylinder radius="0.098" length="0.05" />
-            </geometry>
-        </collision>
-
-        <collision name="waist_yaw_collision3">
-            <origin xyz="0.0 0.0 0.09" rpy="1.5707963267948966 0 0" />
-            <geometry>
-                <cylinder radius="0.096" length="0.044" />
+                <box size="0.14 0.18 0.25" />
             </geometry>
         </collision>
 </link>
@@ -104,9 +90,9 @@
             </material>
         </visual>
             <collision name="l_upper_arm_collision">
-            <origin xyz="0.0 0.0 -0.1" rpy="0 0 0" />
+            <origin xyz="0 0 -0.09" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.046" length="0.2" />
+                <cylinder radius="0.028" length="0.09" />
             </geometry>
         </collision>
 </link>
@@ -156,9 +142,9 @@
             </material>
         </visual>
             <collision name="l_forearm_collision">
-            <origin xyz="0.0 0.0 -0.08" rpy="0 0 0" />
+            <origin xyz="0 0 -0.095" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.045" length="0.17" />
+                <cylinder radius="0.025" length="0.10" />
             </geometry>
         </collision>
 </link>
@@ -231,9 +217,9 @@
             </material>
         </visual>
             <collision name="l_hand_collision">
-            <origin xyz="0.0 0.0 -0.045" rpy="0 0 0" />
+            <origin xyz="0 0 -0.06" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.044" length="0.09" />
+                <cylinder radius="0.025" length="0.06" />
             </geometry>
         </collision>
 </link>
@@ -283,9 +269,9 @@
             <inertia ixx="1.344749e-03" ixy="2.087405e-06" ixz="1.870859e-06" iyy="1.606011e-03" iyz="1.894668e-05" izz="7.990063e-04"/>
         </inertial>
             <collision name="r_upper_arm_collision">
-            <origin xyz="0.0 0.0 -0.1" rpy="0 0 0" />
+            <origin xyz="0 0 -0.09" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.046" length="0.2" />
+                <cylinder radius="0.028" length="0.09" />
             </geometry>
         </collision>
 </link>
@@ -335,9 +321,9 @@
             <inertia ixx="1.265992e-03" ixy="9.632740e-07" ixz="3.853306e-05" iyy="1.085190e-03" iyz="-2.437460e-05" izz="7.244367e-04"/>
         </inertial>
             <collision name="r_forearm_collision">
-            <origin xyz="0.0 0.0 -0.08" rpy="0 0 0" />
+            <origin xyz="0 0 -0.095" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.045" length="0.17" />
+                <cylinder radius="0.025" length="0.10" />
             </geometry>
         </collision>
 </link>
@@ -410,9 +396,9 @@
             <inertia ixx="9.074210e-04" ixy="-1.951608e-05" ixz="3.068800e-06" iyy="8.174604e-04" iyz="-2.101388e-06" izz="3.758096e-04"/>
         </inertial>
             <collision name="r_hand_collision">
-            <origin xyz="0.0 0.0 -0.045" rpy="0 0 0" />
+            <origin xyz="0 0 -0.06" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.044" length="0.09" />
+                <cylinder radius="0.025" length="0.06" />
             </geometry>
         </collision>
 </link>
@@ -520,9 +506,9 @@
             </material>
         </visual>
             <collision name="l_thigh_collision">
-            <origin xyz="0.005 0.0 -0.09" rpy="0 0 0" />
+            <origin xyz="0.005 0 -0.09" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.062" length="0.18" />
+                <cylinder radius="0.05" length="0.14" />
             </geometry>
         </collision>
 </link>
@@ -572,9 +558,9 @@
             </material>
         </visual>
             <collision name="l_shin_collision">
-            <origin xyz="0.005 0.0 -0.1525" rpy="0 0 0" />
+            <origin xyz="0.005 0 -0.1525" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.064" length="0.295" />
+                <cylinder radius="0.045" length="0.24" />
             </geometry>
         </collision>
 </link>
@@ -724,9 +710,9 @@
             <inertia ixx="5.556040e-03" ixy="-3.189088e-07" ixz="-1.301590e-04" iyy="6.284903e-03" iyz="5.461631e-06" izz="4.417289e-03"/>
         </inertial>
             <collision name="r_thigh_collision">
-            <origin xyz="0.005 0.0 -0.09" rpy="0 0 0" />
+            <origin xyz="0.005 0 -0.09" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.062" length="0.18" />
+                <cylinder radius="0.05" length="0.14" />
             </geometry>
         </collision>
 </link>
@@ -776,9 +762,9 @@
             <inertia ixx="4.975048e-02" ixy="7.284012e-05" ixz="9.387709e-04" iyy="5.157824e-02" iyz="-2.327737e-04" izz="6.944587e-03"/>
         </inertial>
             <collision name="r_shin_collision">
-            <origin xyz="0.005 0.0 -0.1525" rpy="0 0 0" />
+            <origin xyz="0.005 0 -0.1525" rpy="0 0 0" />
             <geometry>
-                <cylinder radius="0.064" length="0.295" />
+                <cylinder radius="0.045" length="0.24" />
             </geometry>
         </collision>
 </link>
