@@ -22,6 +22,7 @@ from gear_sonic.trl.utils import common
 from gear_sonic.utils.motion_lib import skeleton
 from gear_sonic.utils.motion_lib.paired_resampling import resample_smpl_to_robot_window
 from gear_sonic.utils.motion_lib.n3_motion_order import normalize_n3_motion_order
+from gear_sonic.utils.smpl_vr import validate_smpl_vr5_data
 
 
 class FixHeightMode(enum.Enum):
@@ -348,6 +349,14 @@ class MotionLibBase:
                 self.smpl_data = [None] * len(self._motion_data_keys)
 
         self.smpl_y_up = motion_lib_cfg.get("smpl_y_up", False)
+        if self.m_cfg.get("require_smpl_vr5", False):
+            paired = self.smpl_data if self.smpl_data is not None else [None] * len(self._motion_data_keys)
+            missing = [str(key) for key, data in zip(self._motion_data_keys, paired) if data is None]
+            if missing:
+                raise ValueError(
+                    "SMPL VR5 requires a real paired SMPL clip for every robot motion; "
+                    f"missing {len(missing)} pair(s), including {missing[:5]}"
+                )
 
         # Tail trimming changes the actual usable length. Build stable adaptive
         # bins only after the SMPL index is available, using the same length rule.
@@ -1174,6 +1183,9 @@ class MotionLibBase:
             smpl_data_list = [self.smpl_data[idx] for idx in sample_idxes.cpu().numpy()]
         else:
             smpl_data_list = None
+        # A worker that raises before queue.put can leave the parent waiting.
+        # Validate the new sparse-human input in the parent before any workers.
+        self._validate_smpl_vr5_sources(motion_data_list, smpl_data_list, max_len=max_len)
         if self.paired_frame_alignment_cfg.get("mode", "strict") == "trim_trailing":
             # A worker that raises before queue.put can leave the parent waiting.
             # Validate selected pairs in the parent, even with adaptive sampling off.
@@ -1836,6 +1848,7 @@ class MotionLibBase:
         else:
             pbar = range(len(ids))
 
+        validated_smpl_vr5 = set()
         for f in pbar:
 
             curr_id = ids[f]  # id for this datasample
@@ -1853,6 +1866,22 @@ class MotionLibBase:
                 curr_smpl_data = smpl_data_list[f]
                 if "path" in curr_smpl_data:
                     curr_smpl_data = joblib.load(curr_smpl_data["path"])
+
+            if self.m_cfg.get("require_smpl_vr5", False):
+                if curr_smpl_data is None:
+                    raise ValueError(
+                        f"{self.curr_motion_keys[curr_id]}: SMPL VR5 requires a real paired SMPL clip"
+                    )
+                source = smpl_data_list[f]
+                identity = source.get("path", id(source))
+                if identity not in validated_smpl_vr5:
+                    try:
+                        validate_smpl_vr5_data(curr_smpl_data)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"{self.curr_motion_keys[curr_id]}: invalid SMPL VR5 data: {exc}"
+                        ) from exc
+                    validated_smpl_vr5.add(identity)
 
             seq_len = curr_file["root_trans_offset"].shape[0]
             if curr_smpl_data is not None:
@@ -2359,6 +2388,56 @@ class MotionLibBase:
         B, J, _ = local_rot.shape
         dof_pos = rotations.quat_to_exp_map(local_rot[:, 1:])
         return dof_pos.reshape(B, -1)
+
+    def _validate_smpl_vr5_sources(self, motion_data_list, smpl_data_list, max_len=-1):
+        """Validate sparse-human sources and sampling grids before workers start."""
+        if not self.m_cfg.get("require_smpl_vr5", False):
+            return
+        if smpl_data_list is None or len(smpl_data_list) != len(motion_data_list):
+            raise ValueError("SMPL VR5 requires paired SMPL data for every robot motion")
+        validated = set()
+        for key, motion_data, smpl_data in zip(self.curr_motion_keys, motion_data_list, smpl_data_list):
+            if smpl_data is None:
+                raise ValueError(f"{key}: SMPL VR5 requires a real paired SMPL clip")
+            identity = (motion_data.get("path", id(motion_data)), smpl_data.get("path", id(smpl_data)))
+            if identity in validated:
+                continue
+            source = joblib.load(smpl_data["path"]) if "path" in smpl_data else smpl_data
+            try:
+                validate_smpl_vr5_data(source)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key}: invalid SMPL VR5 data: {exc}") from exc
+            robot = motion_data
+            if "path" in robot:
+                robot, *_ = joblib.load(robot["path"]).values()
+            try:
+                fps = float(robot.get("fps", 30.0))
+                if not np.isfinite(fps) or fps <= 0:
+                    raise ValueError("Robot fps must be positive and finite")
+                if not np.isfinite(self.target_fps) or self.target_fps <= 0:
+                    raise ValueError("target_fps must be positive and finite")
+                frames = resolve_paired_frame_alignment(
+                    len(robot["root_trans_offset"]), fps, source,
+                    self.target_fps, self.paired_frame_alignment_cfg,
+                )
+                window = frames if max_len == -1 else min(frames, max_len)
+                if window < 3:
+                    raise ValueError("SMPL VR5 requires at least three robot frames per window")
+                # Match Humanoid_Batch.interploate_pose's exclusive endpoint.
+                # The latest possible crop needs the largest SMPL time cursor;
+                # covering it guarantees coverage for every earlier crop.
+                output_frames = window if fps == self.target_fps else len(torch.arange(
+                    0, (window - 1) / fps, 1 / self.target_fps, dtype=torch.float32,
+                ))
+                if output_frames < 3:
+                    raise ValueError("SMPL VR5 requires at least three resampled frames for FK")
+                resample_smpl_to_robot_window(
+                    source, robot_start_frame=frames - window, robot_fps=fps,
+                    target_fps=self.target_fps, num_output_frames=output_frames,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key}: SMPL VR5 time alignment failed: {exc}") from exc
+            validated.add(identity)
 
     def _get_paired_source_frames(self, motion_data, smpl_data):
         """Use source PKLs, not possibly untrimmed metadata, to validate a pair."""

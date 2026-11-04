@@ -78,6 +78,7 @@ class ObservationLayout:
         "command_z", "command_z_multi_future_nonflat", "vr_3point_local_target",
         "vr_3point_local_orn_target", "smpl_joints_multi_future_local_nonflat",
         "smpl_joints_multi_future_nonflat", "joint_pos_multi_future_wrist_for_smpl",
+        "smpl_vr_5point_local_target", "smpl_vr_5point_local_orn_target",
     }
 
     def __init__(

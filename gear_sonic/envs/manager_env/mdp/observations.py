@@ -19,6 +19,7 @@ import torch
 from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.envs.manager_env.mdp import commands, utils
 from gear_sonic.trl.utils import torch_transform
+from gear_sonic.utils.smpl_vr import smpl_vr5_local_orientations, smpl_vr5_local_positions
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -450,6 +451,9 @@ class TokenizerCfg(ObsGroup):
     smpl_lower_body_joints_multi_future_local_flatten = None
     smpl_joints_lower_multi_future_local_flatten = None
     smpl_transl_z_multi_future_nonflat = None
+    smpl_vr_5point_local_target = None
+    smpl_vr_5point_local_orn_target = None
+    smpl_root_ori_b = None
     smpl_root_ori_b_multi_future = None
     smpl_root_ori_b_multi_future_flatten = None
     smpl_root_ori_refheading_multi_future = None
@@ -1805,6 +1809,28 @@ def smpl_elbow_wrist_pose_multi_future(env: ManagerBasedEnv, command_name: str) 
     smpl_pose = command.smpl_pose_multi_future
     elbow_wrist_pose = smpl_pose[..., 54:66]
     return elbow_wrist_pose
+
+
+def smpl_vr_5point_local_target(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Current SMPL wrists, head and ankles in the SMPL root frame (15D).
+
+    Positions retain the source human's proportions. No robot reference joints
+    or robot FK enter this sparse goal; robot proprioception remains separate.
+    """
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return smpl_vr5_local_positions(command.smpl_joints, command.smpl_root_quat_w)
+
+
+def smpl_vr_5point_local_orn_target(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Five SMPL joint orientations in the SMPL root frame (20D, wxyz).
+
+    Compose local pose rotations along the human skeleton before expressing
+    each target orientation in the same root frame as the five positions.
+    """
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return smpl_vr5_local_orientations(
+        command.smpl_pose, command.smpl_root_quat_w, smpl_y_up=command.motion_lib.smpl_y_up,
+    )
 
 
 def smpl_root_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

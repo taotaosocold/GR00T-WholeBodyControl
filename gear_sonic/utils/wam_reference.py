@@ -21,7 +21,8 @@ _REFERENCE_TERMS = frozenset({
     "command_multi_future_lower_body", "command_z", "command_z_multi_future_nonflat",
     "motion_anchor_ori_b", "motion_anchor_ori_b_nonflat", "motion_anchor_ori_b_mf",
     "motion_anchor_ori_b_mf_nonflat", "smpl_root_ori_b_multi_future",
-    "smpl_root_ori_b_multi_future_flatten", "vr_3point_local_target",
+    "smpl_root_ori_b_multi_future_flatten", "smpl_root_ori_b",
+    "smpl_vr_5point_local_target", "smpl_vr_5point_local_orn_target", "vr_3point_local_target",
     "vr_3point_local_orn_target", "smpl_joints_multi_future_local_nonflat",
     "smpl_joints_multi_future_nonflat", "joint_pos_multi_future_wrist_for_smpl",
 })

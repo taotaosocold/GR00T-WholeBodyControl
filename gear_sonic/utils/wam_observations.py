@@ -22,6 +22,7 @@ ROBOT_RELATIVE_ORIENTATION_TERMS = frozenset({
     "motion_anchor_ori_b_nonflat",
     "motion_anchor_ori_b_mf",
     "motion_anchor_ori_b_mf_nonflat",
+    "smpl_root_ori_b",
     "smpl_root_ori_b_multi_future",
     "smpl_root_ori_b_multi_future_flatten",
 })

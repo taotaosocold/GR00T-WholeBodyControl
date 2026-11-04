@@ -1,0 +1,19 @@
+# Preserve the N3 robot and SMPL branches; replace teleop's robot targets.
+defaults:
+  - unitoken_all_noz
+  - ../terms/smpl_vr_5point_local_target@_here_
+  - ../terms/smpl_vr_5point_local_orn_target@_here_
+  - ../terms/smpl_root_ori_b@_here_
+  - _self_
+
+command_multi_future_lower_body: null
+vr_3point_local_target: null
+vr_3point_local_orn_target: null
+motion_anchor_ori_b: null
+command_z: null
+
+smpl_root_ori_b:
+  noise:
+    _target_: isaaclab.utils.noise.AdditiveUniformNoiseCfg
+    n_min: -0.05
+    n_max: 0.05

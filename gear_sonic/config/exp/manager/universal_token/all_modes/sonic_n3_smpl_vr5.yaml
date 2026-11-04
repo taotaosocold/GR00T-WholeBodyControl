@@ -1,0 +1,23 @@
+# @package _global_
+# N3 WAM with paired SMPL five-point teleoperation goals.
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_n3
+  - override /manager_env/observations/tokenizer: unitoken_n3_smpl_vr5
+  - _self_
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        require_smpl_vr5: true
+
+algo:
+  config:
+    actor:
+      backbone:
+        encoders:
+          teleop:
+            inputs:
+              - smpl_vr_5point_local_target
+              - smpl_vr_5point_local_orn_target
+              - smpl_root_ori_b

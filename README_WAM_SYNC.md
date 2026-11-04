@@ -28,17 +28,17 @@ git commit -m "Update WAM training"
 ## 2. 生成并发送 bundle
 
 ```bash
-cd /home/ubuntu/桌面/GR00T-WholeBodyControl
+cd /home/user/tsz/GR00T-WholeBodyControl
 
-rm -f /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle
+rm -f /home/user/tsz/GR00T-WholeBodyControl.bundle
 
 git bundle create \
-  /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle \
-  supermimic_n3
+  /home/user/tsz/GR00T-WholeBodyControl.bundle \
+  supermimic_n3_vr5
 
-git bundle verify /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle
+git bundle verify /home/user/tsz/GR00T-WholeBodyControl.bundle
 
-scp /home/ubuntu/桌面/GR00T-WholeBodyControl.bundle \
+scp /home/user/tsz/GR00T-WholeBodyControl.bundle \
   gpu14:/data/ouqin/
 ```
 
@@ -52,8 +52,8 @@ cd /data/ouqin/GR00T-WholeBodyControl
 git status --short
 git branch --show-current
 
-git fetch /data/ouqin/GR00T-WholeBodyControl.bundle supermimic_n3
-git checkout supermimic_n3
+git fetch /data/ouqin/GR00T-WholeBodyControl.bundle supermimic_n3_vr5
+git checkout supermimic_n3_vr5
 git reset --hard FETCH_HEAD
 
 git log -1 --oneline
@@ -483,6 +483,30 @@ N3_SMPL_MOTIONS=data/n3/smpl   # 改为配对 SMPL 目录
 8 卡仍用第 6 节的 Accelerate/tmux 启动方式，替换 experiment 和数据路径，
 保留 N3 默认的三个非零 encoder 采样概率。缺少数据会明确报错，不会自动使用 G1 数据。
 N3/G1 虽同为 29 维，关节语义不同，不能直接加载旧 G1 权重。
+
+SMPL 五点版本使用独立配置，原 `sonic_n3` 保持不变：
+
+```bash
+"$PY" gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/all_modes/sonic_n3_smpl_vr5 \
+  +resume=false checkpoint=null auto_load_latest=false \
+  num_envs=512 headless=true use_wandb=false \
+  experiment_dir=logs_rl/n3_wam_smpl_vr5 \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file="$N3_ROBOT_MOTIONS" \
+  ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file="$N3_SMPL_MOTIONS"
+```
+
+该配置仍为 `g1 / smpl / teleop` 三分支：前两路输入完全沿用 `sonic_n3`
+（SMPL 分支仍带原有六个机器人腕/前臂关节辅助输入）；仅把 teleop 改为
+SMPL 左腕、右腕、头、左踝、右踝五点的位置（15 维）、姿态（20 维）及
+SMPL 根朝向（6 维），去掉机器人下半身参考和机器人 VR 三点。
+五点采用 SMPL 根局部坐标，姿态为局部 `wxyz` 四元数；根朝向沿用相对机器人
+anchor 的 6D 表示。`smpl_joints` 与原分支一样须为 Z-up 世界朝向数据，
+`smpl_y_up` 只控制 pose 转换，不会再次旋转关节点坐标。
+新模式要求每条机器人动作均有有效的配对 SMPL 数据，不能用零值占位。
+数据仍由服务器命令行传入，本地 CPU 测试不替代真实数据或 Isaac 冒烟验证。
+teleop 输入尺寸已变，旧 `sonic_n3` checkpoint 不能直接续训；导出部署也须使用
+新 checkpoint 配套的输入布局。
 
 完整冒烟命令、数据格式和导出说明见 [N3 训练](docs/source/user_guide/n3_training.md)。
 新 mesh 按仓库 Git LFS 规则管理；使用 bundle 同步时还需同步 LFS 实体文件。

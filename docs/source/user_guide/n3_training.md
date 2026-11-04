@@ -143,6 +143,61 @@ For full training, remove the smoke-test overrides and use the existing tmux /
 Accelerate workflow. Environment counts and update batch sizes are per rank.
 Retain `sonic_n3`'s three nonzero encoder sampling probabilities.
 
+## SMPL five-point teleoperation variant
+
+Select `+exp=manager/universal_token/all_modes/sonic_n3_smpl_vr5` to train the
+same N3 WAM policy with a different teleoperation input. The original
+`sonic_n3` experiment is unchanged. Both experiments keep three encoders and
+the same robot assets, control settings, rewards and FSQ structure:
+
+| Encoder | `sonic_n3_smpl_vr5` input |
+| --- | --- |
+| `g1` | Existing N3 retargeted robot-motion reference, unchanged |
+| `smpl` | Existing SMPL joint sequence, root orientation and six auxiliary robot wrist/forearm joints, unchanged |
+| `teleop` | Current-frame SMPL five-point positions (15D), orientations (20D) and root orientation (6D) |
+
+The five-point order is **left wrist, right wrist, head, left ankle, right
+ankle**, using SMPL joint indices `[20, 21, 15, 7, 8]`. Positions are relative
+to the SMPL root and expressed in its local orientation. Each orientation is
+a `wxyz` quaternion in that same SMPL-root frame, computed from the SMPL
+kinematic chain. The 6D root orientation uses the existing SMPL-to-robot-anchor
+orientation convention. The teleop encoder receives no robot lower-body
+reference or robot-derived VR points; normal robot proprioception still
+conditions the shared action decoder.
+
+As with the existing SMPL branch, `smpl_joints` must use Z-up world-oriented
+coordinates. `smpl_y_up` controls the pose conversion; it does not request a
+second rotation of the joint-position data. This variant requires valid,
+paired SMPL information for every loaded robot clip, rather than allowing
+missing SMPL information to fall back to zero targets. Each SMPL clip must
+contain positive finite `fps`, real `smpl_joints[T,24,3]`, and
+`pose_aa[T,72]` or `pose_aa[T,24,3]` in the standard SMPL joint order, with
+consistent frame counts and finite values. The loader rejects missing fields
+and clips whose five points collapse onto the pelvis for the entire sequence.
+It reuses the paired robot/SMPL resampling timeline; it does not reconstruct
+missing joint positions from a body model.
+
+Pass the same two dataset paths on the training server. No dataset directory
+is hard-coded, and the experiment does not generate or copy SMPL motion files:
+
+```bash
+python gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/all_modes/sonic_n3_smpl_vr5 \
+  +resume=false checkpoint=null auto_load_latest=false \
+  num_envs=512 headless=true use_wandb=false \
+  experiment_dir=logs_rl/n3_wam_smpl_vr5 \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file="$N3_ROBOT_MOTIONS" \
+  ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file="$N3_SMPL_MOTIONS"
+```
+
+For a server integration check, use the earlier smoke-test overrides with this
+experiment name and a separate log directory. Start a new training run: the
+teleop encoder input size changes, so an existing `sonic_n3` checkpoint cannot
+be resumed directly. Saved configurations and exported ONNX input layouts
+must remain paired with the new checkpoint; consumers of the teleop interface
+must provide SMPL five-point data in the layout above. CPU tests do not verify
+server datasets, Isaac Lab rollouts or training convergence.
+
 ## Evaluation and export
 
 Use `gear_sonic/eval_agent_trl.py` with the N3 checkpoint and its saved
