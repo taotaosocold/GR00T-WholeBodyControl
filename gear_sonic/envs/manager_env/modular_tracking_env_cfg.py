@@ -316,16 +316,18 @@ class MySceneCfg(InteractiveSceneCfg):
 
         # ground terrain
         terrain_type = config.get("terrain_type", "plane")
+        matched_wam_domain = config.get("wam_domain_randomization") == "supermimic"
         if terrain_type == "plane":
             self.terrain = TerrainImporterCfg(
                 prim_path="/World/ground",
                 terrain_type="plane",
                 collision_group=-1,
                 physics_material=sim_utils.RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
+                    friction_combine_mode="max" if matched_wam_domain else "multiply",
                     restitution_combine_mode="multiply",
-                    static_friction=1.0,
-                    dynamic_friction=1.0,
+                    static_friction=0.3 if matched_wam_domain else 1.0,
+                    dynamic_friction=0.3 if matched_wam_domain else 1.0,
+                    restitution=0.0,
                 ),
                 visual_material=sim_utils.MdlFileCfg(
                     mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",

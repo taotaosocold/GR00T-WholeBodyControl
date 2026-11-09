@@ -925,7 +925,10 @@ def wam_joint_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tens
     return values[:, order]
 
 
-def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg, complete: bool = False) -> torch.Tensor:
+def wam_context(
+    env: ManagerBasedEnv, asset_cfg: SceneEntityCfg, complete: bool = False,
+    context_mode: str = "legacy",
+) -> torch.Tensor:
     """Return physical context ξ, optionally including all randomized properties.
 
     The first value is the effective friction, the next 29 values are the
@@ -948,6 +951,16 @@ def wam_context(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg, complete: bool 
         xi = xi.to(device=asset.device)
         env._wam_xi = xi
 
+    if context_mode == "supermimic":
+        if complete:
+            raise ValueError("SuperMimic context mode uses the 33-D calibration interface")
+        from gear_sonic.utils.wam_context import supermimic_context, supermimic_context_schema
+
+        result = supermimic_context(asset, xi)
+        env._wam_context_schema = supermimic_context_schema(asset)
+        return result
+    if context_mode != "legacy":
+        raise ValueError(f"Unknown WAM context mode: {context_mode}")
     if complete:
         from gear_sonic.utils.wam_context import physical_context, physical_context_schema
 

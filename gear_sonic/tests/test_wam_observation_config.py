@@ -60,7 +60,8 @@ class WAMObservationConfigurationTests(unittest.TestCase):
         self.assertEqual(groups.wam.joint_pos.scale, 0.75)
         self.assertEqual(groups.wam.joint_pos.func, "gear_sonic.envs.manager_env.mdp:joint_pos_rel")
         self.assertEqual(groups.wam_context.xi.params.asset_cfg.name, "custom_robot")
-        self.assertTrue(groups.wam_context.xi.params.complete)
+        self.assertFalse(groups.wam_context.xi.params.complete)
+        self.assertEqual(groups.wam_context.xi.params.context_mode, "supermimic")
         self.assertEqual(groups.wam_state.root_lin_vel.func, "gear_sonic.envs.manager_env.mdp:wam_root_lin_vel_w")
         for name in GROUPS:
             self.assertNotIn("defaults", groups[name])
@@ -81,6 +82,10 @@ class WAMObservationConfigurationTests(unittest.TestCase):
 
     def test_old_wam_checkpoint_can_recreate_missing_physical_groups(self):
         config = release_configuration("trainer=wam", "world_model=wam_dynamics")
+        # A real pre-profile checkpoint did not contain the new default key.
+        del config.trainer.settings.domain_randomization
+        config.trainer.settings.complete_context = True
+        config.trainer.settings.terrain_type = None
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
             OmegaConf.save(config, path)
@@ -129,13 +134,19 @@ class WAMObservationConfigurationTests(unittest.TestCase):
         self.assertNotIn("wam_reference", config.manager_env.observations)
         self.assertNotIn("wam_context", config.manager_env.observations)
 
-    def test_terrain_override_is_wam_only_and_default_preserves_sonic(self):
+    def test_default_wam_uses_plane_and_legacy_profile_preserves_sonic(self):
         config = release_configuration("trainer=wam", "world_model=wam_dynamics")
         configure_wam_context(config)
-        self.assertEqual(config.manager_env.config.terrain_type, "trimesh")
-        config.trainer.settings.terrain_type = "plane"
-        configure_wam_context(config)
         self.assertEqual(config.manager_env.config.terrain_type, "plane")
+        legacy = release_configuration(
+            "trainer=wam", "world_model=wam_dynamics",
+            "trainer.settings.domain_randomization=sonic", "trainer.settings.terrain_type=null",
+        )
+        configure_wam_context(legacy)
+        self.assertEqual(legacy.manager_env.config.terrain_type, "trimesh")
+        legacy.trainer.settings.terrain_type = "plane"
+        configure_wam_context(legacy)
+        self.assertEqual(legacy.manager_env.config.terrain_type, "plane")
         ppo = release_configuration("++trainer.settings.terrain_type=plane")
         configure_wam_context(ppo)
         self.assertEqual(ppo.manager_env.config.terrain_type, "trimesh")

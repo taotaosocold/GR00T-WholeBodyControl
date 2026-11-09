@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import torch
 
 from gear_sonic.utils.wam_critic import future_reference_states
+from gear_sonic.utils.wam_noise import apply_reference_noise, reference_noise_spec
 
 
 # These observations depend only on the reference, except for orientations
@@ -84,9 +85,7 @@ class WAMReferenceBank:
             cfg_noise = getattr(cfg, "noise", None)
             noise = None
             if cfg_noise is not None and corrupt:
-                if not hasattr(cfg_noise, "n_min") or getattr(cfg_noise, "operation", "add") != "add":
-                    raise ValueError("WAM reference noise requires additive uniform tokenizer noise")
-                noise = (float(cfg_noise.n_min), float(cfg_noise.n_max))
+                noise = reference_noise_spec(cfg_noise)
             clip, scale = getattr(cfg, "clip", None), getattr(cfg, "scale", None)
             if spec[0] in {"encoder_index", "command_num_frames"} and (
                 noise is not None or clip is not None or scale is not None
@@ -215,13 +214,18 @@ class WAMReferenceBank:
         goals = goals.clone()
         for start, end, noise, clip, scale in self.transforms:
             value = goals[..., start:end]
+            original_shape = next(spec[3] for spec in self.specs if spec[1:3] == (start, end))
             if noise is not None:
-                low, high = noise
-                value = value + low + torch.rand_like(value) * (high - low)
+                # Custom current-frame noise needs the true reference-frame
+                # axis, independent of any leading imagination rollout axis.
+                if isinstance(noise, dict):
+                    value = value.reshape(*goals.shape[:-1], *original_shape)
+                    value = apply_reference_noise(value, noise).reshape(*goals.shape[:-1], end - start)
+                else:
+                    value = apply_reference_noise(value, noise)
             if clip is not None:
                 value = value.clamp(*clip)
             if scale is not None:
-                original_shape = next(spec[3] for spec in self.specs if spec[1:3] == (start, end))
                 value = value.reshape(*goals.shape[:-1], *original_shape)
                 value = (value * torch.as_tensor(scale, device=value.device, dtype=value.dtype)).reshape(
                     *goals.shape[:-1], end - start,

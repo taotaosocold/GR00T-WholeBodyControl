@@ -32,7 +32,7 @@ The WAM path has four separate observation groups. `wam_state` is the
 SuperMimic physical state `p(3), quat(wxyz)(4), v(3), w(3), q(29), qd(29)`;
 `wam` is the single-step Sonic proprioceptive frame used to reconstruct the
 actor input; `wam_reference` is the corresponding reference physical
-state; and `wam_context` contains calibration and detailed simulator properties.
+state; and `wam_context` contains SuperMimic's 33 calibration values.
 Settings live
 in `gear_sonic/config/trainer/wam.yaml`; the dynamics
 architecture lives in `gear_sonic/config/world_model/wam_dynamics.yaml` and
@@ -195,7 +195,49 @@ therefore receives only `(physical_state, action, ξ)` and shares one robot
 dynamics model across all three target representations. FSQ tokens are never
 passed to WAM. The physical WAM uses SuperMimic's frame-local invariant input
 and predicts local `dp, dtheta, dv, dw, dq, dqd` increments before integrating
-them back into the 71-dimensional state. With `complete_context: true`, ξ keeps
+them back into the 71-dimensional state. New G1 and N3 physical WAM runs use
+`domain_randomization: supermimic` with `complete_context: false`. Their raw ξ
+is exactly `[friction (1), body-joint default offsets (29), torso CoM offset (3)]`.
+The world-model input is therefore 71 state features + 29 actions + 33 context
+values = 133 dimensions. Context is not corrupted with sensor noise. Replay
+and actor calibration keep raw radian/metre values; privileged model/critic
+features first apply `[(mu-.75)/.45, offsets/.01, com/.05]`. World-model context
+and complete critic inputs then use their own running normalization.
+
+The matched training events sample one continuous `mu ~ U[.3,1.2]` per
+environment at startup, shared by all collision shapes, and one torso CoM
+offset with x in +/-0.025 m and y/z in +/-0.05 m. PhysX receives static and
+dynamic friction equal to mu, fixed zero restitution, and a ground coefficient
+of 0.3 with max combination. Calibration offsets are resampled independently
+in +/-0.01 rad at every reset from immutable nominal defaults, never accumulated.
+There are no mass-randomization or periodic push events in this profile.
+The same settings apply to G1 and N3; N3 uses its named torso and canonical
+29-body-joint ordering rather than G1 asset names.
+
+Reset position, velocity and joint-angle perturbation ranges match SuperMimic.
+Orientation uses a left-multiplied rotation-vector exponential and reset joint
+positions are clipped to hard limits; joint velocities retain their reference
+values. Extra dexterous joints receive no additional calibration or reset noise.
+The profile uses flat ground and disables reference-clip pose augmentations.
+Proprioceptive noise remains q +/-0.01, qd +/-0.5, body angular velocity +/-0.2,
+gravity +/-0.05 and previous action zero. Reference-relative orientation noise
+is +/-0.05 on the current frame only; future targets and extra SMPL/VR targets
+are clean, using matching real and imagined observation transforms.
+Collection adds Gaussian action noise (default sigma 0.1) and then clips once
+to +/-20; imagined actions receive neither this exploration noise nor clipping.
+
+These are matched distributions and context semantics, not identical robot
+dynamics: N3/G1 assets and PhysX versus MuJoCo-Warp still differ. Reset-frame
+sampling remains SONIC's failure-based sampler rather than SuperMimic's
+return-based sampler. Existing 707-D world-model/critic checkpoints cannot be
+resumed under the 33-D profile; load policy weights with `resume=false` and
+refit those models. Saved context and numerical schemas reject incompatible
+full resumes. Historical configurations without the new profile keep their
+old behavior. For a fresh legacy experiment select
+`trainer.settings.domain_randomization=sonic` and explicitly choose its terrain
+and `complete_context` settings.
+
+The older explicit `complete_context: true` mode retains
 SuperMimic's 33-dimensional prefix `[mean static friction, joint-default
 offsets (29), torso CoM offset (3)]` and appends every collision shape's static
 friction, dynamic friction and restitution; every body's mass, 3x3 inertia and
@@ -306,9 +348,9 @@ Set it to `false` to reproduce the previous actor-only warmup gate.
 `reset_sampling: adaptive_failure` explicitly selects GR00T's existing
 failure-based adaptive sampler; the old misleading value `return` is rejected
 because SuperMimic's return-based reset sampler is not implemented.
-`trainer.settings.terrain_type: null` retains the experiment's terrain;
-set `plane` for a flat-ground baseline. The inherited `trimesh` terrain is
-not encoded in WAM's robot-only physical context.
+The matched SuperMimic domain enforces flat ground. With the legacy `sonic`
+domain profile, `trainer.settings.terrain_type: null` retains the experiment's
+terrain. A `trimesh` terrain is not encoded in the robot-only physical context.
 
 For controlled comparisons, use the same robot, fixed held-out motion list,
 reward/termination definitions, encoder, observation noise, seeds and GPU-hour

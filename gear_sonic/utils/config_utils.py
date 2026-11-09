@@ -6,9 +6,9 @@ from pathlib import Path
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from loguru import logger
-from omegaconf import OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 
-from gear_sonic.utils.wam_noise import wam_observation_noise
+from gear_sonic.utils.wam_noise import supermimic_goal_noise_configs, wam_observation_noise
 
 
 def validate_robot_motion_config(config):
@@ -108,8 +108,61 @@ def _configure_wam_observation_groups(config):
     return True
 
 
+def configure_wam_domain_randomization(config):
+    """Use the same physical parameter draws for G1 and N3 physical WAM.
+
+    The profile is explicit in newly saved configurations. Historical configs
+    without it and non-WAM trainers retain their original environment contract.
+    """
+    target = str(OmegaConf.select(config, "trainer._target_", default=""))
+    if target.rsplit(".", 1)[-1] != "WAMTrainer":
+        return False
+    if OmegaConf.select(config, "world_model.cfg.state_type", default="flat") != "physical":
+        return False
+    profile = OmegaConf.select(config, "trainer.settings.domain_randomization")
+    if profile in (None, "sonic"):
+        return False
+    if profile != "supermimic":
+        raise ValueError("WAM domain_randomization must be 'supermimic' or 'sonic'")
+    terrain = OmegaConf.select(config, "trainer.settings.terrain_type")
+    if terrain is not None and (not isinstance(terrain, str) or terrain not in {"plane", "trimesh"}):
+        raise ValueError("WAM terrain_type must be null, 'plane', or 'trimesh'")
+    config_dir = Path(__file__).resolve().parents[1] / "config"
+    events = OmegaConf.load(config_dir / "manager_env/events/tracking/supermimic.yaml")
+    robot_type = OmegaConf.select(config, "manager_env.config.robot.type", default="g1")
+    events.base_com.params.asset_cfg.body_names = "waist_yaw_link" if robot_type == "n3" else "torso_link"
+    with open_dict(config.manager_env):
+        config.manager_env.events = events
+    for path, value in {
+        "trainer.settings.complete_context": False,
+        "trainer.settings.terrain_type": "plane",
+        "world_model.cfg.context_mode": "supermimic",
+        "manager_env.config.terrain_type": "plane",
+        "manager_env.config.wam_domain_randomization": "supermimic",
+        "manager_env.commands.motion.reset_distribution": "supermimic",
+        "manager_env.commands.motion.pose_range": {
+            "x": [-0.05, 0.05], "y": [-0.05, 0.05], "z": [-0.01, 0.01],
+            "roll": [-0.1, 0.1], "pitch": [-0.1, 0.1], "yaw": [-0.2, 0.2],
+        },
+        "manager_env.commands.motion.velocity_range": {
+            "x": [-0.5, 0.5], "y": [-0.5, 0.5], "z": [-0.2, 0.2],
+            "roll": [-0.52, 0.52], "pitch": [-0.52, 0.52], "yaw": [-0.78, 0.78],
+        },
+        "manager_env.commands.motion.joint_position_range": [-0.1, 0.1],
+        "manager_env.commands.motion.joint_velocity_range": [0.0, 0.0],
+        # SuperMimic perturbs reset state rather than modifying reference clips.
+        "manager_env.commands.motion.cat_upper_body_poses": False,
+        "manager_env.commands.motion.freeze_frame_aug": False,
+        "manager_env.commands.motion.randomize_wrist_poses": False,
+        "manager_env.commands.motion.randomize_heading": False,
+    }.items():
+        OmegaConf.update(config, path, value, merge=False, force_add=True)
+    return True
+
+
 def configure_wam_context(config):
     """Enable detailed simulator context only for the physical WAM branch."""
+    matched = configure_wam_domain_randomization(config)
     if not _configure_wam_observation_groups(config):
         return False
     enabled = bool(OmegaConf.select(config, "trainer.settings.complete_context", default=False))
@@ -121,6 +174,8 @@ def configure_wam_context(config):
             term.params = {}
         with open_dict(term.params):
             term.params.complete = enabled
+            if matched:
+                term.params.context_mode = "supermimic"
     return True
 
 
@@ -149,6 +204,15 @@ def configure_wam_observations(config):
                             "n_min": -width,
                             "n_max": width,
                         }
+    if OmegaConf.select(config, "trainer.settings.domain_randomization") == "supermimic":
+        tokenizer = OmegaConf.select(config, "manager_env.observations.tokenizer")
+        if tokenizer is not None:
+            names = [name for name, term in tokenizer.items()
+                     if not name.startswith("_") and isinstance(term, (dict, DictConfig))]
+            with open_dict(tokenizer):
+                for name, noise in supermimic_goal_noise_configs(names).items():
+                    with open_dict(tokenizer[name]):
+                        tokenizer[name].noise = noise
     return True
 
 

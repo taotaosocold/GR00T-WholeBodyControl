@@ -24,6 +24,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from gear_sonic.utils.wam_context import normalize_supermimic_context
+
 
 NUM_G1_JOINTS = 29
 PHYSICAL_STATE_DIM = 3 + 4 + 3 + 3 + NUM_G1_JOINTS + NUM_G1_JOINTS
@@ -318,6 +320,7 @@ class WAMConfig:
     # Preserve the existing per-valid-transition scale by default. The source
     # SuperMimic objective sums each window's errors and averages over the batch.
     loss_reduction: str = "mean_valid"
+    context_mode: str = "legacy"
 
 
 class StateSpaceWorldModel(nn.Module):
@@ -342,6 +345,11 @@ class StateSpaceWorldModel(nn.Module):
         self.action_dim = int(cfg.action_dim)
         self.goal_dim = int(getattr(cfg, "goal_dim", 0))
         self.context_dim = int(getattr(cfg, "context_dim", 0))
+        self.context_mode = str(getattr(cfg, "context_mode", "legacy"))
+        if self.context_mode not in {"legacy", "supermimic"}:
+            raise ValueError(f"unknown WAM context_mode: {self.context_mode}")
+        if self.context_mode == "supermimic" and self.context_dim != 33:
+            raise ValueError("SuperMimic context mode requires context_dim=33")
         self.residual_scale = float(getattr(cfg, "residual_scale", 1.0))
         self.state_type = str(getattr(cfg, "state_type", "flat"))
         self.reward_mode = str(getattr(cfg, "reward_mode", "learned"))
@@ -383,7 +391,10 @@ class StateSpaceWorldModel(nn.Module):
         self.state_norm = RunningNorm(self.state_dim)
         self.action_norm = RunningNorm(self.action_dim)
         self.goal_norm = RunningNorm(self.goal_dim) if self.goal_dim else None
-        self.context_norm = RunningNorm(self.context_dim) if self.context_dim else None
+        self.context_norm = (
+            RunningNorm(self.context_dim, eps=1e-2, min_std=0.0)
+            if self.context_mode == "supermimic" else RunningNorm(self.context_dim)
+        ) if self.context_dim else None
         self.delta_dim = dynamics_out
         if self.state_type == "physical":
             self.delta_norm = RunningNorm(
@@ -419,6 +430,12 @@ class StateSpaceWorldModel(nn.Module):
             )
         return context
 
+    def context_features(self, context: torch.Tensor) -> torch.Tensor:
+        """Map raw replay context to the privileged model-input convention."""
+        if self.context_mode == "supermimic":
+            return normalize_supermimic_context(context)
+        return context
+
     def _goal(self, goal: Optional[torch.Tensor], state: torch.Tensor) -> torch.Tensor:
         if self.goal_dim == 0:
             return state.new_zeros(*state.shape[:-1], 0)
@@ -452,7 +469,7 @@ class StateSpaceWorldModel(nn.Module):
         state_n = self.state_norm(model_state)
         action_n = self.action_norm(action)
         if self.context_norm is not None:
-            context = self.context_norm(context)
+            context = self.context_norm(self.context_features(context))
         return torch.cat((state_n, action_n, context), dim=-1)
 
     def forward(
@@ -699,7 +716,7 @@ class StateSpaceWorldModel(nn.Module):
         if self.goal_norm is not None and goals is not None:
             self.goal_norm.update(goals)
         if self.context_norm is not None and context is not None:
-            self.context_norm.update(context)
+            self.context_norm.update(self.context_features(context))
         if next_states is not None:
             if self.state_type == "physical":
                 self.delta_norm.update(physical_state_transition_delta(states, next_states))

@@ -7,6 +7,19 @@
 #  onnxruntime_LIBRARIES - Libraries for ONNX Runtime
 #  onnxruntime::onnxruntime - Imported target for ONNX Runtime
 
+# Re-discover paths when an SDK upgrade changes the installation layout.
+# CMake otherwise keeps cached values even after the files have disappeared.
+if(onnxruntime_INCLUDE_DIR AND
+   NOT EXISTS "${onnxruntime_INCLUDE_DIR}/onnxruntime_cxx_api.h")
+  unset(onnxruntime_INCLUDE_DIR CACHE)
+  unset(onnxruntime_INCLUDE_DIR)
+endif()
+
+if(onnxruntime_LIBRARY AND NOT EXISTS "${onnxruntime_LIBRARY}")
+  unset(onnxruntime_LIBRARY CACHE)
+  unset(onnxruntime_LIBRARY)
+endif()
+
 # Try to find ONNX Runtime installation
 find_path(onnxruntime_INCLUDE_DIR
   NAMES onnxruntime_cxx_api.h
@@ -16,7 +29,7 @@ find_path(onnxruntime_INCLUDE_DIR
     /opt/onnxruntime
     /usr/local
     /usr
-  PATH_SUFFIXES include
+  PATH_SUFFIXES include include/onnxruntime
 )
 
 find_library(onnxruntime_LIBRARY

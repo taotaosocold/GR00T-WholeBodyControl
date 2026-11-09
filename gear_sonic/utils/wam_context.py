@@ -19,6 +19,87 @@ CONTEXT_PREFIX_DIM = 33
 CONTEXT_SCHEMA_VERSION = 1
 
 
+def normalize_supermimic_context(context):
+    """Apply SuperMimic's fixed affine map to raw 33-D simulator context.
+
+    Replay and actor calibration retain raw values. Only the privileged world
+    model and critic inputs use this transform.
+    """
+    if context.shape[-1] != CONTEXT_PREFIX_DIM:
+        raise ValueError("SuperMimic context requires exactly 33 calibration values")
+    return torch.cat((
+        (context[..., :1] - 0.75) / 0.45,
+        context[..., 1:30] / 0.01,
+        context[..., 30:33] / 0.05,
+    ), -1)
+
+
+def supermimic_context_schema(asset):
+    """Describe the named calibration-only interface without full-body getters."""
+    return {
+        "version": 1,
+        "kind": "supermimic_calibration",
+        "dim": CONTEXT_PREFIX_DIM,
+        "prefix_dim": CONTEXT_PREFIX_DIM,
+        "prefix_joint_names": list(get_robot_joint_names(asset, order="mujoco")),
+        "torso_body_name": get_robot_torso_name(asset),
+        "fields": [
+            {"name": "friction", "start": 0, "end": 1, "shape": [1]},
+            {"name": "joint_default_offsets", "start": 1, "end": 30, "shape": [29]},
+            {"name": "torso_com_offset", "start": 30, "end": 33, "shape": [3]},
+        ],
+    }
+
+
+def supermimic_context(asset, legacy_context=None):
+    """Read raw [friction, canonical joint offsets, torso CoM offset] context.
+
+    This path deliberately does not request masses, inertias or shape-layout
+    metadata. CoM and calibration are refreshed from the articulation so a
+    reset cannot leave a stale event-buffer value in replay.
+    """
+    target = asset.data.joint_pos
+    n = int(target.shape[0])
+    if legacy_context is not None and tuple(legacy_context.shape) != (n, CONTEXT_PREFIX_DIM):
+        raise ValueError("SuperMimic calibration context must have shape [N,33]")
+    result = target.new_zeros(n, CONTEXT_PREFIX_DIM)
+    view = _view(asset)
+    materials = view.get_material_properties()
+    if materials.ndim != 3 or materials.shape[0] != n or materials.shape[-1] != 3:
+        raise ValueError("SuperMimic context requires per-shape material properties")
+    if materials.shape[1] == 0:
+        raise ValueError("SuperMimic context requires at least one collision shape")
+    result[:, 0] = materials[..., 0].mean(-1).to(result)
+    indices = torch.as_tensor([
+        asset.joint_names.index(name) for name in get_robot_joint_names(asset, order="mujoco")
+    ], device=target.device)
+    nominal = getattr(asset.data, "default_joint_pos_nominal", None)
+    if nominal is None:
+        current = asset.data.default_joint_pos
+        if not torch.equal(current, current[:1].expand_as(current)):
+            raise ValueError("SuperMimic calibration requires immutable nominal joint positions")
+        nominal = current[:1]
+    nominal = nominal.to(target)
+    if nominal.ndim == 1:
+        nominal = nominal.unsqueeze(0)
+    offsets = asset.data.default_joint_pos - nominal
+    result[:, 1:30] = offsets[:, indices].to(result)
+    torso = asset.body_names.index(get_robot_torso_name(asset))
+    coms = view.get_coms()
+    nominal_coms = getattr(asset, "_wam_nominal_coms", None)
+    if nominal_coms is not None:
+        result[:, 30:33] = (
+            coms[:, torso, :3] - nominal_coms[:, torso, :3]
+        ).to(result)
+    elif legacy_context is not None:
+        # Unrandomized scenes need no nominal CoM snapshot. A legacy event
+        # buffer still provides a compatible zero/default offset.
+        result[:, 30:33] = legacy_context[:, 30:33].to(result)
+    if not torch.isfinite(result).all():
+        raise ValueError("SuperMimic calibration context contains non-finite values")
+    return result
+
+
 def invalidate_physical_context(asset):
     """Invalidate cached static properties after a simulator randomization event."""
     asset._wam_physical_context = None

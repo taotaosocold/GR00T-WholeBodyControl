@@ -258,6 +258,9 @@ class WAMTrainer:
         self.context_keys = list(self.settings.get("context_observation_keys", []))
         self.reference_keys = list(self.settings.get("reference_observation_keys", []))
         self.physical_wam = dict((world_model_config or {}).get("cfg", {})).get("state_type", "flat") == "physical"
+        profile = self.settings.get("domain_randomization", "legacy")
+        self.domain_randomization_profile = "legacy" if profile in (None, "sonic", "legacy") else profile
+        self.strict_supermimic = self.physical_wam and self.domain_randomization_profile == "supermimic"
         simulator = getattr(env, "env", env)
         scene = getattr(simulator, "scene", None)
         robot = None if scene is None else scene["robot"]
@@ -355,6 +358,8 @@ class WAMTrainer:
             "aux_loss_scale": float(self.settings.get("aux_loss_scale", 1.0)),
             "error_frame": self.world_model.error_frame,
             "loss_reduction": self.world_model.loss_reduction,
+            "context_mode": self.world_model.context_mode,
+            "domain_randomization": self.domain_randomization_profile,
         } if self.physical_wam else None
         self.distributed.check_consistent(self.numerical_spec, "WAM numerical settings")
         self.control_dt = float(getattr(simulator, "step_dt", self.settings.get("control_dt", 0.02)))
@@ -418,7 +423,11 @@ class WAMTrainer:
         trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
         self.actor_optimizer = torch.optim.Adam(trainable, lr=lr, betas=(0.9, 0.95))
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
-        self.critic_norm = RunningNorm(self.critic_input_dim).to(self.device)
+        self.critic_norm = (
+            RunningNorm(self.critic_input_dim, eps=1e-2, min_std=0.0)
+            if self.world_model.context_mode == "supermimic"
+            else RunningNorm(self.critic_input_dim)
+        ).to(self.device)
         self.replay = SequenceReplayBuffer(
             int(self.settings.get("replay_steps", 1000)),
             actor_history_layout=(
@@ -474,7 +483,7 @@ class WAMTrainer:
         # lightweight adapters may return [B, A]. Keep both interfaces valid.
         action = result[:, -1] if result.ndim == 3 else result
         limit = self.env.config.get("action_clip_value", None)
-        if limit is not None and limit > 0:
+        if limit is not None and limit > 0 and not self.strict_supermimic:
             action = action.clamp(-limit, limit)
         return action
 
@@ -883,7 +892,11 @@ class WAMTrainer:
             if self.context_dim:
                 if context is None:
                     raise ValueError("WAM context is required by the critic")
-                context = self.world_model.context_norm(context)
+                context = (
+                    self.world_model.context_features(context)
+                    if self.world_model.context_mode == "supermimic"
+                    else self.world_model.context_norm(context)
+                )
             else:
                 context = state.new_zeros(*state.shape[:-1], 0)
             return self.critic_features(state, reference, context, future_reference)
@@ -1498,6 +1511,8 @@ class WAMTrainer:
                 # resume its world model under the new target-frame objective.
                 saved_numerical_spec.setdefault("error_frame", "predicted")
                 saved_numerical_spec.setdefault("loss_reduction", "mean_valid")
+                saved_numerical_spec.setdefault("context_mode", "legacy")
+                saved_numerical_spec.setdefault("domain_randomization", "legacy")
             if self.physical_wam and saved_numerical_spec != self.numerical_spec:
                 raise ValueError(
                     "Cannot resume WAM with different normalization, noise or actor objective settings "

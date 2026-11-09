@@ -55,6 +55,7 @@ def checkpoint_trainer(error_frame="target"):
         "delta_norm_eps": 0.0001, "state_error_floor": [0.1] * 6,
         "observation_noise": {}, "actor_return_reduction": "sum", "aux_loss_scale": 1.,
         "error_frame": error_frame, "loss_reduction": "mean_valid",
+        "context_mode": "legacy", "domain_randomization": "legacy",
     }
     trainer.distributed = SimpleNamespace(world_size=1, rank=0)
     trainer.iteration, trainer.world_updates = 7, 11
@@ -95,6 +96,8 @@ class WAMCheckpointRegressionTests(unittest.TestCase):
         payload = checkpoint_payload(original)
         payload["wam_numerical_spec"].pop("error_frame")
         payload["wam_numerical_spec"].pop("loss_reduction")
+        payload["wam_numerical_spec"].pop("context_mode")
+        payload["wam_numerical_spec"].pop("domain_randomization")
         saved = deepcopy(payload["wam_numerical_spec"])
         compatible = checkpoint_trainer("predicted")
         with patch("gear_sonic.trl.trainer.wam_trainer.torch.load", return_value=payload):

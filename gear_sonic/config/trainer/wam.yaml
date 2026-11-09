@@ -13,10 +13,10 @@ settings:
   # Actor-only goal stream. It is replayed for encoder/FSQ BPTT and never
   # passed to the WAM dynamics.
   goal_observation_keys: [tokenizer]
-  # Preserve SuperMimic's 33 calibration values, then append complete material,
-  # mass, inertia and CoM properties in a versioned simulator layout.
-  # ξ is consumed by WAM/critic and never by FSQ.
-  complete_context: true
+  # Match SuperMimic's physical randomization and 33-D calibration context.
+  # ξ is consumed by WAM/critic and never directly by FSQ.
+  domain_randomization: supermimic
+  complete_context: false
   context_observation_keys: [wam_context]
   reference_observation_keys: [wam_reference]
   # Shared physical critic uses FK tracking features + raw robot future + ξ.
@@ -63,8 +63,7 @@ settings:
   wm_only_iters: 500
   # Keep Sonic's adaptive failure sampler; return-based reset is not implemented.
   reset_sampling: adaptive_failure
-  # null preserves Sonic's terrain; plane provides a flat-ground comparison.
-  terrain_type: null
+  terrain_type: plane
   action_noise: 0.1
   # Jointly optimize encoder/FSQ/decoder with SuperMimic's summed return.
   actor_return_reduction: sum

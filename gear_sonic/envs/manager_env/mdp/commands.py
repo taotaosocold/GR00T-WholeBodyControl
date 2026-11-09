@@ -33,6 +33,7 @@ from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.isaac_utils import rotations
 from gear_sonic.trl.utils import common, order_converter, torch_transform
 from gear_sonic.utils.motion_lib import motion_lib_robot
+from gear_sonic.utils.wam_reset import apply_supermimic_reset
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -3030,9 +3031,13 @@ class TrackingCommand(CommandTerm):
 
         self.running_ref_root_height[env_ids] = self.anchor_pos_w[env_ids, 2]
 
+        reset_distribution = getattr(self.cfg, "reset_distribution", "sonic")
+        if reset_distribution not in {"sonic", "supermimic"}:
+            raise ValueError("reset_distribution must be 'sonic' or 'supermimic'")
+
         # Skip reset randomizations during evaluation — they cause visible stumbling
         # at the start of rendered episodes and are only needed for training robustness.
-        if not self.is_evaluating:
+        if not self.is_evaluating and reset_distribution == "sonic":
             range_list = [
                 self.cfg.pose_range.get(key, (0.0, 0.0))
                 for key in ["x", "y", "z", "roll", "pitch", "yaw"]
@@ -3077,18 +3082,29 @@ class TrackingCommand(CommandTerm):
             joint_pos = motion_lib_joint_pos
             joint_vel = motion_lib_joint_vel
 
-        if not self.is_evaluating:
-            joint_pos += sample_uniform(
-                *self.cfg.joint_position_range, joint_pos.shape, joint_pos.device
+        if reset_distribution == "supermimic":
+            apply_supermimic_reset(
+                root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos,
+                env_ids, joint_utils.get_body_joint_indices(self.robot),
+                self.robot.data.joint_pos_limits,
+                pose_range=self.cfg.pose_range,
+                velocity_range=self.cfg.velocity_range,
+                joint_position_range=self.cfg.joint_position_range,
+                add_noise=not self.is_evaluating,
             )
-            joint_vel += sample_uniform(
-                *self.cfg.joint_velocity_range, joint_vel.shape, joint_vel.device
-            )
+        else:
+            if not self.is_evaluating:
+                joint_pos += sample_uniform(
+                    *self.cfg.joint_position_range, joint_pos.shape, joint_pos.device
+                )
+                joint_vel += sample_uniform(
+                    *self.cfg.joint_velocity_range, joint_vel.shape, joint_vel.device
+                )
 
-        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
-        joint_pos[env_ids] = torch.clip(
-            joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
-        )
+            soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+            joint_pos[env_ids] = torch.clip(
+                joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
+            )
 
         ####### Resetting Humaonid States #######
         self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
@@ -4192,6 +4208,7 @@ class TrackingCommandCfg(CommandTermCfg):
 
     pose_range: dict[str, tuple[float, float]] = {}  # noqa: RUF012
     velocity_range: dict[str, tuple[float, float]] = {}  # noqa: RUF012
+    reset_distribution: str = "sonic"
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
     joint_velocity_range: tuple[float, float] = (-0, 0)

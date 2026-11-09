@@ -9,7 +9,8 @@ cfg:
   action_dim: 29
   # WAM is goal-free. Goal observations stay on the Sonic actor/FSQ path.
   goal_dim: 0
-  context_dim: 0  # inferred from the simulator's complete physical context
+  context_dim: 0  # inferred from the selected simulator context
+  context_mode: legacy  # the SuperMimic domain profile selects matched 33-D handling
   hidden: [2048, 2048, 2048]
   term_hidden: [128, 128]
   reward_hidden: [128, 128]
