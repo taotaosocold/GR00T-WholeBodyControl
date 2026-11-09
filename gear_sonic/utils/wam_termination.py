@@ -12,6 +12,97 @@ from torch.nn import functional as F
 from gear_sonic.utils.wam_state import robot_state
 
 
+def _quat_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
+    quaternion = F.normalize(quaternion, dim=-1)
+    w, x, y, z = quaternion.unbind(-1)
+    return torch.stack((
+        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+    ), dim=-1).reshape(quaternion.shape[:-1] + (3, 3))
+
+
+def _heading_matrix(rotation: torch.Tensor) -> torch.Tensor:
+    x, y = rotation[..., 0, 0], rotation[..., 1, 0]
+    norm = torch.sqrt(x.square() + y.square() + 1e-9)
+    cosine, sine = x / norm, y / norm
+    zero, one = torch.zeros_like(cosine), torch.ones_like(cosine)
+    return torch.stack((cosine, -sine, zero, sine, cosine, zero, zero, zero, one), -1).reshape(
+        rotation.shape[:-2] + (3, 3)
+    )
+
+
+def _matrix_angle(rotation: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    cosine = ((rotation * reference).sum((-1, -2)) - 1) / 2
+    return torch.acos(cosine.clamp(-1 + 1e-6, 1 - 1e-6))
+
+
+def mimiclite_error_terms(state, reference, kinematics):
+    """Return root/global and tracked-body/local MimicLite errors."""
+    position, rotation = state[..., :3], _quat_to_matrix(state[..., 3:7])
+    ref_position, ref_rotation = reference[..., :3], _quat_to_matrix(reference[..., 3:7])
+    body_pos, body_rot, _, _ = kinematics(state)
+    ref_body_pos, ref_body_rot, _, _ = kinematics(reference)
+    body_names = tuple(getattr(kinematics, "tracked_bodies", ()))
+    if "waist_yaw_link" in body_names:
+        root_name = "waist_yaw_link"
+    elif "torso_link" in body_names:
+        root_name = "torso_link"
+    else:
+        root_name = body_names[0]
+    root_index = body_names.index(root_name)
+    root_body_pos = body_pos[..., root_index, :]
+    ref_root_body_pos = ref_body_pos[..., root_index, :]
+    root_body_rot = body_rot[..., root_index, :, :]
+    ref_root_body_rot = ref_body_rot[..., root_index, :, :]
+    root_pos = (root_body_pos - ref_root_body_pos).norm(dim=-1)
+    root_ori = _matrix_angle(root_body_rot, ref_root_body_rot)
+    heading = _heading_matrix(root_body_rot)
+    ref_heading = _heading_matrix(ref_root_body_rot)
+    root = root_body_pos.clone()
+    ref_root = ref_root_body_pos.clone()
+    root[..., 2] = 0.0
+    ref_root[..., 2] = 0.0
+    local_pos = (
+        (heading.transpose(-1, -2).unsqueeze(-3) @
+         (body_pos - root.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1)
+        - (ref_heading.transpose(-1, -2).unsqueeze(-3) @
+           (ref_body_pos - ref_root.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1)
+    )
+    local_robot_rot = heading.transpose(-1, -2).unsqueeze(-3) @ body_rot
+    local_ref_rot = ref_heading.transpose(-1, -2).unsqueeze(-3) @ ref_body_rot
+    body_pos_error = local_pos.norm(dim=-1).amax(dim=-1)
+    body_ori_error = _matrix_angle(local_robot_rot, local_ref_rot).amax(dim=-1)
+    return torch.stack((root_pos, root_ori, body_pos_error, body_ori_error), dim=-1)
+
+
+def mimiclite_soft_termination(
+    errors: torch.Tensor,
+    counters: torch.Tensor,
+    thresholds=(0.4, 1.2, 0.4, 1.2),
+    min_steps=(25, 25, 5, 5),
+    error_temperature=0.05,
+    temperature=0.5,
+    valid=None,
+):
+    """Differentiable continuous-threshold surrogate for imagined rollouts."""
+    if errors.shape[-1] != 4 or counters.shape != errors.shape:
+        raise ValueError("MimicLite errors/counters must have shape [..., 4]")
+    if temperature <= 0 or error_temperature <= 0:
+        raise ValueError("MimicLite termination temperatures must be positive")
+    threshold = errors.new_tensor(thresholds)
+    steps = errors.new_tensor(min_steps)
+    exceeded = torch.sigmoid((errors - threshold) / error_temperature)
+    next_counters = exceeded * (counters + 1.0)
+    hazards = torch.sigmoid((next_counters - steps + 0.5) / temperature)
+    if valid is not None:
+        next_counters = torch.where(valid[..., None], next_counters, counters)
+        hazards = torch.where(valid[..., None], hazards, torch.zeros_like(hazards))
+    failure = hazards[..., 1:].amax(dim=-1)
+    timeout = hazards[..., 0]
+    return next_counters, failure, timeout, torch.maximum(failure, timeout)
+
+
 def enable_terminal_capture(env, command_name="motion"):
     """Enable a physical WAM trainer's post-physics, pre-reset state cache.
 
@@ -151,4 +242,13 @@ def supermimic_time_out(env, command_name="motion"):
     command = env.command_manager.get_term(command_name)
     cursor = command.motion_start_time_steps + command.time_steps + 1
     clip_end = cursor >= command.motion_lib.get_time_step_total(command.motion_ids)
+    return clip_end | (env.episode_length_buf >= env.max_episode_length)
+
+
+def mimiclite_time_out(env, command_name="motion"):
+    """MimicLite clip boundary: the last valid reference frame truncates."""
+    command = env.command_manager.get_term(command_name)
+    elapsed = command.time_steps + command.motion_start_time_steps + 1
+    total = command.motion_lib.get_time_step_total(command.motion_ids)
+    clip_end = elapsed >= (total - 1).clamp_min(0)
     return clip_end | (env.episode_length_buf >= env.max_episode_length)

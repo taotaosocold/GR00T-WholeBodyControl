@@ -33,6 +33,10 @@ class TerminationsCfg:
 
     time_out = None
     wam_failure = None
+    root_pos_error = None
+    root_ori_error = None
+    body_pos_error = None
+    body_ori_error = None
     anchor_pos = None
     anchor_ori = None
     anchor_ori_full = None
@@ -374,7 +378,6 @@ class CummBodyOriError(_CummErrorMixin):
         self.motion_body_indices = [motion_names.index(name) for name in selected]
         # self.robot_body_indices = self.command.body_indexes[self.motion_body_indices].tolist()
         self.robot_body_indices = self.motion_body_indices
-
     def __call__(self, env, body_names=None, min_steps=None, threshold=None, command_name=None):
         """Compute max world-frame body orientation error and check cumulative threshold.
 
@@ -408,6 +411,10 @@ class CummBodyPosErrorLocal(_CummErrorMixin):
         self.motion_body_indices = [motion_names.index(name) for name in selected]
         # self.robot_body_indices = self.command.body_indexes[self.motion_body_indices].tolist()
         self.robot_body_indices = self.motion_body_indices
+        roots = _resolve_matching_names(cfg.params.get("root_body_names", []), motion_names)
+        if len(roots) > 1:
+            raise ValueError("CummBodyPosErrorLocal accepts at most one root_body_names entry")
+        self.local_root_indices = [motion_names.index(roots[0])] if roots else None
 
     def __call__(self, env, body_names=None, min_steps=None, threshold=None, command_name=None):
         """Compute max root-yaw-local body position error and check cumulative threshold.
@@ -421,13 +428,23 @@ class CummBodyPosErrorLocal(_CummErrorMixin):
         ref_body_pos = self.command.body_pos_w[:, self.motion_body_indices]
         robot_body_pos = self.command.robot_body_pos_w[:, self.robot_body_indices]
 
-        ref_root_pos = self.command.anchor_pos_w.view(self.num_envs, 1, 3).clone()
-        robot_root_pos = self.command.robot_anchor_pos_w.view(self.num_envs, 1, 3).clone()
+        if self.local_root_indices is None:
+            ref_root_pos = self.command.anchor_pos_w.view(self.num_envs, 1, 3).clone()
+            robot_root_pos = self.command.robot_anchor_pos_w.view(self.num_envs, 1, 3).clone()
+        else:
+            ref_root_pos = self.command.body_pos_w[:, self.local_root_indices].clone()
+            robot_root_pos = self.command.robot_body_pos_w[:, self.local_root_indices].clone()
         ref_root_pos[..., 2] = 0.0
         robot_root_pos[..., 2] = 0.0
 
-        ref_root_quat = get_heading_q(self.command.anchor_quat_w.view(self.num_envs, 1, 4))
-        robot_root_quat = get_heading_q(self.command.robot_anchor_quat_w.view(self.num_envs, 1, 4))
+        if self.local_root_indices is None:
+            ref_anchor_quat = self.command.anchor_quat_w.view(self.num_envs, 1, 4)
+            robot_anchor_quat = self.command.robot_anchor_quat_w.view(self.num_envs, 1, 4)
+        else:
+            ref_anchor_quat = self.command.body_quat_w[:, self.local_root_indices]
+            robot_anchor_quat = self.command.robot_body_quat_w[:, self.local_root_indices]
+        ref_root_quat = get_heading_q(ref_anchor_quat)
+        robot_root_quat = get_heading_q(robot_anchor_quat)
         # expand root quaternions to match per-body vectors for quat_apply_inverse
         ref_root_quat = ref_root_quat.expand(ref_body_pos.shape[0], ref_body_pos.shape[1], -1)
         robot_root_quat = robot_root_quat.expand(
@@ -461,6 +478,10 @@ class CummBodyOriErrorLocal(_CummErrorMixin):
         self.motion_body_indices = [motion_names.index(name) for name in selected]
         # self.robot_body_indices = self.command.body_indexes[self.motion_body_indices].tolist()
         self.robot_body_indices = self.motion_body_indices
+        roots = _resolve_matching_names(cfg.params.get("root_body_names", []), motion_names)
+        if len(roots) > 1:
+            raise ValueError("CummBodyOriErrorLocal accepts at most one root_body_names entry")
+        self.local_root_indices = [motion_names.index(roots[0])] if roots else None
 
     def __call__(self, env, body_names=None, min_steps=None, threshold=None, command_name=None):
         """Compute max root-yaw-local body orientation error and check cumulative threshold.
@@ -474,8 +495,14 @@ class CummBodyOriErrorLocal(_CummErrorMixin):
         ref_body_quat = self.command.body_quat_w[:, self.motion_body_indices]
         robot_body_quat = self.command.robot_body_quat_w[:, self.robot_body_indices]
 
-        ref_root_quat = get_heading_q(self.command.anchor_quat_w.view(self.num_envs, 1, 4))
-        robot_root_quat = get_heading_q(self.command.robot_anchor_quat_w.view(self.num_envs, 1, 4))
+        if self.local_root_indices is None:
+            ref_anchor_quat = self.command.anchor_quat_w.view(self.num_envs, 1, 4)
+            robot_anchor_quat = self.command.robot_anchor_quat_w.view(self.num_envs, 1, 4)
+        else:
+            ref_anchor_quat = self.command.body_quat_w[:, self.local_root_indices]
+            robot_anchor_quat = self.command.robot_body_quat_w[:, self.local_root_indices]
+        ref_root_quat = get_heading_q(ref_anchor_quat)
+        robot_root_quat = get_heading_q(robot_anchor_quat)
         ref_root_quat = ref_root_quat.expand_as(ref_body_quat)
         robot_root_quat = robot_root_quat.expand_as(robot_body_quat)
 

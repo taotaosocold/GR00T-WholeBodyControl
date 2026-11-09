@@ -1,0 +1,69 @@
+# MimicLite-style N3 WAM termination profile.
+# The cumulative terms count consecutive post-physics frames at or above the
+# threshold. Root position is a timeout (Adapt/Finetune semantics), while
+# orientation and tracked-body terms are failures.
+_target_: gear_sonic.envs.manager_env.mdp.terminations.TerminationsCfg
+
+root_pos_error:
+  _target_: isaaclab.managers.TerminationTermCfg
+  func: gear_sonic.envs.manager_env.mdp.terminations:CummBodyPosError
+  time_out: true
+  params:
+    command_name: motion
+    body_names: [waist_yaw_link]
+    min_steps: 25
+    threshold: 0.4
+
+root_ori_error:
+  _target_: isaaclab.managers.TerminationTermCfg
+  func: gear_sonic.envs.manager_env.mdp.terminations:CummBodyOriError
+  params:
+    command_name: motion
+    body_names: [waist_yaw_link]
+    min_steps: 25
+    threshold: 1.2
+
+body_pos_error:
+  _target_: isaaclab.managers.TerminationTermCfg
+  func: gear_sonic.envs.manager_env.mdp.terminations:CummBodyPosErrorLocal
+  params:
+    command_name: motion
+    body_names: ".*"
+    root_body_names: [waist_yaw_link]
+    min_steps: 5
+    threshold: 0.4
+
+body_ori_error:
+  _target_: isaaclab.managers.TerminationTermCfg
+  func: gear_sonic.envs.manager_env.mdp.terminations:CummBodyOriErrorLocal
+  params:
+    command_name: motion
+    body_names: ".*"
+    root_body_names: [waist_yaw_link]
+    min_steps: 5
+    threshold: 1.2
+
+# Preserve Sonic's end-effector height-error failure as a true termination.
+# `time_out` is intentionally omitted (false), unlike root_pos_error and
+# the motion time limit below, which are truncations.
+ee_body_pos:
+  _target_: isaaclab.managers.TerminationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:exceeded_body_height
+  params:
+    command_name: motion
+    threshold: 0.15
+    threshold_adaptive: true
+    down_threshold: 0.75
+    root_height_threshold: 0.5
+    body_names:
+      - left_ankle_roll_link
+      - right_ankle_roll_link
+      - left_wrist_yaw_link
+      - right_wrist_yaw_link
+
+time_out:
+  _target_: isaaclab.managers.TerminationTermCfg
+  func: gear_sonic.utils.wam_termination:mimiclite_time_out
+  time_out: true
+  params:
+    command_name: motion

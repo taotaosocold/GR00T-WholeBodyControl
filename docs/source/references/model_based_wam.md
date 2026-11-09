@@ -81,6 +81,38 @@ The default UTD schedule takes precedence over `collect_steps`; the default
 reaching actor/critic updates. Check for finite `actor/loss` and `critic/loss`
 alongside `world/loss`, rather than treating checkpoint creation as coverage.
 
+### N3 MimicLite termination profile
+
+The named experiment
+`+exp=manager/universal_token/all_modes/sonic_n3_smpl_vr5_mimiclite` selects the N3
+SMPL/VR5 WAM configuration while retaining the SuperMimic physical
+randomization, 33-D context, and WAM reward. Its real termination group follows
+MimicLite's Adapt/Finetune semantics: the mapped N3 root (`waist_yaw_link`)
+must exceed 0.4 m position error for 25 consecutive control steps to produce a
+timeout; root orientation uses a 1.2 rad global error for 25 steps, and the
+maximum tracked-body local position/orientation errors use 0.4 m / 1.2 rad for
+5 steps as failures. A counter resets immediately when the corresponding
+maximum error falls below its threshold. Imagined WAM rollouts use a
+differentiable run-length surrogate with the same thresholds and counts, while
+root-position timeout hazards stay out of the failure mask so the critic
+bootstrap path remains available. The motion-clip timeout remains separate.
+
+This profile enables `finite_guard`: a rank that observes a non-finite WAM
+state, action, reward, or observation resets its simulator rank and discards
+the current transition before replay or running-normalizer updates. This is a
+conservative rank-wide reset because Isaac Lab does not expose a stable
+selective reset API across the supported versions. Use the profile with:
+
+```bash
++exp=manager/universal_token/all_modes/sonic_n3_smpl_vr5_mimiclite \
+trainer=wam world_model=wam_dynamics
+```
+
+The equivalent G1 configuration is
+`+exp=manager/universal_token/all_modes/sonic_mimiclite`. It inherits the
+G1 three-modality SONIC data and maps the MimicLite root to `torso_link`; the
+N3 profile above maps it to `waist_yaw_link`.
+
 The extra WAM observation groups are enabled only for WAM. PPO removes these
 four reserved groups from older saved configurations as well, avoiding unused
 rollout storage and simulator-property reads. PPO's policy, reward, termination,

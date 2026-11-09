@@ -1,0 +1,18 @@
+# @package _global_
+# G1 WAM with the MimicLite cumulative termination profile.
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_release
+  - override /trainer: wam
+  - override /world_model: wam_dynamics
+  - override /manager_env/rewards: tracking/wam
+  - override /manager_env/terminations: tracking/wam
+  - _self_
+
+project_name: TRL_G1_MimicLite
+termination_profile: mimiclite
+finite_guard: true
+
+trainer:
+  settings:
+    termination_profile: mimiclite
+    finite_guard: true

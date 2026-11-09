@@ -1,0 +1,14 @@
+# @package _global_
+# N3 WAM with the MimicLite cumulative termination profile.
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_n3_smpl_vr5
+  - _self_
+
+project_name: TRL_N3_MimicLite
+termination_profile: mimiclite
+finite_guard: true
+
+trainer:
+  settings:
+    termination_profile: mimiclite
+    finite_guard: true

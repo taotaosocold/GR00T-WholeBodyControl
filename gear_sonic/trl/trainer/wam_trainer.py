@@ -43,7 +43,8 @@ from gear_sonic.utils.wam_reference import WAMReferenceBank
 from gear_sonic.utils.wam_noise import wam_observation_noise
 from gear_sonic.utils.wam_reward import WAMTrackingReward, reference_state
 from gear_sonic.utils.wam_termination import (
-    enable_terminal_capture, get_terminal_state, soft_tracking_termination,
+    enable_terminal_capture, get_terminal_state, mimiclite_error_terms,
+    mimiclite_soft_termination, soft_tracking_termination,
 )
 
 
@@ -261,6 +262,13 @@ class WAMTrainer:
         profile = self.settings.get("domain_randomization", "legacy")
         self.domain_randomization_profile = "legacy" if profile in (None, "sonic", "legacy") else profile
         self.strict_supermimic = self.physical_wam and self.domain_randomization_profile == "supermimic"
+        self.termination_profile = str(config.get(
+            "termination_profile", self.settings.get("termination_profile", "supermimic")
+        ))
+        self.mimiclite_termination = self.physical_wam and self.termination_profile == "mimiclite"
+        self.finite_guard = bool(config.get("finite_guard", self.settings.get("finite_guard", False)))
+        if self.termination_profile not in {"supermimic", "mimiclite"}:
+            raise ValueError("unknown WAM termination_profile")
         simulator = getattr(env, "env", env)
         scene = getattr(simulator, "scene", None)
         robot = None if scene is None else scene["robot"]
@@ -360,6 +368,8 @@ class WAMTrainer:
             "loss_reduction": self.world_model.loss_reduction,
             "context_mode": self.world_model.context_mode,
             "domain_randomization": self.domain_randomization_profile,
+            "termination_profile": self.termination_profile,
+            "finite_guard": self.finite_guard,
         } if self.physical_wam else None
         self.distributed.check_consistent(self.numerical_spec, "WAM numerical settings")
         self.control_dt = float(getattr(simulator, "step_dt", self.settings.get("control_dt", 0.02)))
@@ -635,6 +645,31 @@ class WAMTrainer:
         optimizer.step()
         return norm
 
+    @staticmethod
+    def _nonfinite_rows(values, batch_size):
+        """Return batch rows containing a NaN/Inf in any supplied tensor."""
+        bad = None
+        for value in values:
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                continue
+            if value.shape[0] != batch_size:
+                continue
+            row_bad = ~torch.isfinite(value.reshape(batch_size, -1)).all(dim=-1)
+            bad = row_bad if bad is None else (bad | row_bad)
+        if bad is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=values[0].device)
+        return bad
+
+    def _reset_after_nonfinite(self):
+        """Reset the rank after a bad transition and clear its actor history."""
+        reset_obs = self.env.reset()
+        if not isinstance(reset_obs, Mapping) or "actor_obs" not in reset_obs:
+            raise FloatingPointError("finite_guard reset did not return valid observations")
+        self.obs = reset_obs
+        self.actor_obs = self._seed_actor_history(reset_obs["actor_obs"], reset_obs.get("wam"))
+        self.previous_world_action.zero_()
+        return reset_obs
+
     @torch.no_grad()
     def collect(self, steps):
         self.policy.eval()
@@ -646,6 +681,7 @@ class WAMTrainer:
         diagnostic_sums = torch.zeros(7, dtype=torch.float64, device=self.device)
         action_abs_max = torch.zeros((), device=self.device)
         episode_logs = {}
+        nonfinite_envs = 0
         for _ in range(steps):
             state = self.layout.pack(self.obs)
             goal = self.layout.pack_goal(self.obs)
@@ -653,6 +689,15 @@ class WAMTrainer:
             reference = self._pack_keys(self.obs, self.reference_keys)
             critic_state = self._pack_keys(self.obs, self.critic_keys)
             context = self._pack_context(self.obs)
+            if self.finite_guard:
+                bad = self._nonfinite_rows(
+                    [state, goal, actor_obs, reference, critic_state, context],
+                    self.env.num_envs,
+                )
+                if bad.any():
+                    nonfinite_envs += int(bad.sum().item())
+                    self._reset_after_nonfinite()
+                    continue
             reference_index = None
             if self.independent_imagination:
                 simulator = getattr(self.env, "env", self.env)
@@ -691,6 +736,15 @@ class WAMTrainer:
             next_obs, rewards, dones, infos = self.env.step({"actions": executed})
             next_state = self.layout.pack(next_obs)
             next_goal = self.layout.pack_goal(next_obs)
+            if self.finite_guard:
+                bad = self._nonfinite_rows(
+                    [executed, rewards, next_state, next_goal, *next_obs.values()],
+                    self.env.num_envs,
+                )
+                if bad.any():
+                    nonfinite_envs += int(bad.sum().item())
+                    self._reset_after_nonfinite()
+                    continue
             # Goals are still in the returned observation's robot frame. Do
             # this conversion before substituting terminal states: done rows
             # of next_obs already describe the newly reset robot.
@@ -730,6 +784,14 @@ class WAMTrainer:
             world_action = self._to_wam_action(executed)
             previous_world_action = self.previous_world_action
             reward = rewards.reshape(state.shape[0], -1).sum(-1)
+            if self.finite_guard:
+                bad = self._nonfinite_rows(
+                    [next_reference, next_critic_state, world_action, reward], self.env.num_envs
+                )
+                if bad.any():
+                    nonfinite_envs += int(bad.sum().item())
+                    self._reset_after_nonfinite()
+                    continue
             timeout = infos.get("time_outs", torch.zeros_like(dones)).bool()
             terminated = infos.get("terminated", dones.bool() & ~timeout).bool()
             at_limit = (
@@ -824,6 +886,8 @@ class WAMTrainer:
             "real/action_rms", "real/action_at_limit_fraction", "real/reward_std",
             "real/action_abs_max",
         ), values))
+        if self.finite_guard:
+            self._last_collection_metrics["real/nonfinite_envs"] = float(nonfinite_envs)
         for name, accumulator in episode_logs.items():
             value_sum, count = accumulator.cpu().tolist()
             if count:
@@ -1030,6 +1094,30 @@ class WAMTrainer:
             tilt_width=float(self.settings.get("termination_tilt_width", 0.04)),
         )
 
+    def _mimiclite_termination(self, state, reference, counters, valid=None):
+        """Return differentiable MimicLite failure/timeout hazards."""
+        if self.reward_model is None or not hasattr(self.reward_model, "kinematics"):
+            raise RuntimeError("MimicLite WAM termination requires physical reward kinematics")
+        errors = mimiclite_error_terms(state, reference, self.reward_model.kinematics)
+        thresholds = (
+            float(self.settings.get("mimiclite_root_pos_threshold", 0.4)),
+            float(self.settings.get("mimiclite_root_ori_threshold", 1.2)),
+            float(self.settings.get("mimiclite_body_pos_threshold", 0.4)),
+            float(self.settings.get("mimiclite_body_ori_threshold", 1.2)),
+        )
+        min_steps = (
+            int(self.settings.get("mimiclite_root_min_steps", 25)),
+            int(self.settings.get("mimiclite_root_min_steps", 25)),
+            int(self.settings.get("mimiclite_body_min_steps", 5)),
+            int(self.settings.get("mimiclite_body_min_steps", 5)),
+        )
+        return mimiclite_soft_termination(
+            errors, counters, thresholds, min_steps,
+            error_temperature=float(self.settings.get("mimiclite_error_temperature", 0.05)),
+            temperature=float(self.settings.get("mimiclite_counter_temperature", 0.5)),
+            valid=valid,
+        )
+
     def _advance_actor_history(self, actor_obs, wam_obs, action=None, *, physical_state=False, context=None):
         """Append one single-step WAM observation to Sonic's actor history."""
         if self.physical_wam and physical_state:
@@ -1130,6 +1218,11 @@ class WAMTrainer:
         state = seed
         states, rewards, dones = [], [], []
         survival = torch.ones(seed.shape[0], device=self.device)
+        failure_survival = survival.clone()
+        mimiclite_counters = (
+            torch.zeros(seed.shape[0], 4, device=self.device)
+            if self.mimiclite_termination else None
+        )
         objective = torch.zeros_like(survival)
         auxiliary_loss = seed.new_zeros(())
         gradient_metrics = {}
@@ -1169,12 +1262,24 @@ class WAMTrainer:
                     reward = self._analytic_reward(
                         prediction["next_state"], reference, world_action, previous_action
                     )
-                    done = self._analytic_termination(prediction["next_state"], reference)
+                    if self.mimiclite_termination:
+                        (
+                            mimiclite_counters, failure_done, timeout_done, done,
+                        ) = self._mimiclite_termination(
+                            prediction["next_state"], reference, mimiclite_counters, valid=valid,
+                        )
+                    else:
+                        done = self._analytic_termination(prediction["next_state"], reference)
+                        failure_done, timeout_done = done, done.new_zeros(done.shape)
                 else:
                     reward = prediction["reward"]
                     done = prediction["termination_logits"].sigmoid()
+                    failure_done, timeout_done = done, done.new_zeros(done.shape)
                 objective = objective + gamma**step * survival * reward * valid
                 survival = torch.where(valid, survival * (1.0 - done), survival)
+                failure_survival = torch.where(
+                    valid, failure_survival * (1.0 - failure_done), failure_survival
+                )
                 state = torch.where(valid[:, None], prediction["next_state"], state)
                 next_actor_obs = self._advance_actor_history(
                     actor_obs, prediction["next_state"], action, physical_state=True,
@@ -1183,7 +1288,10 @@ class WAMTrainer:
                 actor_obs = torch.where(valid[:, None], next_actor_obs, actor_obs)
                 previous_action = world_action
                 rewards.append(reward)
-                dones.append(done)
+                # Timeout hazards stop rewards but retain the critic bootstrap;
+                # failure hazards stop both. This matches MimicLite's
+                # terminated-vs-timeout GAE convention.
+                dones.append(failure_done)
             reference = references[:, horizon] if self.reference_dim else None
             critic_state = critic_states[:, horizon] if self.critic_feature_dim else None
             bootstrap_context = context[:, -1] if context is not None else None
@@ -1194,7 +1302,8 @@ class WAMTrainer:
             bootstrap = self.critic(
                 self.critic_norm(bootstrap_input)
             ).squeeze(-1)
-            objective = objective + gamma**lengths * survival * bootstrap
+            bootstrap_survival = failure_survival if self.mimiclite_termination else survival
+            objective = objective + gamma**lengths * bootstrap_survival * bootstrap
             return_loss = -objective.mean()
             if self.actor_return_reduction == "mean":
                 return_loss = return_loss / horizon
@@ -1506,6 +1615,8 @@ class WAMTrainer:
             if self.physical_wam and checkpoint.get("wam_context_schema") != self.context_schema:
                 raise ValueError("Cannot resume WAM with a different physical context schema")
             saved_numerical_spec = deepcopy(checkpoint.get("wam_numerical_spec"))
+            saved_has_termination_profile = False
+            saved_has_finite_guard = False
             if saved_numerical_spec is not None:
                 # Missing keys identify the pre-fix algorithm. Never silently
                 # resume its world model under the new target-frame objective.
@@ -1513,7 +1624,25 @@ class WAMTrainer:
                 saved_numerical_spec.setdefault("loss_reduction", "mean_valid")
                 saved_numerical_spec.setdefault("context_mode", "legacy")
                 saved_numerical_spec.setdefault("domain_randomization", "legacy")
-            if self.physical_wam and saved_numerical_spec != self.numerical_spec:
+                saved_has_termination_profile = "termination_profile" in saved_numerical_spec
+                saved_has_finite_guard = "finite_guard" in saved_numerical_spec
+                saved_numerical_spec.setdefault("termination_profile", "supermimic")
+                saved_numerical_spec.setdefault("finite_guard", False)
+            comparison_spec = deepcopy(saved_numerical_spec) or {}
+            current_spec = deepcopy(self.numerical_spec) or {}
+            # Historical SuperMimic checkpoints predate these two metadata
+            # fields. They remain compatible with the unchanged profile; a
+            # MimicLite/finite-guard run must still reject an ambiguous old
+            # checkpoint rather than silently changing its semantics.
+            current_profile = current_spec.get("termination_profile", "supermimic")
+            current_guard = current_spec.get("finite_guard", False)
+            if not saved_has_termination_profile and current_profile == "supermimic":
+                comparison_spec.pop("termination_profile", None)
+                current_spec.pop("termination_profile", None)
+            if not saved_has_finite_guard and not current_guard:
+                comparison_spec.pop("finite_guard", None)
+                current_spec.pop("finite_guard", None)
+            if self.physical_wam and comparison_spec != current_spec:
                 raise ValueError(
                     "Cannot resume WAM with different normalization, noise or actor objective settings "
                     "(including error_frame/loss_reduction). Pre-fix checkpoints use "

@@ -230,16 +230,70 @@ def configure_wam_terminations(config):
         return False
     if not OmegaConf.select(config, "trainer.settings.align_real_termination", default=False):
         return False
-    template = Path(__file__).resolve().parents[1] / "config/manager_env/terminations/tracking/wam.yaml"
+    profile = OmegaConf.select(config, "trainer.settings.termination_profile", default="supermimic")
+    # Hydra group overrides (for example ``trainer=wam`` on the command line)
+    # can replace the trainer subtree after an experiment file is merged. The
+    # experiment-level marker keeps the named profile stable in that case.
+    profile = OmegaConf.select(config, "termination_profile", default=profile)
+    if profile not in {"supermimic", "mimiclite"}:
+        raise ValueError("WAM termination_profile must be 'supermimic' or 'mimiclite'")
+    template_name = "wam_mimiclite.yaml" if profile == "mimiclite" else "wam.yaml"
+    template = Path(__file__).resolve().parents[1] / f"config/manager_env/terminations/tracking/{template_name}"
     terminations = OmegaConf.load(template)
-    terminations.wam_failure.params.height_threshold = float(OmegaConf.select(
-        config, "trainer.settings.termination_height", default=0.25,
-    ))
-    terminations.wam_failure.params.tilt_threshold = float(OmegaConf.select(
-        config, "trainer.settings.termination_tilt", default=0.8,
-    ))
+    robot_type = str(OmegaConf.select(config, "manager_env.config.robot.type", default="g1"))
+    root_body = "waist_yaw_link" if robot_type == "n3" else "torso_link"
+    if profile == "mimiclite":
+        for name in ("root_pos_error", "root_ori_error"):
+            OmegaConf.update(
+                terminations, f"{name}.params.body_names", [root_body],
+                merge=False, force_add=True,
+            )
+        for name in ("body_pos_error", "body_ori_error"):
+            OmegaConf.update(
+                terminations, f"{name}.params.root_body_names", [root_body],
+                merge=False, force_add=True,
+            )
+        # Keep Sonic's end-effector height-error failure while adapting the
+        # body names to the selected robot embodiment.
+        ee_bodies = (
+            [
+                "l_leg_ankle_roll_link",
+                "r_leg_ankle_roll_link",
+                "l_arm_hand_pitch_link",
+                "r_arm_hand_pitch_link",
+            ]
+            if robot_type == "n3"
+            else [
+                "left_ankle_roll_link",
+                "right_ankle_roll_link",
+                "left_wrist_yaw_link",
+                "right_wrist_yaw_link",
+            ]
+        )
+        OmegaConf.update(
+            terminations, "ee_body_pos.params.body_names", ee_bodies,
+            merge=False, force_add=True,
+        )
+    if profile == "supermimic":
+        terminations.wam_failure.params.height_threshold = float(OmegaConf.select(
+            config, "trainer.settings.termination_height", default=0.25,
+        ))
+        terminations.wam_failure.params.tilt_threshold = float(OmegaConf.select(
+            config, "trainer.settings.termination_tilt", default=0.8,
+        ))
     with open_dict(config.manager_env):
         config.manager_env.terminations = terminations
+    # Keep the selected experiment marker in the trainer subtree as well;
+    # train_agent_trl passes the algorithm/trainer config separately to
+    # WAMTrainer, and a command-line ``trainer=wam`` group can otherwise hide
+    # the experiment-specific profile.
+    if OmegaConf.select(config, "termination_profile") is not None:
+        OmegaConf.update(config, "trainer.settings.termination_profile", profile, force_add=True)
+    if OmegaConf.select(config, "finite_guard") is not None:
+        OmegaConf.update(
+            config, "trainer.settings.finite_guard",
+            bool(OmegaConf.select(config, "finite_guard")), force_add=True,
+        )
     return True
 
 

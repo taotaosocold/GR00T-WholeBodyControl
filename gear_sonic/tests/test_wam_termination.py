@@ -13,6 +13,7 @@ import torch
 from gear_sonic.utils.config_utils import configure_wam_terminations
 from gear_sonic.utils.wam_termination import (
     hard_tracking_termination,
+    mimiclite_time_out,
     next_motion_frame,
     reference_pose,
     soft_tracking_termination,
@@ -158,6 +159,11 @@ class TerminationTests(unittest.TestCase):
         command.robot_anchor_pos_w[0, 2] += 1
         self.assertTrue(supermimic_failure(env)[0])
         self.assertFalse(supermimic_time_out(env)[0])
+
+    def test_mimiclite_clip_timeout_uses_last_valid_frame(self):
+        env, command = make_env()
+        command.time_steps = torch.tensor([0, 0, 2])
+        self.assertEqual(mimiclite_time_out(env).tolist(), [False, False, True])
 
 
 class TrainerTerminationIntegrationTests(unittest.TestCase):

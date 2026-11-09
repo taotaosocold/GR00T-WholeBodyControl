@@ -27,10 +27,23 @@ settings:
   # Real collection and imagination share SuperMimic's failure criteria.
   # Clip ends / the environment's episode limit remain normal truncations.
   align_real_termination: true
+  termination_profile: supermimic
   termination_height: 0.25
   termination_tilt: 0.8
   termination_height_width: 0.02
   termination_tilt_width: 0.04
+  # MimicLite profile: cumulative-error surrogate for imagined rollouts.
+  mimiclite_root_pos_threshold: 0.4
+  mimiclite_root_ori_threshold: 1.2
+  mimiclite_body_pos_threshold: 0.4
+  mimiclite_body_ori_threshold: 1.2
+  mimiclite_root_min_steps: 25
+  mimiclite_body_min_steps: 5
+  mimiclite_error_temperature: 0.05
+  mimiclite_counter_temperature: 0.5
+  # Reset the simulator and discard the current transition if any WAM field
+  # becomes NaN/Inf during collection. Disabled for historical profiles.
+  finite_guard: false
   # Share the same eight FK-based terms with the real RewardManager.
   align_real_reward: true
   collect_steps: 1
